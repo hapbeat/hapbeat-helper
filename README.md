@@ -100,6 +100,15 @@ python -m venv .venv
 pipx upgrade hapbeat-helper
 ```
 
+If you installed editable from a clone (`pipx install -e .` or
+`pip install -e ".[dev]"`), updates are automatic — just `git pull` and
+restart the daemon. The Python package picks up changes in `src/` on
+the next process start.
+
+> **WS protocol mismatch?** When Studio reports
+> `ERROR: unknown type: <message>` in the log drawer, your helper is
+> older than the Studio build. `git pull && restart` (or `pipx upgrade`).
+
 ### Uninstalling
 
 ```bash
