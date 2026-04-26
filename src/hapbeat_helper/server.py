@@ -270,6 +270,35 @@ class HelperServer:
                 ws, payload, {"cmd": "reboot"},
             )
 
+        elif msg_type == "clear_wifi":
+            await self._handle_tcp_command(
+                ws, payload, {"cmd": "clear_wifi"},
+            )
+
+        elif msg_type == "get_info":
+            await self._handle_query(
+                ws, payload, "get_info", "get_info_result",
+                lambda r: {
+                    "name": r.get("name"),
+                    "mac": r.get("mac"),
+                    "fw": r.get("fw"),
+                    "group": r.get("group"),
+                    "wifi_connected": r.get("wifi_connected"),
+                },
+            )
+
+        elif msg_type == "get_wifi_status":
+            await self._handle_query(
+                ws, payload, "get_wifi_status", "wifi_status_result",
+                lambda r: {
+                    "connected": r.get("connected"),
+                    "ssid": r.get("ssid"),
+                    "ip": r.get("ip"),
+                    "rssi": r.get("rssi"),
+                    "channel": r.get("channel"),
+                },
+            )
+
         elif msg_type == "query_space":
             await self._handle_query(
                 ws, payload, "space_query", "space_result",
