@@ -116,6 +116,12 @@ def _cmd_config_show(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_verbose(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="debug logging",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hapbeat-helper",
@@ -124,10 +130,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "Hapbeat devices on the local network."
         ),
     )
-    p.add_argument("--verbose", "-v", action="store_true", help="debug logging")
+    _add_verbose(p)
     sub = p.add_subparsers(dest="cmd")
 
     p_start = sub.add_parser("start", help="start the daemon")
+    _add_verbose(p_start)
     p_start.add_argument(
         "--foreground", action="store_true",
         help="run in the foreground (required for MVP)",
@@ -139,6 +146,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start.set_defaults(func=_cmd_start)
 
     p_status = sub.add_parser("status", help="check whether helper is running")
+    _add_verbose(p_status)
     p_status.add_argument("--port", type=int, default=WS_PORT)
     p_status.set_defaults(func=_cmd_status)
 
