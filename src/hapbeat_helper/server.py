@@ -1101,6 +1101,11 @@ def _deploy_kit_to_device(
     for fp in sorted(pack_dir.rglob("*")):
         if fp.is_file():
             rel = fp.relative_to(pack_dir).as_posix()
+            # stream-clips/ are SDK-side (Unity streams them at runtime).
+            # The firmware does not store them; exclude to avoid wasting
+            # LittleFS space and to prevent install-commit confusion.
+            if rel.startswith("stream-clips/"):
+                continue
             files.append((rel, fp))
     total_size = sum(fp.stat().st_size for _, fp in files)
     # Total TCP-payload chunks across the whole kit. Drives the
