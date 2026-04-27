@@ -1136,20 +1136,32 @@ def _deploy_kit_to_device(
                 if not resp or resp.get("status") != "ok":
                     return False, f"file_begin nack ({rel_path})"
 
+                # Per-chunk progress: emit one update per TCP packet so
+                # the UI bar moves at the actual transfer cadence the
+                # user can see in their network log. The bar caps at
+                # 95% pre-commit; commit takes the last 4 percentage
+                # points (96–99) and the final response brings it to
+                # 100. file_sent is the bytes sent for *this* file, used
+                # to give a richer per-file label.
+                file_sent = 0
                 with open(abs_path, "rb") as f:
                     while True:
                         chunk = f.read(4096)
                         if not chunk:
                             break
                         conn.send_raw(chunk)
-                sent += size
+                        sent += len(chunk)
+                        file_sent += len(chunk)
+                        pct = int(sent / total_size * 95) if total_size else 95
+                        _progress(
+                            pct,
+                            f"[{idx}/{len(files)}] {rel_path} "
+                            f"{file_sent}/{size}B",
+                        )
 
                 resp = conn.read_response(timeout=10.0)
                 if not resp or resp.get("status") != "ok":
                     return False, f"file recv nack ({rel_path})"
-
-                pct = int(sent / total_size * 95) if total_size else 95
-                _progress(pct, f"[{idx}/{len(files)}] {rel_path}")
 
             _progress(96, "committing…")
             conn.send_json({"cmd": "kit_commit"})
