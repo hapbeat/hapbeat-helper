@@ -781,11 +781,32 @@ class HelperServer:
 
         # Send to each target sequentially in a worker thread so the
         # WebSocket handler stays responsive. Progress is pushed via
-        # broadcast_async messages.
+        # `deploy_progress` messages from a thread-safe callback.
         async def _run_deploy():
             for ip in targets:
+                # The callback is invoked from a worker thread, so we
+                # can't await on it directly — schedule the broadcast
+                # on the asyncio loop with run_coroutine_threadsafe.
+                def make_progress(ip_inner: str):
+                    def cb(pct: int, msg: str) -> None:
+                        coro = self._broadcast({
+                            "type": "deploy_progress",
+                            "payload": {
+                                "ip": ip_inner,
+                                "kit_id": kit_id,
+                                "percent": pct,
+                                "message": msg,
+                            },
+                        })
+                        try:
+                            asyncio.run_coroutine_threadsafe(coro, loop)
+                        except RuntimeError:
+                            pass
+                    return cb
+
                 ok, msg = await loop.run_in_executor(
-                    None, _deploy_kit_to_device, ip, pack_dir, kit_id,
+                    None, _deploy_kit_to_device,
+                    ip, pack_dir, kit_id, make_progress(ip),
                 )
                 await self._broadcast({
                     "type": "deploy_result",
@@ -1053,10 +1074,19 @@ def _send_tcp_passthrough(ip: str, cmd: dict) -> Optional[dict]:
 
 def _deploy_kit_to_device(
     ip: str, pack_dir: Path, kit_id_default: str,
+    on_progress=None,
 ) -> tuple[bool, str]:
     """Send a Pack/Kit to one device using the firmware's TCP protocol.
 
     Mirrors ``transport._do_tcp_kit_transfer`` from the manager.
+
+    Parameters
+    ----------
+    on_progress
+        Optional callback ``(percent: int, message: str) -> None`` invoked
+        after each file finishes uploading and at major lifecycle steps
+        (install, commit). Caller is responsible for thread-safety; this
+        function calls it synchronously from the worker thread.
     """
     manifest_path = pack_dir / "manifest.json"
     if not manifest_path.exists():
@@ -1074,6 +1104,16 @@ def _deploy_kit_to_device(
             files.append((rel, fp))
     total_size = sum(fp.stat().st_size for _, fp in files)
 
+    def _progress(pct: int, msg: str) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(pct, msg)
+        except Exception:  # noqa: BLE001
+            logger.exception("deploy on_progress callback failed")
+
+    _progress(0, f"connecting to {ip}…")
+
     with TcpRawConnection(ip) as conn:
         if not conn.connect():
             return False, "connect failed"
@@ -1086,7 +1126,8 @@ def _deploy_kit_to_device(
             if not resp or resp.get("status") != "ok":
                 return False, f"install nack: {resp}"
 
-            for rel_path, abs_path in files:
+            sent = 0
+            for idx, (rel_path, abs_path) in enumerate(files, 1):
                 size = abs_path.stat().st_size
                 conn.send_json({
                     "cmd": "file_begin", "path": rel_path, "size": size,
@@ -1101,11 +1142,16 @@ def _deploy_kit_to_device(
                         if not chunk:
                             break
                         conn.send_raw(chunk)
+                sent += size
 
                 resp = conn.read_response(timeout=10.0)
                 if not resp or resp.get("status") != "ok":
                     return False, f"file recv nack ({rel_path})"
 
+                pct = int(sent / total_size * 95) if total_size else 95
+                _progress(pct, f"[{idx}/{len(files)}] {rel_path}")
+
+            _progress(96, "committing…")
             conn.send_json({"cmd": "kit_commit"})
             resp = conn.read_response(timeout=15.0)
             if not resp or resp.get("status") != "ok":
@@ -1113,4 +1159,5 @@ def _deploy_kit_to_device(
         except OSError as exc:
             return False, f"io error: {exc}"
 
+    _progress(100, "complete")
     return True, "ok"
