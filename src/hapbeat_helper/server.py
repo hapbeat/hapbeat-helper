@@ -1103,6 +1103,14 @@ def _deploy_kit_to_device(
             rel = fp.relative_to(pack_dir).as_posix()
             files.append((rel, fp))
     total_size = sum(fp.stat().st_size for _, fp in files)
+    # Total TCP-payload chunks across the whole kit. Drives the
+    # progress bar so the percent advances on every actual packet
+    # send rather than only at file-boundaries.
+    chunk_size = 4096
+    total_chunks = sum(
+        max(1, (fp.stat().st_size + chunk_size - 1) // chunk_size)
+        for _, fp in files
+    )
 
     def _progress(pct: int, msg: str) -> None:
         if on_progress is None:
@@ -1126,7 +1134,7 @@ def _deploy_kit_to_device(
             if not resp or resp.get("status") != "ok":
                 return False, f"install nack: {resp}"
 
-            sent = 0
+            chunks_sent = 0
             for idx, (rel_path, abs_path) in enumerate(files, 1):
                 size = abs_path.stat().st_size
                 conn.send_json({
@@ -1137,33 +1145,32 @@ def _deploy_kit_to_device(
                     return False, f"file_begin nack ({rel_path})"
 
                 # Per-chunk progress: emit one update per TCP packet so
-                # the UI bar moves at the actual transfer cadence the
-                # user can see in their network log. The bar caps at
-                # 95% pre-commit; commit takes the last 4 percentage
-                # points (96–99) and the final response brings it to
-                # 100. file_sent is the bytes sent for *this* file, used
-                # to give a richer per-file label.
-                file_sent = 0
+                # the UI bar moves at the actual transfer cadence. The
+                # percent is `chunks_sent / total_chunks * 99` so the
+                # final 1% is reserved for kit_commit.
+                file_chunks = max(1, (size + chunk_size - 1) // chunk_size)
+                file_chunk_idx = 0
                 with open(abs_path, "rb") as f:
                     while True:
-                        chunk = f.read(4096)
+                        chunk = f.read(chunk_size)
                         if not chunk:
                             break
                         conn.send_raw(chunk)
-                        sent += len(chunk)
-                        file_sent += len(chunk)
-                        pct = int(sent / total_size * 95) if total_size else 95
+                        chunks_sent += 1
+                        file_chunk_idx += 1
+                        pct = int(chunks_sent / total_chunks * 99) if total_chunks else 99
                         _progress(
                             pct,
                             f"[{idx}/{len(files)}] {rel_path} "
-                            f"{file_sent}/{size}B",
+                            f"pkt {chunks_sent}/{total_chunks} "
+                            f"({file_chunk_idx}/{file_chunks} in file)",
                         )
 
                 resp = conn.read_response(timeout=10.0)
                 if not resp or resp.get("status") != "ok":
                     return False, f"file recv nack ({rel_path})"
 
-            _progress(96, "committing…")
+            _progress(99, "committing…")
             conn.send_json({"cmd": "kit_commit"})
             resp = conn.read_response(timeout=15.0)
             if not resp or resp.get("status") != "ok":
