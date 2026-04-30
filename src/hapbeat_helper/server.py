@@ -148,10 +148,24 @@ class HelperServer:
                 server.close()
 
     async def _scan_loop(self) -> None:
+        # 2s ping interval matches Manager. The registry's offline
+        # threshold is 5s so a powered-off device shows up as offline
+        # within ~5s in the Studio UI. We also re-broadcast the
+        # device_list at the end of every scan tick so an online→offline
+        # transition is pushed to clients without waiting for the next
+        # registry mutation (which only fires on upserts).
         try:
+            last_online_state: dict[str, bool] = {}
             while True:
                 self.udp.send_broadcast_ping()
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(2.0)
+                # Detect liveness transitions and push if anything flipped.
+                current = {
+                    ip: d.is_online for ip, d in self.registry.get_all_devices().items()
+                }
+                if current != last_online_state:
+                    last_online_state = current
+                    self._post_to_loop(self._broadcast(self._device_list_msg()))
         except asyncio.CancelledError:
             pass
 
@@ -418,9 +432,18 @@ class HelperServer:
         pkt = protocol.build_play(seq, event_id, target=target, gain=gain)
         # PLAY is sent as broadcast — devices self-filter by address.
         self.udp.send_raw(pkt, "<broadcast>")
+        # Echo a detailed result line. Studio surfaces this in the log
+        # drawer as `[helper] play sent ...`, so include the wire
+        # values that drive device-side playback.
+        target_label = target if target else "<broadcast>"
+        msg = (
+            f"play sent — event_id={event_id} "
+            f"target={target_label} gain={gain:.3f} seq={seq} "
+            f"udp_bytes={len(pkt)}"
+        )
         await ws.send(json.dumps({
             "type": "write_result",
-            "payload": {"success": True, "message": "play sent"},
+            "payload": {"success": True, "message": msg},
         }))
 
     async def _handle_stop_event(self, ws, payload: dict) -> None:

@@ -18,8 +18,12 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Two consecutive missed PONGs (~5s scan interval) -> offline.
-_OFFLINE_THRESHOLD = 12.0
+# Liveness window. Scan loop pings every 2s (see server._scan_loop),
+# so a device is treated as offline after ~2 missed PONGs (5s window).
+# Manager parity: Manager uses 2s scan / 8s threshold; we run a touch
+# tighter so power-off shows up in the Studio UI within ~5s instead
+# of the 12s the previous "5s/12s" pair allowed.
+_OFFLINE_THRESHOLD = 5.0
 
 
 @dataclass
