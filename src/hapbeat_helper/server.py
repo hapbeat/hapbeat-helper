@@ -464,13 +464,19 @@ class HelperServer:
         self, ws, payload: dict, cmd: dict,
     ) -> None:
         targets = _resolve_targets(payload, self.registry)
+        cmd_name = cmd.get("cmd", "?")
         if not targets:
             await ws.send(json.dumps({
                 "type": "write_result",
                 "payload": {
                     "success": False,
                     "error": "no_device",
-                    "message": "no targets",
+                    "message": (
+                        f"{cmd_name}: 送信先デバイスが解決できません "
+                        f"(payload.ip='{payload.get('ip', '')}'). "
+                        "Devices タブでデバイスを選択してから再実行してください。"
+                    ),
+                    "cmd": cmd_name,
                 },
             }))
             return
@@ -481,12 +487,44 @@ class HelperServer:
             None, _send_tcp_to_many, targets, cmd,
         )
         ok_count = sum(1 for r in results if r.get("success"))
+
+        # Build a verbose, per-target reason string so the Studio log
+        # drawer surfaces *why* something failed instead of the bare
+        # "0/1 ok". Failures usually fall into one of three buckets:
+        #   1. connect failed   → device unreachable on TCP 7701
+        #   2. OSError on send  → connection dropped mid-write
+        #   3. status != "ok"   → firmware rejected the command
+        # All three need different fixes, so distinguishing them in
+        # the log saves debugging time.
+        detail_lines: list[str] = []
+        for r in results:
+            ip = r.get("ip", "?")
+            resp = r.get("response") or {}
+            if r.get("success"):
+                # Echo the firmware's own message so the user sees
+                # what the device confirmed.
+                detail_lines.append(
+                    f"  ✓ {ip}: {resp.get('message') or resp.get('status') or 'ok'}"
+                )
+            else:
+                err = resp.get("error") or resp.get("message") or "unknown"
+                status = resp.get("status")
+                detail_lines.append(
+                    f"  ✗ {ip}: {err}"
+                    + (f" (status={status})" if status and status != "ok" else "")
+                )
+
+        summary = f"{cmd_name}: {ok_count}/{len(targets)} ok"
+        full_message = summary + ("\n" + "\n".join(detail_lines) if detail_lines else "")
+
         await ws.send(json.dumps({
             "type": "write_result",
             "payload": {
                 "success": ok_count > 0,
                 "device_confirmed": True,
-                "message": f"{ok_count}/{len(targets)} ok",
+                "message": full_message,
+                "summary": summary,
+                "cmd": cmd_name,
                 "results": results,
             },
         }))
@@ -932,21 +970,64 @@ class HelperServer:
 
 def _send_tcp_to_many(targets: list[str], cmd: dict) -> list[dict]:
     """Send *cmd* to every IP in *targets* sequentially. Returns a list
-    of ``{ip, success, response}`` results.
+    of ``{ip, success, response}`` results — failure responses now
+    carry the concrete OSError string so Studio's log drawer can
+    surface *why* the TCP write failed (timeout vs ECONNREFUSED vs
+    EHOSTUNREACH all imply different fixes).
     """
+    cmd_name = cmd.get("cmd", "?")
     out: list[dict] = []
     for ip in targets:
         with TcpRawConnection(ip) as conn:
-            if not conn.connect():
+            t0 = time.monotonic()
+            try:
+                connected = conn.connect()
+            except OSError as exc:
                 out.append({"ip": ip, "success": False,
-                            "response": {"error": "connect failed"}})
+                            "response": {
+                                "error": f"connect raised {type(exc).__name__}: {exc}",
+                                "phase": "connect",
+                                "cmd": cmd_name,
+                            }})
+                continue
+            if not connected:
+                # Most common path: TCP 7701 closed (no firmware
+                # listening / firewall) or device is in a transient
+                # post-Wi-Fi-switch state where the listening socket
+                # hasn't been re-bound yet. Surface it explicitly.
+                out.append({"ip": ip, "success": False,
+                            "response": {
+                                "error": (
+                                    f"TCP 7701 connect failed to {ip} "
+                                    f"({(time.monotonic() - t0) * 1000:.0f} ms). "
+                                    "デバイスがオンラインに見えても TCP サーバが "
+                                    "起動していない場合があります — 電源を一度 OFF→ON してください。"
+                                ),
+                                "phase": "connect",
+                                "cmd": cmd_name,
+                            }})
                 continue
             try:
                 conn.send_json(cmd)
                 resp = conn.read_response(timeout=10.0) or {}
             except OSError as exc:
                 out.append({"ip": ip, "success": False,
-                            "response": {"error": str(exc)}})
+                            "response": {
+                                "error": f"send/read raised {type(exc).__name__}: {exc}",
+                                "phase": "io",
+                                "cmd": cmd_name,
+                            }})
+                continue
+            if not resp:
+                out.append({"ip": ip, "success": False,
+                            "response": {
+                                "error": (
+                                    "device disconnected before reply "
+                                    "(connection accepted but TCP server closed it)"
+                                ),
+                                "phase": "no_reply",
+                                "cmd": cmd_name,
+                            }})
                 continue
             out.append({
                 "ip": ip,
