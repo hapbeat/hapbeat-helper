@@ -71,7 +71,22 @@ class TcpRawConnection:
         return False
 
     def close(self) -> None:
+        # Issue an explicit shutdown before close. The firmware's
+        # tcp_server.cpp has a single global `s_client` slot and only
+        # accepts a *new* connection when `s_client.connected()`
+        # returns false (tcp_server.cpp:1233). Without an explicit
+        # shutdown, the FIN may sit buffered locally for a while,
+        # which leaves the device's `s_client` in the connected state
+        # — so the next click finds the device "busy" and the new TCP
+        # connect appears to hang/timeout. shutdown(SHUT_RDWR) flushes
+        # the FIN immediately so the device can clean up between
+        # back-to-back requests. (User-reported "詰まり" 2026-05-01.)
         if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                # Already closed or never connected — ignore.
+                pass
             try:
                 self.sock.close()
             except OSError:

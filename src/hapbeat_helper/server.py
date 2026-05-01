@@ -384,6 +384,15 @@ class HelperServer:
         elif msg_type == "ota_data":
             await self._handle_ota_data(ws, payload)
 
+        elif msg_type == "scan_wifi":
+            # PC-side Wi-Fi scan. Studio's onboarding assumes
+            # PC + Hapbeat are on the same LAN, so the PC's own
+            # neighborhood is the same set the Hapbeat will see —
+            # and far more convenient than asking the firmware to
+            # scan (no Serial conn needed, no LAN round-trip, and
+            # it works while the Hapbeat is offline being onboarded).
+            await self._handle_local_wifi_scan(ws, payload)
+
         elif msg_type == "query_space":
             await self._handle_query(
                 ws, payload, "space_query", "space_result",
@@ -693,6 +702,22 @@ class HelperServer:
             "type": "ota_result",
             "payload": {"device": target, "success": ok, "message": msg},
         })
+
+    async def _handle_local_wifi_scan(self, ws, payload: dict) -> None:
+        """Run an OS-native Wi-Fi scan and ship the result back.
+
+        Returns ``{type: "scan_wifi_result", payload: {networks, error?}}``
+        with networks shaped like the Serial-side scan
+        (`{ssid, rssi, channel?, auth?}`) so Studio can render either
+        source through the same UI.
+        """
+        del payload  # nothing to read — scan is OS-global
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _local_wifi_scan)
+        await ws.send(json.dumps({
+            "type": "scan_wifi_result",
+            "payload": result,
+        }))
 
     async def _handle_subscribe_logs(self, ws, payload: dict) -> None:
         """Open a long-lived TCP connection and tail firmware logs.
@@ -1055,13 +1080,28 @@ def _do_ota_to_device(
     """
     file_size = len(bin_bytes)
     with TcpRawConnection(ip) as conn:
-        if not conn.connect():
-            return False, "connect failed"
+        t0 = time.monotonic()
+        try:
+            connected = conn.connect()
+        except OSError as exc:
+            return False, (
+                f"phase=connect: TCP 7701 → {ip} raised "
+                f"{type(exc).__name__}: {exc}. "
+                "デバイスがオンライン表示でも TCP server が立ち上がっていない "
+                "ことがあります — 電源を OFF→ON してから再試行してください。"
+            )
+        if not connected:
+            return False, (
+                f"phase=connect: TCP 7701 → {ip} 接続失敗 "
+                f"({(time.monotonic() - t0) * 1000:.0f} ms). "
+                "デバイスがオンライン表示でも TCP server が立ち上がっていない "
+                "ことがあります — 電源を OFF→ON してから再試行してください。"
+            )
         try:
             conn.send_json({"cmd": "ota_begin", "size": file_size})
             resp = conn.read_response(timeout=5.0)
             if not resp or resp.get("status") != "ok":
-                return False, f"ota_begin nack: {resp}"
+                return False, f"phase=ota_begin: nack {resp}"
 
             chunk_size = 4096
             sent = 0
@@ -1076,19 +1116,23 @@ def _do_ota_to_device(
             while True:
                 resp = conn.read_response(timeout=30.0)
                 if resp is None:
-                    return False, "device timeout"
+                    return False, (
+                        "phase=verify: デバイスからの応答が 30 秒以内に来ません。"
+                        " Update.end が失敗している可能性があります — シリアル"
+                        " ログで [OTA] エラー行を確認してください。"
+                    )
                 status = resp.get("status", "")
                 if status == "ok":
                     progress("done", 100, "OTA 完了")
                     return True, resp.get("message", "OK")
                 if status == "error":
-                    return False, resp.get("message", "OTA error")
+                    return False, f"phase=verify: {resp.get('message', 'OTA error')}"
                 if status == "progress":
                     pct = resp.get("percent", 0)
                     progress("flash", min(96 + pct // 25, 99),
                              f"書込中 {pct}%")
         except OSError as exc:
-            return False, f"io error: {exc}"
+            return False, f"phase=io: {type(exc).__name__}: {exc}"
 
 
 def _log_tail_worker(ip: str, stop: threading.Event, relay) -> None:
@@ -1289,3 +1333,190 @@ def _deploy_kit_to_device(
 
     _progress(100, "complete")
     return True, "ok"
+
+
+# ── Local Wi-Fi scan (OS-native) ─────────────────────────────────
+
+def _local_wifi_scan() -> dict:
+    """Cross-platform Wi-Fi scan via OS CLI.
+
+    Returns ``{networks: [{ssid, rssi, channel?, auth?}, ...], error?}``.
+    The list is de-duped by SSID (keeping the strongest BSSID per SSID
+    to mirror what the firmware-side scan does) and sorted strongest-first.
+    Empty list is a valid response — we return ``error`` only when the
+    underlying CLI is missing or the OS isn't supported.
+    """
+    import platform
+    import subprocess
+
+    sysname = platform.system()
+    try:
+        if sysname == "Windows":
+            networks = _scan_windows_netsh()
+        elif sysname == "Darwin":
+            networks = _scan_macos_airport()
+        elif sysname == "Linux":
+            networks = _scan_linux_nmcli()
+        else:
+            return {"networks": [], "error": f"unsupported OS: {sysname}"}
+    except FileNotFoundError as exc:
+        return {"networks": [], "error": f"scanner not installed: {exc}"}
+    except subprocess.SubprocessError as exc:
+        return {"networks": [], "error": f"scan failed: {exc}"}
+    except OSError as exc:
+        return {"networks": [], "error": f"scan os-error: {exc}"}
+
+    # Dedupe by SSID, keep strongest signal
+    by_ssid: dict[str, dict] = {}
+    for n in networks:
+        ssid = (n.get("ssid") or "").strip()
+        if not ssid:
+            continue
+        prev = by_ssid.get(ssid)
+        if prev is None or n.get("rssi", -200) > prev.get("rssi", -200):
+            by_ssid[ssid] = n
+    out = sorted(
+        by_ssid.values(),
+        key=lambda n: -(n.get("rssi") or -200),
+    )
+    return {"networks": out}
+
+
+def _scan_windows_netsh() -> list[dict]:
+    """Parse `netsh wlan show networks mode=Bssid` output.
+
+    Both English ("SSID", "Signal", "Authentication", "Channel") and
+    Japanese ("シグナル", "認証", "チャネル") locale labels are matched
+    so the same code works on Windows en-US and ja-JP installs.
+    """
+    import subprocess
+
+    out = subprocess.check_output(
+        ["netsh", "wlan", "show", "networks", "mode=Bssid"],
+        timeout=10,
+        stderr=subprocess.STDOUT,
+    )
+    # netsh respects the system code page; on Japanese Windows that's
+    # cp932, on English en-US it's cp1252. Try utf-8 first then fall back.
+    text = ""
+    for enc in ("utf-8", "cp932", "cp1252", "latin-1"):
+        try:
+            text = out.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if not text:
+        return []
+
+    nets: list[dict] = []
+    cur: Optional[dict] = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        # `SSID 1 : MyNetwork` — top of an SSID block. Inner BSSID
+        # lines also contain " : " but start with "BSSID", so the
+        # `startswith("SSID ")` guard distinguishes them.
+        if line.startswith("SSID ") and " : " in line:
+            if cur is not None and cur.get("ssid"):
+                nets.append(cur)
+            cur = {"ssid": line.split(" : ", 1)[1].strip(), "rssi": -100}
+            continue
+        if cur is None:
+            continue
+        if " : " not in line:
+            continue
+        key, val = (s.strip() for s in line.split(" : ", 1))
+        klow = key.lower()
+        if klow.startswith("authentication") or "認証" in key:
+            cur["auth"] = val
+        elif klow.startswith("signal") or "シグナル" in key:
+            try:
+                pct = int(val.rstrip("%").strip())
+                # Map percent to a rough dBm value: 100% ≈ -50 dBm,
+                # 0% ≈ -100 dBm. Same approximation Windows uses
+                # internally for the WLAN_SIGNAL_QUALITY field.
+                cur["rssi"] = max(-100, min(-30, pct // 2 - 100))
+            except ValueError:
+                pass
+        elif klow.startswith("channel") or "チャネル" in key:
+            try:
+                cur["channel"] = int(val.split()[0])
+            except (ValueError, IndexError):
+                pass
+    if cur is not None and cur.get("ssid"):
+        nets.append(cur)
+    return nets
+
+
+def _scan_macos_airport() -> list[dict]:
+    """Parse `airport -s` output. Deprecated in macOS 14+ but still
+    works on 13 and earlier; on 14+ this returns empty + the user
+    can fall back to history."""
+    import subprocess
+
+    airport = (
+        "/System/Library/PrivateFrameworks/Apple80211.framework"
+        "/Versions/Current/Resources/airport"
+    )
+    out = subprocess.check_output(
+        [airport, "-s"], timeout=10,
+    ).decode("utf-8", errors="replace")
+    nets: list[dict] = []
+    # Skip header line, parse columns: SSID BSSID RSSI CHANNEL HT SECURITY
+    for line in out.splitlines()[1:]:
+        if not line.strip():
+            continue
+        # SSID may contain spaces; rsplit from the right is safer.
+        parts = line.rsplit(None, 6)
+        if len(parts) < 7:
+            continue
+        ssid = parts[0]
+        try:
+            rssi = int(parts[2])
+            channel = int(parts[3].split(",")[0])
+        except (ValueError, IndexError):
+            continue
+        nets.append({
+            "ssid": ssid,
+            "rssi": rssi,
+            "channel": channel,
+            "auth": parts[6],
+        })
+    return nets
+
+
+def _scan_linux_nmcli() -> list[dict]:
+    """Parse `nmcli -t -f SSID,SIGNAL,CHAN,SECURITY dev wifi list`."""
+    import subprocess
+
+    out = subprocess.check_output(
+        [
+            "nmcli", "-t", "-f", "SSID,SIGNAL,CHAN,SECURITY",
+            "dev", "wifi", "list",
+        ],
+        timeout=10,
+    ).decode("utf-8", errors="replace")
+    nets: list[dict] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        cols = line.split(":")
+        if len(cols) < 4:
+            continue
+        ssid = cols[0]
+        if not ssid:
+            continue
+        try:
+            pct = int(cols[1])
+            rssi = max(-100, min(-30, pct // 2 - 100))
+        except ValueError:
+            rssi = -100
+        try:
+            channel = int(cols[2])
+        except ValueError:
+            channel = None
+        nets.append({
+            "ssid": ssid, "rssi": rssi,
+            **({"channel": channel} if channel is not None else {}),
+            "auth": cols[3] or None,
+        })
+    return nets
