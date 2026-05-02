@@ -24,3 +24,7 @@ htmlcov/
 # Helper runtime
 *.pid
 logs/
+
+# Misc local junk
+*.stackdump
+lauch

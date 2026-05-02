@@ -9,11 +9,30 @@ description = "Local daemon bridging Hapbeat Studio (web) to Hapbeat devices"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "Hapbeat" }]
+authors = [{ name = "Hapbeat", email = "yus988@hapbeat.com" }]
+keywords = ["hapbeat", "haptics", "studio", "websocket", "mdns", "iot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: System :: Hardware",
+]
 dependencies = [
     "websockets>=12",
     "zeroconf>=0.131",
 ]
+
+[project.urls]
+Homepage = "https://devtools.hapbeat.com/"
+Repository = "https://github.com/hapbeat/hapbeat-helper"
+Issues = "https://github.com/hapbeat/hapbeat-helper/issues"
 
 [project.optional-dependencies]
 dev = [
