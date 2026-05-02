@@ -19,8 +19,15 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 7701
-CONNECT_TIMEOUT = 3.0
-READ_TIMEOUT = 2.0
+# Aggressive timeouts (2026-05-02): Studio users were reporting
+# "詰まり" — multi-second freezes when a click triggered a TCP path
+# while a previous connection was still being torn down on the device.
+# Old defaults (3 s connect + 3 s handshake + 2 retries × 1 s sleep)
+# accumulated to ~20 s worst-case before the helper gave up; now the
+# whole chain fits in ~6 s and the user sees a clear "device unresponsive"
+# faster than they could finish manually power-cycling the device.
+CONNECT_TIMEOUT = 1.5
+READ_TIMEOUT = 1.5
 
 
 class TcpRawConnection:
@@ -36,7 +43,7 @@ class TcpRawConnection:
         self.port = port
         self.sock: Optional[socket.socket] = None
 
-    def connect(self, retries: int = 2) -> bool:
+    def connect(self, retries: int = 1) -> bool:
         for attempt in range(retries + 1):
             try:
                 logger.info(
@@ -50,7 +57,7 @@ class TcpRawConnection:
                 self.sock = s
 
                 self.send_json({"cmd": "get_info"})
-                resp = self.read_response(timeout=3.0)
+                resp = self.read_response(timeout=READ_TIMEOUT)
                 if resp and resp.get("status") == "ok":
                     logger.info(
                         "TCP handshake ok (%s: %s)",
@@ -64,8 +71,11 @@ class TcpRawConnection:
                 logger.info("TCP connect error (%s): %s", self.ip, exc)
                 self.close()
 
+            # Short pause before retry — long enough that the firmware
+            # has a chance to FIN-clean the previous slot, short enough
+            # that the user doesn't perceive a freeze.
             if attempt < retries:
-                time.sleep(1.0)
+                time.sleep(0.3)
 
         logger.warning("TCP connect failed (%s:%d)", self.ip, self.port)
         return False
