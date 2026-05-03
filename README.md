@@ -117,7 +117,34 @@ pipx uninstall hapbeat-helper
 
 ## Run
 
-The MVP only supports foreground mode. Start the daemon in a terminal:
+### Option A — Auto-start service (recommended)
+
+Register hapbeat-helper as an OS-level service so it starts automatically
+every time you log in. After this one-time setup you never need to open a
+terminal again:
+
+```bash
+hapbeat-helper install-service
+```
+
+To check the registration state:
+
+```bash
+hapbeat-helper service-status
+```
+
+To remove the auto-start registration:
+
+```bash
+hapbeat-helper uninstall-service
+```
+
+Platform notes:
+- **macOS** — creates `~/Library/LaunchAgents/com.hapbeat.helper.plist` (launchd)
+- **Linux** — creates `~/.config/systemd/user/hapbeat-helper.service` (systemd --user)
+- **Windows** — registers a Task Scheduler entry (`HapbeatHelper`) that runs on login
+
+### Option B — Foreground (dev / debug)
 
 ```bash
 hapbeat-helper start --foreground
@@ -125,17 +152,15 @@ hapbeat-helper start --foreground
 
 Then open https://devtools.hapbeat.com — Studio will connect automatically.
 
-Other commands:
+Press `Ctrl+C` to stop.
+
+### Other commands
 
 ```bash
 hapbeat-helper status      # check whether a daemon is reachable on 7703
 hapbeat-helper version     # print version
 hapbeat-helper config show # show config path
 ```
-
-`stop` is currently a no-op for the foreground variant; press `Ctrl+C`.
-OS-level service installation (launchd / systemd / Windows Service) is
-planned for a future release.
 
 ## Verify
 
@@ -148,8 +173,8 @@ echo '{"type":"list_devices","payload":{}}' | websocat ws://localhost:7703
 
 ## Troubleshooting
 
-- **Studio reports "Helper 未接続"** — make sure `hapbeat-helper start --foreground`
-  is running on the same machine as the browser.
+- **Studio reports "Helper 未接続"** — run `hapbeat-helper install-service` (once)
+  or start manually with `hapbeat-helper start --foreground`.
 - **Browser cannot connect to `ws://localhost:7703` from HTTPS Studio** —
   Chrome and Edge allow this by default. Firefox requires
   `network.websocket.allowInsecureFromHTTPS = true` in `about:config`.

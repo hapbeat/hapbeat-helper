@@ -89,7 +89,35 @@ pipx install hapbeat-helper
 
 ## 起動
 
-別ターミナルでフォアグラウンド起動するのが MVP の標準です。
+### ログイン時自動起動（推奨）
+
+1 回だけコマンドを実行すると、以降はログインするたびに Helper が自動起動します。Studio を開けばすぐ接続済みの状態になります。
+
+```bash
+hapbeat-helper install-service
+```
+
+| OS | 仕組み |
+|---|---|
+| macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd） |
+| Linux | `~/.config/systemd/user/hapbeat-helper.service`（systemd --user） |
+| Windows | タスク スケジューラ エントリ `HapbeatHelper`（ログイン時起動） |
+
+登録状態を確認するには:
+
+```bash
+hapbeat-helper service-status
+```
+
+自動起動を解除するには:
+
+```bash
+hapbeat-helper uninstall-service
+```
+
+### フォアグラウンド起動（開発・デバッグ用）
+
+別ターミナルで手動起動することもできます。
 
 ```bash
 hapbeat-helper start --foreground
@@ -133,7 +161,7 @@ pipx uninstall hapbeat-helper
 
 | 症状 | 対処 |
 |---|---|
-| Studio に「Helper 接続中」が出ない | Helper が起動しているターミナルを確認 / ポート 7703 が他プロセスに使われていないか (`lsof -i :7703` / Windows は `netstat -ano \| findstr :7703`) |
+| Studio に「Helper 接続中」が出ない | `hapbeat-helper install-service` で自動起動を設定するか、ターミナルで `hapbeat-helper start --foreground` を実行 / ポート 7703 が他プロセスに使われていないか (`lsof -i :7703` / Windows は `netstat -ano \| findstr :7703`) |
 | ブラウザから `ws://localhost:7703` に繋がらない (Firefox) | `about:config` → `network.websocket.allowInsecureFromHTTPS` を `true` に。Chrome / Edge は不要 |
 | デバイスがサイドバーに出てこない | Helper と Hapbeat が同一 Wi-Fi LAN か確認 / hotspot/AP モードによっては UDP broadcast / mDNS が遮断される |
 | ポート 7700 / 7703 が既に使われている | 旧 `hapbeat-manager` を起動していないか確認。Helper と Manager は同時起動できません |

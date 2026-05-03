@@ -7,9 +7,9 @@ Subcommands:
 - ``version``                             print version
 - ``stop``                                placeholder (foreground only for now)
 - ``logs``                                placeholder
-
-OS-level service install (launchd / systemd / Windows Service) is
-deferred — the MVP only supports ``start --foreground``.
+- ``install-service``                     register as OS auto-start service
+- ``uninstall-service``                   remove the OS service registration
+- ``service-status``                      show OS service registration state
 """
 
 from __future__ import annotations
@@ -105,6 +105,54 @@ def _cmd_logs(_args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_install_service(_args: argparse.Namespace) -> int:
+    try:
+        from hapbeat_helper.service import get_service_manager
+        mgr = get_service_manager()
+        mgr.install()
+        return 0
+    except NotImplementedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_uninstall_service(_args: argparse.Namespace) -> int:
+    try:
+        from hapbeat_helper.service import get_service_manager
+        mgr = get_service_manager()
+        mgr.uninstall()
+        return 0
+    except NotImplementedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_service_status(_args: argparse.Namespace) -> int:
+    try:
+        from hapbeat_helper.service import get_service_manager
+        mgr = get_service_manager()
+        state = mgr.status()
+        labels = {
+            "not_registered": "not registered",
+            "stopped": "registered, stopped",
+            "running": "registered, running",
+        }
+        print(f"hapbeat-helper service: {labels.get(state, state)}")
+        return 0 if state == "running" else 1
+    except NotImplementedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def _cmd_config_show(_args: argparse.Namespace) -> int:
     cfg = _config_dir()
     print(f"config dir: {cfg}")
@@ -158,6 +206,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_logs = sub.add_parser("logs", help="(MVP: not implemented)")
     p_logs.set_defaults(func=_cmd_logs)
+
+    p_install = sub.add_parser(
+        "install-service",
+        help="register hapbeat-helper as an OS auto-start service (launchd / systemd / Task Scheduler)",
+    )
+    p_install.set_defaults(func=_cmd_install_service)
+
+    p_uninstall = sub.add_parser(
+        "uninstall-service",
+        help="remove the OS service registration",
+    )
+    p_uninstall.set_defaults(func=_cmd_uninstall_service)
+
+    p_svc_status = sub.add_parser(
+        "service-status",
+        help="show OS service registration state (not_registered / stopped / running)",
+    )
+    p_svc_status.set_defaults(func=_cmd_service_status)
 
     p_config = sub.add_parser("config", help="config helpers")
     sub_cfg = p_config.add_subparsers(dest="config_cmd")

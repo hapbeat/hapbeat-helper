@@ -1448,39 +1448,102 @@ def _scan_windows_netsh() -> list[dict]:
 
 
 def _scan_macos_airport() -> list[dict]:
-    """Parse `airport -s` output. Deprecated in macOS 14+ but still
-    works on 13 and earlier; on 14+ this returns empty + the user
-    can fall back to history."""
+    """Scan Wi-Fi networks on macOS.
+
+    Strategy:
+    1. Try `airport -s` (works on macOS ≤ 13; deprecated in 14+ Sonoma).
+    2. If airport returns nothing, fall back to `system_profiler SPAirPortDataType`
+       which works on macOS 14+ without admin privileges (no passwords exposed).
+    """
     import subprocess
 
     airport = (
         "/System/Library/PrivateFrameworks/Apple80211.framework"
         "/Versions/Current/Resources/airport"
     )
-    out = subprocess.check_output(
-        [airport, "-s"], timeout=10,
-    ).decode("utf-8", errors="replace")
+    try:
+        out = subprocess.check_output(
+            [airport, "-s"], timeout=10,
+        ).decode("utf-8", errors="replace")
+        nets: list[dict] = []
+        # Skip header line, parse columns: SSID BSSID RSSI CHANNEL HT SECURITY
+        for line in out.splitlines()[1:]:
+            if not line.strip():
+                continue
+            # SSID may contain spaces; rsplit from the right is safer.
+            parts = line.rsplit(None, 6)
+            if len(parts) < 7:
+                continue
+            ssid = parts[0]
+            try:
+                rssi = int(parts[2])
+                channel = int(parts[3].split(",")[0])
+            except (ValueError, IndexError):
+                continue
+            nets.append({
+                "ssid": ssid,
+                "rssi": rssi,
+                "channel": channel,
+                "auth": parts[6],
+            })
+        if nets:
+            return nets
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass
+
+    # Fallback: system_profiler (macOS 14+ Sonoma compatible)
+    return _scan_macos_system_profiler()
+
+
+def _scan_macos_system_profiler() -> list[dict]:
+    """Parse `system_profiler SPAirPortDataType` output.
+
+    Works on macOS 14+ where `airport -s` no longer reliably returns results.
+    Parses the human-readable text output to extract SSID and RSSI.
+    Returns an empty list (never raises) — caller treats empty as
+    "scan unavailable, user should type SSID manually".
+    """
+    import subprocess
+
+    try:
+        out = subprocess.check_output(
+            ["system_profiler", "SPAirPortDataType"],
+            timeout=15,
+        ).decode("utf-8", errors="replace")
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return []
+
     nets: list[dict] = []
-    # Skip header line, parse columns: SSID BSSID RSSI CHANNEL HT SECURITY
-    for line in out.splitlines()[1:]:
-        if not line.strip():
+    current_ssid: str | None = None
+    in_other_networks = False
+
+    for line in out.splitlines():
+        stripped = line.strip()
+        # Section header for "Other Local Wi-Fi Networks"
+        if "Other Local Wi-Fi Networks" in stripped or "Other Wi-Fi Networks" in stripped:
+            in_other_networks = True
             continue
-        # SSID may contain spaces; rsplit from the right is safer.
-        parts = line.rsplit(None, 6)
-        if len(parts) < 7:
-            continue
-        ssid = parts[0]
-        try:
-            rssi = int(parts[2])
-            channel = int(parts[3].split(",")[0])
-        except (ValueError, IndexError):
-            continue
-        nets.append({
-            "ssid": ssid,
-            "rssi": rssi,
-            "channel": channel,
-            "auth": parts[6],
-        })
+        # SSID lines look like: "NetworkName:" at indentation level 12+
+        if in_other_networks:
+            # A new network entry ends with ':'
+            if stripped.endswith(":") and ":" not in stripped[:-1]:
+                current_ssid = stripped[:-1]
+                continue
+            # RSSI line: "Signal / Noise: -65 dBm / -90 dBm"
+            if current_ssid and ("Signal" in stripped or "RSSI" in stripped):
+                m_rssi = None
+                import re
+                m = re.search(r'(-\d+)\s*dBm', stripped)
+                if m:
+                    m_rssi = int(m.group(1))
+                nets.append({
+                    "ssid": current_ssid,
+                    "rssi": m_rssi or -80,
+                    "channel": 0,
+                    "auth": "",
+                })
+                current_ssid = None
+
     return nets
 
 
