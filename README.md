@@ -37,13 +37,6 @@ brew install pipx
 pipx ensurepath
 ```
 
-#### Linux
-
-```bash
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-```
-
 #### Windows
 
 ```powershell
@@ -86,12 +79,12 @@ pipx install -e .
 
 # or — preferred during active dev — a plain venv:
 python -m venv .venv
-# Linux / macOS:
+# macOS:
 .venv/bin/pip install -e ".[dev]"
-.venv/bin/hapbeat-helper start --foreground
+.venv/bin/hapbeat-helper start
 # Windows:
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\hapbeat-helper start --foreground
+.venv\Scripts\hapbeat-helper start
 ```
 
 ### Updating
@@ -141,13 +134,12 @@ hapbeat-helper uninstall-service
 
 Platform notes:
 - **macOS** — creates `~/Library/LaunchAgents/com.hapbeat.helper.plist` (launchd)
-- **Linux** — creates `~/.config/systemd/user/hapbeat-helper.service` (systemd --user)
 - **Windows** — registers a Task Scheduler entry (`HapbeatHelper`) that runs on login
 
 ### Option B — Foreground (dev / debug)
 
 ```bash
-hapbeat-helper start --foreground
+hapbeat-helper start
 ```
 
 Then open https://devtools.hapbeat.com — Studio will connect automatically.
@@ -174,7 +166,7 @@ echo '{"type":"list_devices","payload":{}}' | websocat ws://localhost:7703
 ## Troubleshooting
 
 - **Studio reports "Helper 未接続"** — run `hapbeat-helper install-service` (once)
-  or start manually with `hapbeat-helper start --foreground`.
+  or start manually with `hapbeat-helper start`.
 - **Browser cannot connect to `ws://localhost:7703` from HTTPS Studio** —
   Chrome and Edge allow this by default. Firefox requires
   `network.websocket.allowInsecureFromHTTPS = true` in `about:config`.

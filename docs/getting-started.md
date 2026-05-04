@@ -1,6 +1,6 @@
 ---
 title: hapbeat-helper のインストール
-description: Hapbeat Studio とデバイスを橋渡しする CLI daemon `hapbeat-helper` の OS 別インストール手順。macOS / Windows / Linux 共通。
+description: Hapbeat Studio とデバイスを橋渡しする CLI daemon `hapbeat-helper` の OS 別インストール手順。macOS / Windows 共通。
 ---
 
 `hapbeat-helper` は **Hapbeat Studio (Web)** と **Hapbeat デバイス (Wi-Fi LAN)** を橋渡しするローカル daemon です。ブラウザ単体では行えない mDNS 検出・UDP broadcast・raw TCP を中継します。
@@ -22,7 +22,7 @@ hapbeat-helper                  ← この CLI
 ## 必要環境
 
 - **Python 3.10 以上**（`pipx` 経由で別 venv に入るため、システム Python のバージョンに気を遣う必要はありません）
-- **Hapbeat デバイスと同じ Wi-Fi LAN にぶら下がっている PC**（Windows / macOS / Linux）
+- **Hapbeat デバイスと同じ Wi-Fi LAN にぶら下がっている PC**（Windows / macOS）
 - **Chrome または Edge**（Studio が Web Serial / File System Access を使うため）
 
 ## インストール
@@ -78,15 +78,6 @@ pipx install hapbeat-helper
 >
 > 起動時に **Windows Defender Firewall** ダイアログが出たら「アクセスを許可する」を選んでください。
 
-### Linux
-
-```bash
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-# 新しいシェルを開く
-pipx install hapbeat-helper
-```
-
 ## 起動
 
 ### ログイン時自動起動（推奨）
@@ -100,7 +91,6 @@ hapbeat-helper install-service
 | OS | 仕組み |
 |---|---|
 | macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd） |
-| Linux | `~/.config/systemd/user/hapbeat-helper.service`（systemd --user） |
 | Windows | タスク スケジューラ エントリ `HapbeatHelper`（ログイン時起動） |
 
 登録状態を確認するには:
@@ -115,12 +105,16 @@ hapbeat-helper service-status
 hapbeat-helper uninstall-service
 ```
 
+> ⚠️ `pipx uninstall hapbeat-helper` を実行する **前に** 必ず `hapbeat-helper uninstall-service` を先に実行してください。エントリだけ残った状態で実体を消すと、次回ログイン時に「コマンドが見つからない」エラーが出ることがあります。
+
+> 自動起動の挙動・PC 作業への影響・セキュリティリスクの詳細は **[セキュリティと動作の影響](/docs/helper/security/)** にまとめています。公共 Wi-Fi で使う前に必ず確認してください。
+
 ### フォアグラウンド起動（開発・デバッグ用）
 
 別ターミナルで手動起動することもできます。
 
 ```bash
-hapbeat-helper start --foreground
+hapbeat-helper start
 ```
 
 正常起動すると以下のようなログが出ます:
@@ -161,7 +155,7 @@ pipx uninstall hapbeat-helper
 
 | 症状 | 対処 |
 |---|---|
-| Studio に「Helper 接続中」が出ない | `hapbeat-helper install-service` で自動起動を設定するか、ターミナルで `hapbeat-helper start --foreground` を実行 / ポート 7703 が他プロセスに使われていないか (`lsof -i :7703` / Windows は `netstat -ano \| findstr :7703`) |
+| Studio に「Helper 接続中」が出ない | `hapbeat-helper install-service` で自動起動を設定するか、ターミナルで `hapbeat-helper start` を実行 / ポート 7703 が他プロセスに使われていないか (`lsof -i :7703` / Windows は `netstat -ano \| findstr :7703`) |
 | ブラウザから `ws://localhost:7703` に繋がらない (Firefox) | `about:config` → `network.websocket.allowInsecureFromHTTPS` を `true` に。Chrome / Edge は不要 |
 | デバイスがサイドバーに出てこない | Helper と Hapbeat が同一 Wi-Fi LAN か確認 / hotspot/AP モードによっては UDP broadcast / mDNS が遮断される |
 | ポート 7700 / 7703 が既に使われている | 旧 `hapbeat-manager` を起動していないか確認。Helper と Manager は同時起動できません |

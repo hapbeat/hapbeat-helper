@@ -2,11 +2,11 @@
 
 Subcommands:
 
-- ``start [--foreground] [--port 7703]``  start the daemon
+- ``start [--port 7703]``                 start the daemon (foreground)
 - ``status``                              probe ws://localhost:7703
 - ``version``                             print version
-- ``stop``                                placeholder (foreground only for now)
-- ``logs``                                placeholder
+- ``stop``                                stop the auto-started helper
+- ``logs [-f] [-n N]``                    show log file + tail recent lines
 - ``install-service``                     register as OS auto-start service
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
@@ -47,13 +47,6 @@ def _setup_logging(verbose: bool) -> None:
 
 def _cmd_start(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
-    if not args.foreground:
-        print(
-            "MVP only supports foreground mode; pass --foreground.",
-            file=sys.stderr,
-        )
-        return 2
-
     server = HelperServer(port=args.port)
     print(f"hapbeat-helper {__version__} starting on ws://localhost:{args.port}")
     print("Press Ctrl+C to stop.")
@@ -92,17 +85,78 @@ def _cmd_version(_args: argparse.Namespace) -> int:
 
 
 def _cmd_stop(_args: argparse.Namespace) -> int:
+    try:
+        from hapbeat_helper.service import get_service_manager
+        mgr = get_service_manager()
+        if hasattr(mgr, "stop"):
+            mgr.stop()
+            return 0
+    except NotImplementedError:
+        pass
     print(
-        "stop: not implemented in MVP — "
-        "press Ctrl+C in the foreground terminal.",
+        "stop: no auto-started instance found. "
+        "If you launched in foreground, press Ctrl+C there.",
         file=sys.stderr,
     )
-    return 2
+    return 1
 
 
-def _cmd_logs(_args: argparse.Namespace) -> int:
-    print("logs: not implemented in MVP.", file=sys.stderr)
-    return 2
+def _cmd_logs(args: argparse.Namespace) -> int:
+    """Print the log file path and tail recent lines.
+
+    With --follow / -f, stream new lines until Ctrl+C.
+    """
+    try:
+        from hapbeat_helper.service import get_service_manager
+        mgr = get_service_manager()
+    except NotImplementedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not hasattr(mgr, "log_path"):
+        print(
+            "logs: this platform does not redirect stdout to a file. "
+            "Run `hapbeat-helper start` to see logs in the "
+            "current terminal.",
+            file=sys.stderr,
+        )
+        return 1
+    log = mgr.log_path()
+    print(f"# {log}")
+    if not log.exists():
+        print(
+            "(log file does not exist yet — has the service been started?)",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Print last N lines.
+    try:
+        with log.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        for line in lines[-args.lines:]:
+            sys.stdout.write(line)
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if not args.follow:
+        return 0
+
+    # Tail mode (cross-platform): poll for new bytes.
+    import time
+    sys.stdout.flush()
+    try:
+        with log.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)  # to EOF
+            while True:
+                chunk = f.read()
+                if chunk:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                else:
+                    time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
 
 
 def _cmd_install_service(_args: argparse.Namespace) -> int:
@@ -181,12 +235,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_verbose(p)
     sub = p.add_subparsers(dest="cmd")
 
-    p_start = sub.add_parser("start", help="start the daemon")
-    _add_verbose(p_start)
-    p_start.add_argument(
-        "--foreground", action="store_true",
-        help="run in the foreground (required for MVP)",
+    p_start = sub.add_parser(
+        "start",
+        help="start the daemon in the foreground (Ctrl+C to stop)",
     )
+    _add_verbose(p_start)
     p_start.add_argument(
         "--port", type=int, default=WS_PORT,
         help=f"WebSocket port (default: {WS_PORT})",
@@ -201,15 +254,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p_version = sub.add_parser("version", help="print version")
     p_version.set_defaults(func=_cmd_version)
 
-    p_stop = sub.add_parser("stop", help="(MVP: not implemented)")
+    p_stop = sub.add_parser(
+        "stop",
+        help="stop the auto-started helper instance",
+    )
     p_stop.set_defaults(func=_cmd_stop)
 
-    p_logs = sub.add_parser("logs", help="(MVP: not implemented)")
+    p_logs = sub.add_parser(
+        "logs",
+        help="show log file path + tail recent lines (-f to follow)",
+    )
+    p_logs.add_argument(
+        "-n", "--lines", type=int, default=50,
+        help="number of lines to show from the end (default: 50)",
+    )
+    p_logs.add_argument(
+        "-f", "--follow", action="store_true",
+        help="stream new log lines until Ctrl+C",
+    )
     p_logs.set_defaults(func=_cmd_logs)
 
     p_install = sub.add_parser(
         "install-service",
-        help="register hapbeat-helper as an OS auto-start service (launchd / systemd / Task Scheduler)",
+        help="register hapbeat-helper as an OS auto-start service (launchd on macOS / Task Scheduler on Windows)",
     )
     p_install.set_defaults(func=_cmd_install_service)
 

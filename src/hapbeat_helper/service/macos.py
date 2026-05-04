@@ -12,6 +12,10 @@ PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 LOG_PATH = Path.home() / "Library" / "Logs" / "hapbeat-helper.log"
 
 
+def log_path() -> Path:
+    return LOG_PATH
+
+
 def _hapbeat_helper_path() -> str:
     path = shutil.which("hapbeat-helper")
     if not path:
@@ -35,7 +39,6 @@ def _write_plist(exe: str) -> None:
   <array>
     <string>{exe}</string>
     <string>start</string>
-    <string>--foreground</string>
   </array>
   <key>RunAtLoad</key>      <true/>
   <key>KeepAlive</key>      <true/>
@@ -85,6 +88,29 @@ def uninstall() -> None:
     if PLIST_PATH.exists():
         PLIST_PATH.unlink()
     print("hapbeat-helper service removed.")
+
+
+def stop() -> None:
+    """Stop the running instance.
+
+    Uses `kickstart -k` (SIGTERM). With KeepAlive=true the launchd job
+    will respawn it — that's restart-style semantics. To stop permanently,
+    use `uninstall()` instead.
+    """
+    is_reg = PLIST_PATH.exists()
+    if not is_reg:
+        # No service registered → kill any helper python the user started
+        # in foreground.
+        subprocess.run(
+            ["pkill", "-f", "hapbeat[-_]helper"], check=False
+        )
+        print("hapbeat-helper foreground process(es) killed.")
+        return
+    subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{_uid()}/{LABEL}"],
+        check=False,
+    )
+    print("hapbeat-helper restarted (kickstart -k; KeepAlive will respawn).")
 
 
 def status() -> str:
