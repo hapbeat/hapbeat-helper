@@ -249,6 +249,18 @@ class HelperServer:
         elif msg_type == "list_devices":
             await ws.send(json.dumps(self._device_list_msg()))
 
+        elif msg_type == "rescan":
+            # Trigger an immediate UDP broadcast PING + push the latest
+            # device_list so the requester sees a fresh snapshot without
+            # waiting for the next 2s scan tick.
+            try:
+                self.udp.send_broadcast_ping()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("rescan: broadcast_ping failed: %s", exc)
+            # Give devices ~250ms to PONG, then broadcast device_list.
+            await asyncio.sleep(0.25)
+            await self._broadcast(self._device_list_msg())
+
         elif msg_type == "preview_event":
             await self._handle_preview_event(ws, payload)
 
