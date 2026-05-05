@@ -17,13 +17,26 @@ def log_path() -> Path:
 
 
 def _hapbeat_helper_path() -> str:
+    """Locate hapbeat-helper, preferring the same venv we are running in.
+
+    Resolution order:
+    1. Sibling of sys.executable (e.g. <venv>/bin/hapbeat-helper).
+    2. shutil.which fallback (system-wide install case).
+    """
+    py_dir = Path(sys.executable).resolve().parent
+    candidate = py_dir / "hapbeat-helper"
+    if candidate.is_file():
+        return str(candidate)
+
     path = shutil.which("hapbeat-helper")
-    if not path:
-        raise RuntimeError(
-            "hapbeat-helper is not on PATH. "
-            "Install via pipx: pipx install hapbeat-helper"
-        )
-    return path
+    if path:
+        return path
+
+    raise RuntimeError(
+        "hapbeat-helper not found next to the current Python "
+        f"({sys.executable}) and not on PATH. "
+        "Install via pipx: pipx install hapbeat-helper"
+    )
 
 
 def _write_plist(exe: str) -> None:

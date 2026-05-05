@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 SHIM_NAME = "HapbeatHelper.vbs"
@@ -43,13 +44,31 @@ def log_path() -> Path:
 
 
 def _hapbeat_helper_path() -> str:
-    path = shutil.which("hapbeat-helper")
-    if not path:
-        raise RuntimeError(
-            "hapbeat-helper is not on PATH. "
-            "Install via pipx: pipx install hapbeat-helper"
-        )
-    return str(Path(path).resolve())
+    """Locate hapbeat-helper.exe, preferring the same venv we are running in.
+
+    Resolution order:
+    1. Sibling of sys.executable: <sys.executable parent>/hapbeat-helper.exe
+       — this is the most reliable and works under git-bash where shutil.which
+       can fail on Windows symlinks (e.g. /c/pipx/bin/hapbeat-helper.exe).
+    2. shutil.which("hapbeat-helper") — fallback for cases where the helper
+       was installed system-wide (no pipx venv).
+    """
+    # Sibling-of-python lookup first.
+    py_dir = Path(sys.executable).resolve().parent
+    candidate = py_dir / "hapbeat-helper.exe"
+    if candidate.is_file():
+        return str(candidate)
+
+    # Fallback: PATH search.
+    path = shutil.which("hapbeat-helper") or shutil.which("hapbeat-helper.exe")
+    if path:
+        return str(Path(path).resolve())
+
+    raise RuntimeError(
+        "hapbeat-helper.exe not found next to the current Python "
+        f"({sys.executable}) and not on PATH. "
+        "Install via pipx: pipx install hapbeat-helper"
+    )
 
 
 def _build_vbs(exe: str, log: Path) -> str:
