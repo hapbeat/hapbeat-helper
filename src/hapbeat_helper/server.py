@@ -320,6 +320,10 @@ class HelperServer:
                     "fw": r.get("fw"),
                     "group": r.get("group"),
                     "wifi_connected": r.get("wifi_connected"),
+                    # Hardware board ID (e.g. band_wl_v3 / band_wl_v4 /
+                    # duo_wl_v3) — Studio uses this to warn the user
+                    # before flashing a build for the wrong board.
+                    "board": r.get("board"),
                 },
             )
 
