@@ -324,13 +324,6 @@ class HelperServer:
                     # duo_wl_v3) — Studio uses this to warn the user
                     # before flashing a build for the wrong board.
                     "board": r.get("board"),
-                    # Live SDK connection (CONNECT_STATUS payload).
-                    # Surfaced so Studio can show "now playing" — which
-                    # Unity / Unreal / etc. app currently has the
-                    # device claimed via UDP.
-                    "app_connected": r.get("app_connected"),
-                    "app_name": r.get("app_name"),
-                    "app_device": r.get("app_device"),
                 },
             )
 
