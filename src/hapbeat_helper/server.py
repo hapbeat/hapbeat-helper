@@ -506,11 +506,45 @@ class HelperServer:
             }))
             return
 
-        # Run TCP I/O off the asyncio loop.
+        # Run TCP I/O off the asyncio loop. We deliberately loop over
+        # targets here (rather than calling _send_tcp_to_many) so the
+        # WebSocket caller can emit per-target `write_progress` events
+        # in between — Studio surfaces these as a per-device progress
+        # row during deploy. Total wall-clock cost is the same.
         loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, _send_tcp_to_many, targets, cmd,
-        )
+        total = len(targets)
+        results: list[dict] = []
+        for idx, ip in enumerate(targets):
+            await self._broadcast({
+                "type": "write_progress",
+                "payload": {
+                    "cmd": cmd_name,
+                    "ip": ip,
+                    "index": idx,
+                    "total": total,
+                    "phase": "sending",
+                },
+            })
+            r = await loop.run_in_executor(None, _send_tcp_to_one, ip, cmd)
+            results.append(r)
+            resp = r.get("response") or {}
+            await self._broadcast({
+                "type": "write_progress",
+                "payload": {
+                    "cmd": cmd_name,
+                    "ip": ip,
+                    "index": idx,
+                    "total": total,
+                    "phase": "done" if r.get("success") else "failed",
+                    "success": bool(r.get("success")),
+                    "message": (
+                        resp.get("message")
+                        or resp.get("error")
+                        or resp.get("status")
+                        or ""
+                    ),
+                },
+            })
         ok_count = sum(1 for r in results if r.get("success"))
 
         # Build a verbose, per-target reason string so the Studio log
@@ -1009,73 +1043,77 @@ class HelperServer:
 
 # ── Background-thread helpers (no asyncio) ───────────────────
 
-def _send_tcp_to_many(targets: list[str], cmd: dict) -> list[dict]:
-    """Send *cmd* to every IP in *targets* sequentially. Returns a list
-    of ``{ip, success, response}`` results — failure responses now
-    carry the concrete OSError string so Studio's log drawer can
-    surface *why* the TCP write failed (timeout vs ECONNREFUSED vs
-    EHOSTUNREACH all imply different fixes).
+def _send_tcp_to_one(ip: str, cmd: dict) -> dict:
+    """Send *cmd* to a single IP. Extracted from `_send_tcp_to_many` so
+    callers that want per-target progress can loop in their own context
+    (e.g. emitting ``write_progress`` push events between targets).
+    Returns ``{ip, success, response}``.
     """
     cmd_name = cmd.get("cmd", "?")
-    out: list[dict] = []
-    for ip in targets:
-        with TcpRawConnection(ip) as conn:
-            t0 = time.monotonic()
-            try:
-                connected = conn.connect()
-            except OSError as exc:
-                out.append({"ip": ip, "success": False,
-                            "response": {
-                                "error": f"connect raised {type(exc).__name__}: {exc}",
-                                "phase": "connect",
-                                "cmd": cmd_name,
-                            }})
-                continue
-            if not connected:
-                # Most common path: TCP 7701 closed (no firmware
-                # listening / firewall) or device is in a transient
-                # post-Wi-Fi-switch state where the listening socket
-                # hasn't been re-bound yet. Surface it explicitly.
-                out.append({"ip": ip, "success": False,
-                            "response": {
-                                "error": (
-                                    f"TCP 7701 connect failed to {ip} "
-                                    f"({(time.monotonic() - t0) * 1000:.0f} ms). "
-                                    "デバイスがオンラインに見えても TCP サーバが "
-                                    "起動していない場合があります — 電源を一度 OFF→ON してください。"
-                                ),
-                                "phase": "connect",
-                                "cmd": cmd_name,
-                            }})
-                continue
-            try:
-                conn.send_json(cmd)
-                resp = conn.read_response(timeout=10.0) or {}
-            except OSError as exc:
-                out.append({"ip": ip, "success": False,
-                            "response": {
-                                "error": f"send/read raised {type(exc).__name__}: {exc}",
-                                "phase": "io",
-                                "cmd": cmd_name,
-                            }})
-                continue
-            if not resp:
-                out.append({"ip": ip, "success": False,
-                            "response": {
-                                "error": (
-                                    "device disconnected before reply "
-                                    "(connection accepted but TCP server closed it)"
-                                ),
-                                "phase": "no_reply",
-                                "cmd": cmd_name,
-                            }})
-                continue
-            out.append({
-                "ip": ip,
-                "success": resp.get("status") == "ok",
-                "response": resp,
-            })
-    return out
+    with TcpRawConnection(ip) as conn:
+        t0 = time.monotonic()
+        try:
+            connected = conn.connect()
+        except OSError as exc:
+            return {"ip": ip, "success": False,
+                    "response": {
+                        "error": f"connect raised {type(exc).__name__}: {exc}",
+                        "phase": "connect",
+                        "cmd": cmd_name,
+                    }}
+        if not connected:
+            # Most common path: TCP 7701 closed (no firmware listening /
+            # firewall) or device is in a transient post-Wi-Fi-switch
+            # state where the listening socket hasn't been re-bound yet.
+            return {"ip": ip, "success": False,
+                    "response": {
+                        "error": (
+                            f"TCP 7701 connect failed to {ip} "
+                            f"({(time.monotonic() - t0) * 1000:.0f} ms). "
+                            "デバイスがオンラインに見えても TCP サーバが "
+                            "起動していない場合があります — 電源を一度 OFF→ON してください。"
+                        ),
+                        "phase": "connect",
+                        "cmd": cmd_name,
+                    }}
+        try:
+            conn.send_json(cmd)
+            resp = conn.read_response(timeout=10.0) or {}
+        except OSError as exc:
+            return {"ip": ip, "success": False,
+                    "response": {
+                        "error": f"send/read raised {type(exc).__name__}: {exc}",
+                        "phase": "io",
+                        "cmd": cmd_name,
+                    }}
+        if not resp:
+            return {"ip": ip, "success": False,
+                    "response": {
+                        "error": (
+                            "device disconnected before reply "
+                            "(connection accepted but TCP server closed it)"
+                        ),
+                        "phase": "no_reply",
+                        "cmd": cmd_name,
+                    }}
+        return {
+            "ip": ip,
+            "success": resp.get("status") == "ok",
+            "response": resp,
+        }
+
+
+def _send_tcp_to_many(targets: list[str], cmd: dict) -> list[dict]:
+    """Send *cmd* to every IP in *targets* sequentially. Returns a list
+    of ``{ip, success, response}`` results — failure responses carry
+    the concrete OSError string so Studio's log drawer can surface
+    *why* the TCP write failed (timeout vs ECONNREFUSED vs
+    EHOSTUNREACH all imply different fixes).
+
+    For per-target progress streaming, use ``_send_tcp_to_one`` in your
+    own loop instead and emit ``write_progress`` between iterations.
+    """
+    return [_send_tcp_to_one(ip, cmd) for ip in targets]
 
 
 def _send_tcp_query(ip: str, cmd_name: str) -> Optional[dict]:
