@@ -294,6 +294,19 @@ class HelperServer:
                  "address": payload.get("address", "")},
             )
 
+        elif msg_type == "set_oled_brightness":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_oled_brightness",
+                 "level": int(payload.get("level", 2))},
+            )
+
+        elif msg_type == "get_oled_brightness":
+            await self._handle_query(
+                ws, payload, "get_oled_brightness", "oled_brightness_result",
+                lambda r: {"level": r.get("level", 2)},
+            )
+
         elif msg_type == "set_group":
             await self._handle_tcp_command(
                 ws, payload,
