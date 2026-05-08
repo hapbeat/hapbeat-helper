@@ -100,6 +100,9 @@ class HelperServer:
         # for the same IP we just rely on the first thread fanning out.
         self._log_threads: dict[str, threading.Thread] = {}
         self._log_stop_flags: dict[str, threading.Event] = {}
+        # IPs for which an OTA is currently in flight. log_tail supervisor
+        # uses this to suppress reconnect attempts during OTA.
+        self._ota_in_progress: set[str] = set()
 
         # ip -> asyncio.Lock for serializing TCP traffic to that device.
         #
@@ -867,10 +870,14 @@ class HelperServer:
         # OTA off or itself fail (= the "OTA never progresses" symptom on
         # fresh boot, where DeviceDetail spams 5 queries the moment the
         # device shows up online).
-        async with self._get_tcp_lock(target):
-            ok, msg = await loop.run_in_executor(
-                None, _do_ota_to_device, target, bin_bytes, progress,
-            )
+        self._ota_in_progress.add(target)
+        try:
+            async with self._get_tcp_lock(target):
+                ok, msg = await loop.run_in_executor(
+                    None, _do_ota_to_device, target, bin_bytes, progress,
+                )
+        finally:
+            self._ota_in_progress.discard(target)
         await self._broadcast({
             "type": "ota_result",
             "payload": {"device": target, "success": ok, "message": msg},
@@ -948,12 +955,21 @@ class HelperServer:
                     logger.exception("log tail (%s) crashed; restarting", target)
                 if stop.is_set():
                     break
-                # Short backoff before reconnecting; longer if firmware
-                # is busy (give the displacing command time to finish).
-                time.sleep(backoff)
-                backoff = min(backoff * 1.5, 2.0)
-                if not stop.is_set():
-                    logger.info("log tail (%s) auto-restart", target)
+                # OTA 中は log_tail の再接続を抑止して静かに待機する。
+                # OTA 完了後に 1 回だけ再接続させる。
+                if target in self._ota_in_progress:
+                    while not stop.is_set() and target in self._ota_in_progress:
+                        time.sleep(0.5)
+                    if not stop.is_set():
+                        logger.info("log tail (%s) OTA 完了 — 再接続", target)
+                    backoff = 0.3
+                else:
+                    # Short backoff before reconnecting; longer if firmware
+                    # is busy (give the displacing command time to finish).
+                    time.sleep(backoff)
+                    backoff = min(backoff * 1.5, 2.0)
+                    if not stop.is_set():
+                        logger.info("log tail (%s) auto-restart", target)
             # Natural exit — clean up dict entries so subsequent
             # subscribe_logs requests can re-create the thread.
             self._log_stop_flags.pop(target, None)
@@ -1318,7 +1334,7 @@ def _do_ota_to_device(
             sent = 0
             for off in range(0, file_size, chunk_size):
                 chunk = bin_bytes[off : off + chunk_size]
-                conn.send_raw(chunk)
+                conn.send_raw(chunk, timeout=10.0)
                 sent += len(chunk)
                 pct = int(sent / file_size * 95) + 1
                 progress("upload", pct, f"送信中 {sent:,}/{file_size:,}")

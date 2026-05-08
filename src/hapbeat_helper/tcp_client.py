@@ -167,10 +167,18 @@ class TcpRawConnection:
         line = json.dumps(cmd, separators=(",", ":")) + "\n"
         self.sock.sendall(line.encode("utf-8"))
 
-    def send_raw(self, data: bytes) -> None:
+    def send_raw(self, data: bytes, *, timeout: float | None = None) -> None:
         if not self.sock:
             raise OSError("not connected")
-        self.sock.sendall(data)
+        if timeout is not None:
+            prev = self.sock.gettimeout()
+            self.sock.settimeout(timeout)
+            try:
+                self.sock.sendall(data)
+            finally:
+                self.sock.settimeout(prev)
+        else:
+            self.sock.sendall(data)
 
     def read_response(self, timeout: float = 5.0) -> Optional[dict]:
         if not self.sock:
