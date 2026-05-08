@@ -101,6 +101,31 @@ class HelperServer:
         self._log_threads: dict[str, threading.Thread] = {}
         self._log_stop_flags: dict[str, threading.Event] = {}
 
+        # ip -> asyncio.Lock for serializing TCP traffic to that device.
+        #
+        # Why: firmware tcp_server.cpp uses a single `s_client` slot; when
+        # a second client connects, the first is idle-displaced mid-query.
+        # Studio's DeviceDetail fires 5+ queries (get_info / get_wifi_status
+        # / get_ap_status / get_oled_brightness / list_wifi_profiles) the
+        # moment a device is selected, and an OTA / write_ui_config / kit
+        # deploy on top of that means several connections racing for the
+        # same s_client slot. The losers come back as silent "displaced"
+        # errors and the user sees "OTA never progressed" or random
+        # query timeouts on a freshly-booted device.
+        #
+        # The lock makes every TCP-to-device operation queue per-IP. Two
+        # devices can still be hit in parallel; only same-device traffic
+        # serializes. (User report 2026-05-08: "hapbeat 起動 → helper 起動
+        # で OTA が刺さる現象は再現性がある".)
+        self._tcp_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_tcp_lock(self, ip: str) -> asyncio.Lock:
+        lock = self._tcp_locks.get(ip)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._tcp_locks[ip] = lock
+        return lock
+
     # ── Run / shutdown ───────────────────────────────────────
 
     async def run(self) -> None:
@@ -211,10 +236,18 @@ class HelperServer:
     # ── WS handlers ──────────────────────────────────────────
 
     async def _handler(self, ws) -> None:
+        from hapbeat_helper import __version__ as _helper_version
         self._clients.add(ws)
         remote = getattr(ws, "remote_address", None)
         logger.info("Studio connected: %s", remote)
         try:
+            # Send helper hello (= version) FIRST so Studio can render it
+            # before any device events arrive. Studio displays this in
+            # the header next to the "Helper 接続中" indicator.
+            await ws.send(json.dumps({
+                "type": "helper_hello",
+                "payload": {"version": _helper_version},
+            }))
             await ws.send(json.dumps(self._device_list_msg()))
             async for raw in ws:
                 try:
@@ -237,6 +270,28 @@ class HelperServer:
             pass
         finally:
             self._clients.discard(ws)
+            # If this was the last WS client, tear down all log_tail
+            # subscribers. Without this, a closed-tab / refreshed Studio
+            # leaves _log_tail_worker threads running indefinitely; each
+            # holds a TCP connection to the device with `s_log_stream=true`
+            # latched on firmware. New deploy/OTA attempts then race
+            # against a "stale but flagged" log slot — and the firmware's
+            # displacement logic has `!s_log_stream` in its gate, so the
+            # stale slot wins and refuses every subsequent SYN until power
+            # cycle. (User report 2026-05-08: 「しばらく放置していると
+            # TCP handshake failed が連発する」)
+            if not self._clients and self._log_threads:
+                logger.info(
+                    "last WS client gone — stopping %d log_tail thread(s)",
+                    len(self._log_threads),
+                )
+                # Snapshot before mutating
+                ips_to_stop = list(self._log_threads.keys())
+                for ip in ips_to_stop:
+                    stop = self._log_stop_flags.pop(ip, None)
+                    self._log_threads.pop(ip, None)
+                    if stop:
+                        stop.set()
             logger.info("Studio disconnected: %s", remote)
 
     async def _dispatch(self, ws, msg: dict) -> None:
@@ -322,6 +377,46 @@ class HelperServer:
         elif msg_type == "clear_wifi":
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "clear_wifi"},
+            )
+
+        # ── SoftAP mode handlers (added 2026-05-08) ──
+        # Studio (DeviceDetail) sends `get_ap_status` immediately on every
+        # device selection, so an outdated helper without these stanzas
+        # spammed `ERROR: unknown type: get_ap_status` toasts every time.
+        # The firmware (tcp_server.cpp) already implements all five — we
+        # just need to relay them.
+        elif msg_type == "get_ap_status":
+            await self._handle_query(
+                ws, payload, "get_ap_status", "ap_status_result",
+                lambda r: {
+                    "mode": r.get("mode"),
+                    "ap_ssid": r.get("ap_ssid"),
+                    "ap_ip": r.get("ap_ip"),
+                    "ap_has_pass": r.get("ap_has_pass"),
+                    "ap_client_count": r.get("ap_client_count"),
+                },
+            )
+
+        elif msg_type == "enter_ap_mode":
+            await self._handle_tcp_command(
+                ws, payload, {"cmd": "enter_ap_mode"},
+            )
+
+        elif msg_type == "enter_sta_mode":
+            await self._handle_tcp_command(
+                ws, payload, {"cmd": "enter_sta_mode"},
+            )
+
+        elif msg_type == "set_ap_pass":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_ap_pass",
+                 "pass": payload.get("password", payload.get("pass", ""))},
+            )
+
+        elif msg_type == "clear_ap_pass":
+            await self._handle_tcp_command(
+                ws, payload, {"cmd": "clear_ap_pass"},
             )
 
         elif msg_type == "get_info":
@@ -524,6 +619,9 @@ class HelperServer:
         # WebSocket caller can emit per-target `write_progress` events
         # in between — Studio surfaces these as a per-device progress
         # row during deploy. Total wall-clock cost is the same.
+        #
+        # Per-IP lock: firmware has a single TCP client slot, so we
+        # serialize same-device traffic to avoid mid-query displacement.
         loop = asyncio.get_running_loop()
         total = len(targets)
         results: list[dict] = []
@@ -538,7 +636,8 @@ class HelperServer:
                     "phase": "sending",
                 },
             })
-            r = await loop.run_in_executor(None, _send_tcp_to_one, ip, cmd)
+            async with self._get_tcp_lock(ip):
+                r = await loop.run_in_executor(None, _send_tcp_to_one, ip, cmd)
             results.append(r)
             resp = r.get("response") or {}
             await self._broadcast({
@@ -614,9 +713,11 @@ class HelperServer:
             }))
             return
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, _send_tcp_query, target, cmd_name,
-        )
+        # Per-IP lock — see _handle_tcp_command for rationale.
+        async with self._get_tcp_lock(target):
+            result = await loop.run_in_executor(
+                None, _send_tcp_query, target, cmd_name,
+            )
         if result and result.get("status") == "ok":
             payload_out = {"device": target, **extract_fields(result)}
             await ws.send(json.dumps({
@@ -646,9 +747,11 @@ class HelperServer:
             }))
             return
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, _send_tcp_passthrough, target, cmd,
-        )
+        # Per-IP lock — see _handle_tcp_command for rationale.
+        async with self._get_tcp_lock(target):
+            result = await loop.run_in_executor(
+                None, _send_tcp_passthrough, target, cmd,
+            )
         await ws.send(json.dumps({
             "type": response_type,
             "payload": {"device": target, **(result or {"error": "no response"})},
@@ -758,9 +861,16 @@ class HelperServer:
                 loop,
             )
 
-        ok, msg = await loop.run_in_executor(
-            None, _do_ota_to_device, target, bin_bytes, progress,
-        )
+        # Per-IP lock — OTA holds the device's TCP slot for the full
+        # transfer. Without serialization, a stray get_info / get_ap_status
+        # query from Studio would race for the same slot and either kick
+        # OTA off or itself fail (= the "OTA never progresses" symptom on
+        # fresh boot, where DeviceDetail spams 5 queries the moment the
+        # device shows up online).
+        async with self._get_tcp_lock(target):
+            ok, msg = await loop.run_in_executor(
+                None, _do_ota_to_device, target, bin_bytes, progress,
+            )
         await self._broadcast({
             "type": "ota_result",
             "payload": {"device": target, "success": ok, "message": msg},
@@ -820,11 +930,39 @@ class HelperServer:
                 loop,
             )
 
+        # Self-healing supervisor: the firmware has a single TCP client
+        # slot, so a log_tail subscription gets displaced whenever Studio
+        # issues a regular command (write_ui_config, OTA, kit deploy,
+        # get_info, etc.). Without restart, the user loses log forwarding
+        # forever until they manually re-open LogDrawer. This loop
+        # detects natural exits (= displaced or peer dropped) and
+        # restarts the underlying TCP after a short backoff. Stops only
+        # when the explicit `stop` event is set (= unsubscribe / WS
+        # close handler).
+        def _supervised_worker() -> None:
+            backoff = 0.3
+            while not stop.is_set():
+                try:
+                    _log_tail_worker(target, stop, relay)
+                except Exception:  # noqa: BLE001
+                    logger.exception("log tail (%s) crashed; restarting", target)
+                if stop.is_set():
+                    break
+                # Short backoff before reconnecting; longer if firmware
+                # is busy (give the displacing command time to finish).
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 2.0)
+                if not stop.is_set():
+                    logger.info("log tail (%s) auto-restart", target)
+            # Natural exit — clean up dict entries so subsequent
+            # subscribe_logs requests can re-create the thread.
+            self._log_stop_flags.pop(target, None)
+            self._log_threads.pop(target, None)
+
         t = threading.Thread(
-            target=_log_tail_worker,
-            args=(target, stop, relay),
+            target=_supervised_worker,
             daemon=True,
-            name=f"log-tail-{target}",
+            name=f"log-tail-sup-{target}",
         )
         self._log_threads[target] = t
         t.start()
@@ -855,9 +993,11 @@ class HelperServer:
             }))
             return
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, _send_tcp_query, target, "get_volume",
-        )
+        # Per-IP lock — see _handle_tcp_command for rationale.
+        async with self._get_tcp_lock(target):
+            result = await loop.run_in_executor(
+                None, _send_tcp_query, target, "get_volume",
+            )
         if result and result.get("status") == "ok":
             self.registry.update_volume(
                 target,
@@ -953,10 +1093,14 @@ class HelperServer:
                             pass
                     return cb
 
-                ok, msg = await loop.run_in_executor(
-                    None, _deploy_kit_to_device,
-                    ip, pack_dir, kit_id, make_progress(ip),
-                )
+                # Per-IP lock — kit deploy holds the device's TCP slot
+                # for the full transfer (multiple file_begin / chunks /
+                # kit_commit). See _handle_tcp_command for rationale.
+                async with self._get_tcp_lock(ip):
+                    ok, msg = await loop.run_in_executor(
+                        None, _deploy_kit_to_device,
+                        ip, pack_dir, kit_id, make_progress(ip),
+                    )
                 await self._broadcast({
                     "type": "deploy_result",
                     "payload": {
