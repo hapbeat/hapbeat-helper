@@ -103,6 +103,9 @@ class HelperServer:
         # IPs for which an OTA is currently in flight. log_tail supervisor
         # uses this to suppress reconnect attempts during OTA.
         self._ota_in_progress: set[str] = set()
+        # ip -> relay callable, stored so _resume_log_tail can restart a
+        # supervisor after OTA without a new subscribe_logs handshake.
+        self._log_relays: dict[str, Any] = {}
 
         # ip -> asyncio.Lock for serializing TCP traffic to that device.
         #
@@ -128,6 +131,69 @@ class HelperServer:
             lock = asyncio.Lock()
             self._tcp_locks[ip] = lock
         return lock
+
+    def _pause_log_tail(self, ip: str) -> bool:
+        """Stop the log_tail supervisor for *ip* and wait for it to exit.
+
+        Returns True if a supervisor was running (caller should call
+        _resume_log_tail after OTA to restart it).  The stop event is set
+        so the thread won't reconnect; we then join with a short timeout so
+        the device's TCP slot is freed before OTA tries to connect.
+        """
+        stop = self._log_stop_flags.pop(ip, None)
+        t = self._log_threads.pop(ip, None)
+        if stop is None or t is None:
+            return False
+        stop.set()
+        t.join(timeout=1.5)
+        return True
+
+    def _resume_log_tail(self, ip: str) -> None:
+        """Restart the log_tail supervisor for *ip* after OTA.
+
+        Only restarts if a relay was previously stored (i.e. the Studio had
+        subscribed to logs for this device before OTA began).
+        """
+        relay = self._log_relays.get(ip)
+        if relay is None:
+            return
+        if ip in self._log_threads:
+            return  # already running (shouldn't happen, but guard)
+
+        stop = threading.Event()
+        self._log_stop_flags[ip] = stop
+
+        def _supervised_worker() -> None:
+            backoff = 0.3
+            while not stop.is_set():
+                try:
+                    _log_tail_worker(ip, stop, relay)
+                except Exception:  # noqa: BLE001
+                    logger.exception("log tail (%s) crashed; restarting", ip)
+                if stop.is_set():
+                    break
+                if ip in self._ota_in_progress:
+                    while not stop.is_set() and ip in self._ota_in_progress:
+                        time.sleep(0.5)
+                    if not stop.is_set():
+                        logger.info("log tail (%s) OTA 完了 — 再接続", ip)
+                    backoff = 0.3
+                else:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 1.5, 2.0)
+                    if not stop.is_set():
+                        logger.info("log tail (%s) auto-restart", ip)
+            self._log_stop_flags.pop(ip, None)
+            self._log_threads.pop(ip, None)
+
+        t = threading.Thread(
+            target=_supervised_worker,
+            daemon=True,
+            name=f"log-tail-sup-{ip}",
+        )
+        self._log_threads[ip] = t
+        t.start()
+        logger.info("log tail (%s) resumed after OTA", ip)
 
     # ── Run / shutdown ───────────────────────────────────────
 
@@ -864,20 +930,42 @@ class HelperServer:
                 loop,
             )
 
+        # Pause any active log_tail for this device BEFORE acquiring the
+        # TCP lock.  The firmware has one TCP client slot; if log_tail
+        # holds it (or is mid-reconnect) when OTA connects, the two
+        # threads race and OTA may lose the slot silently.  Pausing first
+        # gives OTA exclusive access from the start.
+        had_log_tail = self._pause_log_tail(target)
+
         # Per-IP lock — OTA holds the device's TCP slot for the full
         # transfer. Without serialization, a stray get_info / get_ap_status
         # query from Studio would race for the same slot and either kick
-        # OTA off or itself fail (= the "OTA never progresses" symptom on
-        # fresh boot, where DeviceDetail spams 5 queries the moment the
-        # device shows up online).
+        # OTA off or itself fail.
         self._ota_in_progress.add(target)
         try:
             async with self._get_tcp_lock(target):
-                ok, msg = await loop.run_in_executor(
-                    None, _do_ota_to_device, target, bin_bytes, progress,
-                )
+                # Safety net: if the executor thread blocks indefinitely
+                # (e.g. Windows WinError 10054 / sendall race), the lock
+                # would never be released and subsequent OTA / commands
+                # would hang forever until helper restart.  600 s is well
+                # above the worst-case transfer time (~1.7 MB / 5 KB/s).
+                try:
+                    ok, msg = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, _do_ota_to_device, target, bin_bytes, progress,
+                        ),
+                        timeout=600.0,
+                    )
+                except asyncio.TimeoutError:
+                    ok = False
+                    msg = "phase=stuck: OTA executor blocked >600 s — recovered"
+                    logger.error(
+                        "OTA executor stuck for %s >600 s — forcing recovery", target,
+                    )
         finally:
             self._ota_in_progress.discard(target)
+            if had_log_tail:
+                self._resume_log_tail(target)
         await self._broadcast({
             "type": "ota_result",
             "payload": {"device": target, "success": ok, "message": msg},
@@ -981,6 +1069,7 @@ class HelperServer:
             name=f"log-tail-sup-{target}",
         )
         self._log_threads[target] = t
+        self._log_relays[target] = relay
         t.start()
         await ws.send(json.dumps({
             "type": "log_subscription",
