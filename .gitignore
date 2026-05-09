@@ -28,3 +28,8 @@ logs/
 # Misc local junk
 *.stackdump
 lauch
+
+# Internal dev notes — moved to workspace-level (private) per
+# 2026-05-10 policy. Local-only scratch space; canonical location is
+# hapbeat-sdk-workspace/dev-notes/helper/ in the workspace (private) repo.
+dev-notes/
