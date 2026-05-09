@@ -134,7 +134,7 @@ hapbeat-helper uninstall-service
 
 Platform notes:
 - **macOS** — creates `~/Library/LaunchAgents/com.hapbeat.helper.plist` (launchd)
-- **Windows** — registers a Task Scheduler entry (`HapbeatHelper`) that runs on login
+- **Windows** — drops a hidden VBS shim into the Startup folder (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\hapbeat-helper.vbs`) that launches the daemon at login with no console window. stdout/stderr → `%LOCALAPPDATA%\hapbeat-helper\hapbeat-helper.log`
 
 ### Option B — Foreground (dev / debug)
 

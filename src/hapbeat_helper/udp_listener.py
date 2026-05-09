@@ -51,6 +51,13 @@ class UdpListener:
     def add_rtt_listener(self, cb: RttCallback) -> None:
         self._rtt_callbacks.append(cb)
 
+    def remove_rtt_listener(self, cb: RttCallback) -> None:
+        """Best-effort: silently no-op if the callback wasn't registered."""
+        try:
+            self._rtt_callbacks.remove(cb)
+        except ValueError:
+            pass
+
     # ── Lifecycle ────────────────────────────────────────────
 
     def start(self) -> bool:

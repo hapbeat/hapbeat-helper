@@ -2,7 +2,7 @@
 
 Dispatches to the appropriate OS implementation:
 - macOS   → service.macos   (launchd plist)
-- Windows → service.windows (Task Scheduler via schtasks)
+- Windows → service.windows (Startup-folder VBS shim — hidden window)
 """
 
 from __future__ import annotations

@@ -91,7 +91,7 @@ hapbeat-helper install-service
 | OS | 仕組み |
 |---|---|
 | macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd） |
-| Windows | タスク スケジューラ エントリ `HapbeatHelper`（ログイン時起動） |
+| Windows | スタートアップフォルダに `hapbeat-helper.vbs` shim を配置（Hidden window で `cmd /c hapbeat-helper.exe start` をログイン時起動。stdout/stderr → `%LOCALAPPDATA%\hapbeat-helper\hapbeat-helper.log`） |
 
 登録状態を確認するには:
 

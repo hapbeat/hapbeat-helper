@@ -33,10 +33,3 @@ def test_offline_after_threshold():
     # Simulate stale last_seen
     dev.last_seen = time.monotonic() - 999
     assert dev.is_online is False
-
-
-def test_remove_device():
-    reg = DeviceRegistry()
-    reg.upsert_device({"ip": "10.0.0.1"})
-    reg.remove_device("10.0.0.1")
-    assert reg.get_device("10.0.0.1") is None

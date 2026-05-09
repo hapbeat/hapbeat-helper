@@ -367,13 +367,6 @@ class HelperServer:
                 lambda r: {"level": r.get("level", 2)},
             )
 
-        elif msg_type == "set_group":
-            await self._handle_tcp_command(
-                ws, payload,
-                {"cmd": "set_group",
-                 "group": int(payload.get("group", 0))},
-            )
-
         elif msg_type == "reboot":
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "reboot"},
@@ -804,10 +797,7 @@ class HelperServer:
                 }))
         finally:
             # No remove API on UdpListener; clear by resetting the list.
-            try:
-                self.udp._rtt_callbacks.remove(on_rtt)
-            except (ValueError, AttributeError):
-                pass
+            self.udp.remove_rtt_listener(on_rtt)
 
     async def _handle_ota_data(self, ws, payload: dict) -> None:
         """Receive a base64-encoded firmware image and stream it to one or
@@ -1352,19 +1342,6 @@ def _send_tcp_to_one(ip: str, cmd: dict) -> dict:
             "success": resp.get("status") == "ok",
             "response": resp,
         }
-
-
-def _send_tcp_to_many(targets: list[str], cmd: dict) -> list[dict]:
-    """Send *cmd* to every IP in *targets* sequentially. Returns a list
-    of ``{ip, success, response}`` results — failure responses carry
-    the concrete OSError string so Studio's log drawer can surface
-    *why* the TCP write failed (timeout vs ECONNREFUSED vs
-    EHOSTUNREACH all imply different fixes).
-
-    For per-target progress streaming, use ``_send_tcp_to_one`` in your
-    own loop instead and emit ``write_progress`` between iterations.
-    """
-    return [_send_tcp_to_one(ip, cmd) for ip in targets]
 
 
 def _send_tcp_query(ip: str, cmd_name: str) -> Optional[dict]:

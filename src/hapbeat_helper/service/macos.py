@@ -86,12 +86,14 @@ def _bootout() -> None:
 
 def install() -> None:
     exe = _hapbeat_helper_path()
-    # If already loaded, bootout first (idempotent reinstall)
-    if is_registered():
+    # If a stale plist exists, unload it first so bootstrap doesn't see
+    # a duplicate label.  ``_bootout`` is harmless if the job isn't
+    # currently loaded.
+    if PLIST_PATH.exists():
         _bootout()
     _write_plist(exe)
     _bootstrap()
-    print(f"hapbeat-helper service installed and started.")
+    print("hapbeat-helper service installed and started.")
     print(f"  plist: {PLIST_PATH}")
     print(f"  log:   {LOG_PATH}")
 

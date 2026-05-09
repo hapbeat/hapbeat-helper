@@ -116,14 +116,6 @@ class DeviceRegistry:
                 dev.volume_steps = steps
         self._notify()
 
-    def remove_device(self, ip: str) -> None:
-        with self._lock:
-            if ip in self._devices:
-                del self._devices[ip]
-            else:
-                return
-        self._notify()
-
     # ── Query API ────────────────────────────────────────────
 
     def get_all_devices(self) -> dict[str, HapbeatDevice]:
