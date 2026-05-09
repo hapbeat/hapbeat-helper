@@ -20,6 +20,7 @@ import base64
 import io
 import json
 import logging
+import select
 import shutil
 import socket
 import struct
@@ -1320,15 +1321,76 @@ def _send_tcp_query(ip: str, cmd_name: str) -> Optional[dict]:
         return conn.read_response(timeout=5.0)
 
 
+def _drain_pending_lines(
+    sock: socket.socket, buf: bytes, *, max_bytes: int = 65536,
+) -> tuple[list[dict], bytes, bool]:
+    """Non-blocking drain of any complete JSON lines on *sock*.
+
+    Returns ``(parsed_lines, remaining_buf, eof)``.  ``eof`` is True if
+    the peer closed (recv returned empty).  Never blocks — uses
+    ``select`` with timeout=0.
+    """
+    parsed: list[dict] = []
+    eof = False
+    total = 0
+    while total < max_bytes:
+        try:
+            ready, _, _ = select.select([sock], [], [], 0)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            break
+        try:
+            chunk = sock.recv(4096)
+        except (BlockingIOError, socket.timeout):
+            break
+        except OSError:
+            break
+        if not chunk:
+            eof = True
+            break
+        buf += chunk
+        total += len(chunk)
+
+    while b"\n" in buf:
+        line_b, buf = buf.split(b"\n", 1)
+        line = line_b.decode("utf-8", errors="replace").strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return parsed, buf, eof
+
+
 def _do_ota_to_device(
     ip: str, bin_bytes: bytes, progress,
 ) -> tuple[bool, str]:
     """Push a firmware image to one device over TCP 7701.
 
-    Mirrors `transport._do_ota_single` in the manager. Calls `progress(
-    phase, percent, message)` as the worker advances.
+    Streaming is interleaved with non-blocking recv so we can surface the
+    *device-confirmed* progress (firmware emits ``{"status":"progress",
+    "percent":N}`` every 5 %) instead of just helper's send-buffer
+    progress.  This catches the misleading "28 % then stuck" symptom:
+    helper's local TCP send buffer happily absorbs the first ~half MB
+    even when the device is not draining its RX, so the old
+    bytes-sent-only progress could climb to ~28 % while the device was
+    actually stuck at 0 %.  We now abort early with ``phase=stall`` when
+    the device fails to confirm any progress within
+    ``NO_DEVICE_PROGRESS_TIMEOUT`` seconds.
     """
     file_size = len(bin_bytes)
+    chunk_size = 4096
+    # Device must report at least one progress update within this many
+    # seconds of streaming start, otherwise we abort.
+    INITIAL_DEVICE_PROGRESS_GRACE = 8.0
+    # After we've seen *some* device progress, abort if the percent
+    # value doesn't change for this long.
+    NO_DEVICE_PROGRESS_TIMEOUT = 20.0
+    # Log INFO line each time these many percent of *sent* bytes pass.
+    LOG_EVERY_PCT = 5
+
     with TcpRawConnection(ip) as conn:
         t0 = time.monotonic()
         try:
@@ -1347,30 +1409,135 @@ def _do_ota_to_device(
                 "デバイスがオンライン表示でも TCP server が立ち上がっていない "
                 "ことがあります — 電源を OFF→ON してから再試行してください。"
             )
+        sock = conn.sock
+        if sock is None:
+            return False, "phase=connect: socket missing after connect"
+
         try:
             conn.send_json({"cmd": "ota_begin", "size": file_size})
             resp = conn.read_response(timeout=5.0)
             if not resp or resp.get("status") != "ok":
                 return False, f"phase=ota_begin: nack {resp}"
+            logger.info("OTA %s: ota_begin ok, streaming %d bytes", ip, file_size)
 
-            chunk_size = 4096
             sent = 0
+            recv_buf = b""
+            device_pct = 0
+            stream_start = time.monotonic()
+            last_device_pct_change = stream_start
+            last_logged_pct_bucket = 0
+
             for off in range(0, file_size, chunk_size):
                 chunk = bin_bytes[off : off + chunk_size]
-                conn.send_raw(chunk, timeout=10.0)
-                sent += len(chunk)
-                pct = int(sent / file_size * 95) + 1
-                progress("upload", pct, f"送信中 {sent:,}/{file_size:,}")
-
-            progress("flash", 96, "デバイス書込待ち…")
-            while True:
-                resp = conn.read_response(timeout=30.0)
-                if resp is None:
+                try:
+                    conn.send_raw(chunk, timeout=10.0)
+                except OSError as exc:
                     return False, (
-                        "phase=verify: デバイスからの応答が 30 秒以内に来ません。"
-                        " Update.end が失敗している可能性があります — シリアル"
-                        " ログで [OTA] エラー行を確認してください。"
+                        f"phase=stream-send: {type(exc).__name__}: {exc} "
+                        f"(sent={sent:,}/{file_size:,}, device_pct={device_pct})"
                     )
+                sent += len(chunk)
+                sent_pct = int(sent / file_size * 95) + 1
+
+                # Drain any device responses that arrived while we sent.
+                lines, recv_buf, eof = _drain_pending_lines(sock, recv_buf)
+                if eof:
+                    return False, (
+                        f"phase=stream-recv: device closed connection "
+                        f"(sent={sent:,}/{file_size:,}, device_pct={device_pct})"
+                    )
+                for obj in lines:
+                    status = obj.get("status", "")
+                    if status == "progress":
+                        new_pct = int(obj.get("percent", 0))
+                        if new_pct > device_pct:
+                            device_pct = new_pct
+                            last_device_pct_change = time.monotonic()
+                    elif status == "error":
+                        return False, (
+                            f"phase=stream: device error: "
+                            f"{obj.get('message', 'unknown')}"
+                        )
+                    elif status == "ok":
+                        # Unexpected early completion — but treat as success.
+                        progress("done", 100, obj.get("message", "OK"))
+                        return True, obj.get("message", "OK")
+
+                # Stall detection.
+                now = time.monotonic()
+                if device_pct == 0 and (now - stream_start) > INITIAL_DEVICE_PROGRESS_GRACE:
+                    return False, (
+                        f"phase=stall: chunk 送信開始から {now - stream_start:.0f}s 経つが "
+                        f"device は 0% のまま (sent={sent:,}/{file_size:,}). "
+                        "TCP buffer に積まれているだけで device 側 processOtaData が "
+                        "走っていない可能性が高い。device 電源 OFF→ON 推奨。"
+                    )
+                if device_pct > 0 and (now - last_device_pct_change) > NO_DEVICE_PROGRESS_TIMEOUT:
+                    return False, (
+                        f"phase=stall: device は {device_pct}% で "
+                        f"{now - last_device_pct_change:.0f}s 進まず "
+                        f"(sent={sent:,}/{file_size:,}). flash が固まっている可能性。"
+                    )
+
+                # 5%-bucket INFO log so foreground monitoring can pinpoint
+                # where streaming actually stalls.
+                pct_bucket = (sent_pct // LOG_EVERY_PCT) * LOG_EVERY_PCT
+                if pct_bucket > last_logged_pct_bucket:
+                    logger.info(
+                        "OTA %s: sent=%d%% device=%d%% (%d/%d bytes)",
+                        ip, sent_pct, device_pct, sent, file_size,
+                    )
+                    last_logged_pct_bucket = pct_bucket
+
+                # UI: prefer device-confirmed pct so user doesn't get
+                # misled by helper buffer fill.  Fall back to sent_pct
+                # only before first device confirmation.
+                shown = device_pct if device_pct > 0 else 1
+                progress(
+                    "upload", shown,
+                    f"送信 {sent_pct}% / device {device_pct}% "
+                    f"({sent:,}/{file_size:,})",
+                )
+
+            logger.info(
+                "OTA %s: streaming done (sent=%d bytes, device_pct=%d)",
+                ip, sent, device_pct,
+            )
+            progress("flash", max(device_pct, 96), "デバイス書込待ち…")
+
+            # Verify phase — drain remaining buffered lines first, then
+            # block for ok / error.
+            verify_deadline = time.monotonic() + 30.0
+            while time.monotonic() < verify_deadline:
+                # Process any already-buffered lines first.
+                lines, recv_buf, eof = _drain_pending_lines(sock, recv_buf)
+                if eof:
+                    return False, "phase=verify: device closed connection"
+                handled_inline = False
+                for obj in lines:
+                    handled_inline = True
+                    status = obj.get("status", "")
+                    if status == "ok":
+                        progress("done", 100, "OTA 完了")
+                        return True, obj.get("message", "OK")
+                    if status == "error":
+                        return False, (
+                            f"phase=verify: {obj.get('message', 'OTA error')}"
+                        )
+                    if status == "progress":
+                        pct = int(obj.get("percent", 0))
+                        if pct > device_pct:
+                            device_pct = pct
+                        progress(
+                            "flash", min(96 + pct // 25, 99),
+                            f"書込中 {pct}%",
+                        )
+                if handled_inline:
+                    continue
+                # Nothing buffered — block for one more line.
+                resp = conn.read_response(timeout=2.0)
+                if resp is None:
+                    continue  # keep polling until verify_deadline
                 status = resp.get("status", "")
                 if status == "ok":
                     progress("done", 100, "OTA 完了")
@@ -1378,9 +1545,18 @@ def _do_ota_to_device(
                 if status == "error":
                     return False, f"phase=verify: {resp.get('message', 'OTA error')}"
                 if status == "progress":
-                    pct = resp.get("percent", 0)
-                    progress("flash", min(96 + pct // 25, 99),
-                             f"書込中 {pct}%")
+                    pct = int(resp.get("percent", 0))
+                    if pct > device_pct:
+                        device_pct = pct
+                    progress(
+                        "flash", min(96 + pct // 25, 99),
+                        f"書込中 {pct}%",
+                    )
+            return False, (
+                "phase=verify: デバイスからの ok/error が 30 秒以内に来ません。"
+                " Update.end が失敗している可能性があります — シリアルログで "
+                "[OTA] エラー行を確認してください。"
+            )
         except OSError as exc:
             return False, f"phase=io: {type(exc).__name__}: {exc}"
 
