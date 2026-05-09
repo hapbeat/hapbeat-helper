@@ -22,6 +22,7 @@ import json
 import logging
 import shutil
 import socket
+import struct
 import tempfile
 import threading
 import time
@@ -1499,6 +1500,22 @@ def _log_tail_worker(ip: str, stop: threading.Event, relay) -> None:
                 sock.sendall(
                     json.dumps({"cmd": "log_stream", "enable": False}).encode()
                     + b"\n"
+                )
+            except OSError:
+                pass
+            # SO_LINGER(on=1, linger=0): RST on close, freeing both ends
+                # immediately. Same rationale as TcpRawConnection.close —
+                # without this, a displaced log_tail leaves a FIN_WAIT_2
+                # entry on helper and a still-allocated socket fd on the
+                # device's lwIP pool. Repeated displacement (during OTA
+                # supervisor restarts, kit deploys, etc.) silently exhausts
+                # the pool, blocking new accepts. (Diagnosed 2026-05-09:
+                # netstat showed ESTABLISHED + FIN_WAIT_2 piling up to
+                # 192.168.0.108:7701 even after helper Ctrl+C.)
+            try:
+                sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER,
+                    struct.pack("ii", 1, 0),
                 )
             except OSError:
                 pass

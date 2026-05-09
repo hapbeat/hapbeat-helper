@@ -13,10 +13,28 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import struct
 import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# SO_LINGER struct: (l_onoff=1, l_linger=0) → close() sends RST instead
+# of FIN. Why: ESP32 lwIP keeps the per-client socket fd allocated until
+# the firmware loop() reaches its disconnect-cleanup branch, which is
+# *not* reached during OTA (line 1586 short-circuits to processOtaData).
+# Without RST, helper's close() drops to FIN_WAIT_2 waiting for the
+# firmware's FIN, which only arrives much later (or never if loop is
+# busy). Many such half-closed sockets pile up on the device's lwIP
+# pool (LWIP_MAX_SOCKETS ≈ 10) and eventually starve OTA.
+#
+# RST is rude — any unread RX bytes on the device side are discarded.
+# Acceptable for our request/response queries: helper always reads the
+# response before close(). Acceptable for OTA cleanup on failure: we're
+# tearing down anyway. NOT acceptable mid-OTA-success — but the success
+# path closes only after both sides have drained their respective
+# expected exchanges, so applying it uniformly is safe.
+_SO_LINGER_RST = struct.pack("ii", 1, 0)
 
 DEFAULT_PORT = 7701
 # Aggressive timeouts (2026-05-02): Studio users were reporting
@@ -139,22 +157,23 @@ class TcpRawConnection:
         return False
 
     def close(self) -> None:
-        # Issue an explicit shutdown before close. The firmware's
-        # tcp_server.cpp has a single global `s_client` slot and only
-        # accepts a *new* connection when `s_client.connected()`
-        # returns false (tcp_server.cpp:1233). Without an explicit
-        # shutdown, the FIN may sit buffered locally for a while,
-        # which leaves the device's `s_client` in the connected state
-        # — so the next click finds the device "busy" and the new TCP
-        # connect appears to hang/timeout. shutdown(SHUT_RDWR) flushes
-        # the FIN immediately so the device can clean up between
-        # back-to-back requests. (User-reported "詰まり" 2026-05-01.)
+        # SO_LINGER(on=1, linger=0) → close() sends RST. This avoids
+        # FIN_WAIT_2 piling up while the firmware's loop() takes its
+        # time getting around to the disconnect-cleanup branch. See
+        # _SO_LINGER_RST comment for full rationale. Failing to set
+        # the option (e.g. socket already torn down) is harmless — fall
+        # back to plain shutdown/close.
         if self.sock:
             try:
-                self.sock.shutdown(socket.SHUT_RDWR)
+                self.sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, _SO_LINGER_RST,
+                )
             except OSError:
-                # Already closed or never connected — ignore.
-                pass
+                # Some platforms / states reject this — drop to FIN path.
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             try:
                 self.sock.close()
             except OSError:
