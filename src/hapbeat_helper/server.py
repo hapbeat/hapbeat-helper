@@ -1420,6 +1420,21 @@ def _do_ota_to_device(
                 return False, f"phase=ota_begin: nack {resp}"
             logger.info("OTA %s: ota_begin ok, streaming %d bytes", ip, file_size)
 
+            # Workaround for firmware dispatch race: after cmdOtaBegin sets
+            # ``s_ota_active = true``, the firmware's JSON dispatch ``while
+            # (s_client.available())`` loop keeps reading bytes — it does
+            # not re-check the binary-mode flag mid-loop.  If helper's first
+            # chunk arrives in the device's lwIP RX during that same loop
+            # iteration, the binary firmware bytes get fed to the JSON
+            # parser and the device responds with
+            # ``{"status":"error","message":"json parse error: InvalidInput"}``.
+            # Sleeping briefly here lets the device exit the dispatch loop,
+            # return from tcpServerUpdate, and re-enter via the
+            # ``if (s_ota_active) processOtaData()`` short-circuit before
+            # any chunk bytes arrive.  Proper fix is firmware-side; see
+            # hapbeat-device-firmware/instructions/instructions-tcp-dispatch-binary-mode-202605092130.md.
+            time.sleep(0.1)
+
             sent = 0
             recv_buf = b""
             device_pct = 0
