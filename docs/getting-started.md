@@ -164,5 +164,6 @@ pipx uninstall hapbeat-helper
 
 ## 次のステップ
 
+- [CLI リファレンス](./cli-reference.md) — 全サブコマンド（`start` / `stop` / `logs` / `status` / `service-status` ほか）一覧と用例
 - [Hapbeat 初期セットアップ](/docs/studio/initial-setup/) — Hapbeat デバイスを最初に Wi-Fi に乗せる手順（Studio のオンボーディング ウィザード）
 - [最初の Kit を作る](/docs/studio/getting-started/) — Studio で振動コンテンツをデザインする
