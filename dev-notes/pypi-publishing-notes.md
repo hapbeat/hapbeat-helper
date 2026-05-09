@@ -149,7 +149,20 @@ twine upload --repository pypi-helper dist/*    # ← セクション名で指�
 .venv/Scripts/python -m pip install --upgrade build twine
 ```
 
-### ビルド
+### コマンド早見表 (publisher 視点)
+
+| ステップ | コマンド (cwd: hapbeat-helper repo) |
+|---|---|
+| 1. 古い dist 掃除 | `rm -rf dist/ build/ src/*.egg-info/` |
+| 2. wheel + sdist build | `.venv/Scripts/python -m build` |
+| 3. metadata 検証 | `.venv/Scripts/python -m twine check dist/*` |
+| 4. TestPyPI へ upload | `PYTHONIOENCODING=utf-8 PYTHONUTF8=1 .venv/Scripts/python -m twine upload --repository testpypi dist/*` |
+| 5. 動作確認 (別ターミナル) | 「動作確認の早見表」参照 |
+| 6. 本番 PyPI へ upload | `PYTHONIOENCODING=utf-8 PYTHONUTF8=1 .venv/Scripts/python -m twine upload dist/*` |
+
+> ⚠️ **Windows で `PYTHONIOENCODING=utf-8` 必須**: twine の進捗 bar が rich を使い、Windows console は default cp932 で `•` (•) 等が encode できず途中で UnicodeEncodeError → 進捗描画クラッシュ。`PYTHONUTF8=1` で Python 全体を UTF-8 mode にするのが安全。upload 自体は半ば成功するケースもあるが、確実に最後まで通すため最初から付ける。
+
+### ビルド (詳細)
 
 ```bash
 # 古い dist/ をクリア (mtime 順で twine が誤った wheel を上げないように)
@@ -168,28 +181,67 @@ rm -rf dist/ build/ src/*.egg-info/
 ### TestPyPI に upload
 
 ```bash
-.venv/Scripts/python -m twine upload --repository testpypi dist/*
+PYTHONIOENCODING=utf-8 PYTHONUTF8=1 \
+  .venv/Scripts/python -m twine upload --repository testpypi dist/*
 ```
 
-成功後の確認:
-- ブラウザで <https://test.pypi.org/project/hapbeat-helper/> を開いて release が見えるか
-- pipx でインストールテスト:
-  ```bash
-  pipx install --pip-args="--extra-index-url https://pypi.org/simple/" \
-    --index-url https://test.pypi.org/simple/ hapbeat-helper==0.1.0
-  hapbeat-helper version
-  hapbeat-helper start
-  ```
-  - `--extra-index-url` は **本番 PyPI から依存 (websockets 等) を取りに行くため必須** (TestPyPI に依存パッケージのフルセットは無い)
+成功すると `View at: https://test.pypi.org/project/hapbeat-helper/<ver>/` が出力される。
 
 ### 本番 PyPI に upload
 
 TestPyPI で OK が出たら:
 
 ```bash
-.venv/Scripts/python -m twine upload dist/*
+PYTHONIOENCODING=utf-8 PYTHONUTF8=1 \
+  .venv/Scripts/python -m twine upload dist/*
 # (--repository 省略時のデフォルトが pypi)
 ```
+
+> 同じ `dist/*` をそのまま使う (本番のために再ビルドする必要は無い、bytes-identical な
+> wheel を本番にも上げる)。
+
+## 動作確認手順 (verifier 視点)
+
+### コマンド早見表
+
+| 用途 | コマンド (PowerShell / cmd) |
+|---|---|
+| 既存 helper 停止 | `hapbeat-helper stop` |
+| 残骸 process kill | `tasklist \| findstr python` → `taskkill /F /PID <番号>` |
+| TestPyPI から install (検証) | `pipx install --force --pip-args="--extra-index-url https://pypi.org/simple/" --index-url https://test.pypi.org/simple/ hapbeat-helper==0.1.0` |
+| バージョン確認 | `hapbeat-helper version` |
+| foreground 起動 | `hapbeat-helper start` |
+| 自動起動を試す | `hapbeat-helper install-service` → `hapbeat-helper service-status` |
+| 検証後 uninstall | `pipx uninstall hapbeat-helper` |
+| 本番 PyPI から install | `pipx install hapbeat-helper` |
+| 既存 install を本番版で更新 | `pipx upgrade hapbeat-helper` (or `pipx install --force hapbeat-helper`) |
+
+### TestPyPI install の注意
+
+`--extra-index-url https://pypi.org/simple/` は **必須**。理由:
+
+- `--index-url` で TestPyPI を primary に指定した場合、依存解決もそこで行われる
+- TestPyPI は本番 PyPI のミラーではないので `websockets` / `zeroconf` 等が見つからない
+- → `--extra-index-url` で本番 PyPI を fallback として指定すると、依存はそこから取得される
+
+`--force` は既に同名の pipx venv があっても上書き install する。検証で何度も入れ直すときに便利。
+
+### 検証で見るポイント
+
+- `hapbeat-helper version` で **新しい version 表示**になっているか
+- `hapbeat-helper start` で `WebSocket server listening on ws://127.0.0.1:7703` が出るか
+- Studio (devtools.hapbeat.com/studio/) を開いて「Helper 接続中」が出るか
+- 実機で OTA / Wi-Fi 設定など主要 path が動くか
+- `hapbeat-helper install-service` で Startup folder の VBS shim が生成されるか (Windows)
+
+### 検証後
+
+問題があれば repo 側を fix → version bump → 再 build → 再 upload (TestPyPI は同 ver 再 upload 不可。
+0.1.0 → 0.1.1 のように上げる)。
+
+問題なければ本番 PyPI へ。本番では同 ver でもアップロード可能だが慣例的に
+TestPyPI と本番で同じ version 番号を使う (= 一度しか上げないので
+immutability 制約に当たらない)。
 
 ## 失敗パターンと対処
 
