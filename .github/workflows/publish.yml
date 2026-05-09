@@ -1,0 +1,120 @@
+name: Publish to PyPI
+
+# このワークフローの目的:
+#   ローカル twine upload が Cloudflare/bot 対策で silent block される
+#   ケース (2026-05-10 経験) を回避するため、GitHub Actions の OIDC
+#   (Trusted Publishing) 経由で TestPyPI / PyPI に publish する。
+#
+#   token 不要。GitHub の id-token を PyPI 側が verify して短期 credential
+#   を発行 → upload。
+#
+# トリガー:
+#   - workflow_dispatch (手動): target を testpypi / pypi から選択
+#   - tag push (vX.Y.Z): 自動で **本番 PyPI** に publish
+#       (vX.Y.Z-rcN や vX.Y.ZaN のような prerelease タグは TestPyPI に)
+#
+# 必要な事前設定 (PyPI 側 — 一度だけ):
+#   1. https://test.pypi.org/manage/account/publishing/
+#      "Add a new pending publisher" で:
+#        PyPI Project Name: hapbeat-helper
+#        Owner:             hapbeat (or org name in github URL)
+#        Repository name:   hapbeat-helper
+#        Workflow filename: publish.yml
+#        Environment name:  testpypi
+#   2. https://pypi.org/manage/account/publishing/ でも同様に
+#      Environment name:  pypi
+#
+# 必要な GitHub 側設定 (一度だけ):
+#   Settings → Environments で `testpypi` と `pypi` を新規作成
+#   (Required reviewers などは任意)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Upload target'
+        required: true
+        default: 'testpypi'
+        type: choice
+        options:
+          - testpypi
+          - pypi
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Verify metadata
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') ||
+      (github.event_name == 'push' && contains(github.ref, '-') )
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/hapbeat-helper
+    permissions:
+      id-token: write   # OIDC token for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # Skip files that already exist (re-runs without bumping
+          # version don't fail noisy)
+          skip-existing: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi') ||
+      (github.event_name == 'push' && !contains(github.ref, '-'))
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hapbeat-helper
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
