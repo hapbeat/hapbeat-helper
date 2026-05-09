@@ -1,6 +1,6 @@
 # CLI リファレンス
 
-`hapbeat-helper` コマンドの一覧と用例。バージョン 1.0.0 時点。
+`hapbeat-helper` コマンドの一覧と用例。バージョン 0.1.0 時点。
 
 すべてのコマンドは `hapbeat-helper <subcommand> [options]` の形式。
 オプションなしで実行すると help が表示される。
@@ -37,7 +37,7 @@ hapbeat-helper start --verbose      # DEBUG ログ
 
 出力例:
 ```
-hapbeat-helper 1.0.0 starting on ws://localhost:7703
+hapbeat-helper 0.1.0 starting on ws://localhost:7703
 Press Ctrl+C to stop.
 20:48:09 INFO hapbeat_helper.udp_listener: UDP listener started on 0.0.0.0:7700
 20:48:09 INFO hapbeat_helper.mdns_scanner: mDNS browsing started for _hapbeat._udp.local.
@@ -82,7 +82,7 @@ hapbeat-helper: not running (no listener on 7703)
 
 ```powershell
 hapbeat-helper version
-# → hapbeat-helper 1.0.0
+# → hapbeat-helper 0.1.0
 ```
 
 ---

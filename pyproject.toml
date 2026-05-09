@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hapbeat-helper"
-version = "1.0.0"
+version = "0.1.0"
 description = "Local daemon bridging Hapbeat Studio (web) to Hapbeat devices"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Hapbeat", email = "yus988@hapbeat.com" }]
 keywords = ["hapbeat", "haptics", "studio", "websocket", "mdns", "iot"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
