@@ -810,19 +810,25 @@ class HelperServer:
                 pass
 
     async def _handle_ota_data(self, ws, payload: dict) -> None:
-        """Receive a base64-encoded firmware image and stream it to one device.
+        """Receive a base64-encoded firmware image and stream it to one or
+        more devices sequentially.
 
-        Progress is broadcast as `ota_progress` events while the worker
-        runs. Final outcome arrives as `ota_result`.
+        Each target gets its own ``ota_progress`` events keyed on
+        ``device: <ip>``; final outcome per target is broadcast as
+        ``ota_result``.  When the payload carries ``targets: [...]`` (or
+        a single ``ip`` / ``target``) we run the OTAs **one after the
+        other** — Wi-Fi/router buffers can't reliably absorb two
+        simultaneous 1.7 MB streams, and a failure on device A
+        shouldn't kill the queue for device B.
         """
         targets = _resolve_targets(payload, self.registry)
-        target = targets[0] if targets else ""
         bin_b64 = payload.get("bin_base64", "")
-        if not target or not bin_b64:
+        if not targets or not bin_b64:
+            # Best-effort: still emit a result so Studio's spinner clears.
             await ws.send(json.dumps({
                 "type": "ota_result",
                 "payload": {
-                    "device": target,
+                    "device": targets[0] if targets else "",
                     "success": False,
                     "message": "missing target or bin_base64",
                 },
@@ -832,80 +838,128 @@ class HelperServer:
         try:
             bin_bytes = base64.b64decode(bin_b64)
         except (ValueError, TypeError) as exc:
-            await ws.send(json.dumps({
-                "type": "ota_result",
-                "payload": {
-                    "device": target,
-                    "success": False,
-                    "message": f"bad base64: {exc}",
-                },
-            }))
+            for ip in targets:
+                await ws.send(json.dumps({
+                    "type": "ota_result",
+                    "payload": {
+                        "device": ip,
+                        "success": False,
+                        "message": f"bad base64: {exc}",
+                    },
+                }))
             return
 
-        await ws.send(json.dumps({
-            "type": "ota_progress",
-            "payload": {
-                "device": target,
-                "phase": "begin",
-                "percent": 0,
-                "message": f"OTA 開始 ({len(bin_bytes):,} bytes)",
-            },
-        }))
-
         loop = asyncio.get_running_loop()
-
-        def progress(phase: str, percent: int, message: str) -> None:
-            asyncio.run_coroutine_threadsafe(
-                self._broadcast({
-                    "type": "ota_progress",
-                    "payload": {
-                        "device": target, "phase": phase,
-                        "percent": percent, "message": message,
-                    },
-                }),
-                loop,
+        total_targets = len(targets)
+        if total_targets > 1:
+            logger.info(
+                "OTA batch start: %d targets %s (%d bytes each)",
+                total_targets, targets, len(bin_bytes),
             )
+            await self._broadcast({
+                "type": "ota_batch",
+                "payload": {
+                    "phase": "begin",
+                    "targets": list(targets),
+                    "total": total_targets,
+                },
+            })
 
-        # NOTE: do NOT explicitly pause the log_tail supervisor here.
-        # The supervisor's own loop already checks
-        # ``target in self._ota_in_progress`` before reconnecting and
-        # naturally waits out the OTA. An explicit pause+resume race
-        # leaves an orphan thread behind whenever ``join`` times out
-        # (supervisor mid-sleep, ≤2 s) and the resume spawns a *second*
-        # supervisor — observed 2026-05-09 as 2 simultaneous ESTABLISHED
-        # connections on netstat after a few OTA cycles.
+        for idx, target in enumerate(targets):
+            await ws.send(json.dumps({
+                "type": "ota_progress",
+                "payload": {
+                    "device": target,
+                    "phase": "begin",
+                    "percent": 0,
+                    "message": (
+                        f"OTA 開始 ({idx + 1}/{total_targets} — {len(bin_bytes):,} bytes)"
+                        if total_targets > 1
+                        else f"OTA 開始 ({len(bin_bytes):,} bytes)"
+                    ),
+                },
+            }))
 
-        # Per-IP lock — OTA holds the device's TCP slot for the full
-        # transfer. Without serialization, a stray get_info / get_ap_status
-        # query from Studio would race for the same slot and either kick
-        # OTA off or itself fail.
-        self._ota_in_progress.add(target)
-        try:
-            async with self._get_tcp_lock(target):
-                # Safety net: if the executor thread blocks indefinitely
-                # (e.g. Windows WinError 10054 / sendall race), the lock
-                # would never be released and subsequent OTA / commands
-                # would hang forever until helper restart.  600 s is well
-                # above the worst-case transfer time (~1.7 MB / 5 KB/s).
-                try:
-                    ok, msg = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None, _do_ota_to_device, target, bin_bytes, progress,
-                        ),
-                        timeout=600.0,
+            # Bind the closure to *this* target so per-target progress
+            # events stay tagged with the right IP across the loop.
+            def make_progress(ip: str):
+                def _p(phase: str, percent: int, message: str) -> None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._broadcast({
+                            "type": "ota_progress",
+                            "payload": {
+                                "device": ip, "phase": phase,
+                                "percent": percent, "message": message,
+                            },
+                        }),
+                        loop,
                     )
-                except asyncio.TimeoutError:
-                    ok = False
-                    msg = "phase=stuck: OTA executor blocked >600 s — recovered"
-                    logger.error(
-                        "OTA executor stuck for %s >600 s — forcing recovery", target,
-                    )
-        finally:
-            self._ota_in_progress.discard(target)
-        await self._broadcast({
-            "type": "ota_result",
-            "payload": {"device": target, "success": ok, "message": msg},
-        })
+                return _p
+            progress = make_progress(target)
+
+            # NOTE: do NOT explicitly pause the log_tail supervisor here.
+            # The supervisor's own loop already checks
+            # ``target in self._ota_in_progress`` before reconnecting and
+            # naturally waits out the OTA.
+
+            # Per-IP lock — OTA holds the device's TCP slot for the full
+            # transfer. Without serialization, a stray get_info /
+            # get_ap_status query from Studio would race for the same
+            # slot and either kick OTA off or itself fail.
+            self._ota_in_progress.add(target)
+            ok = False
+            msg = ""
+            try:
+                async with self._get_tcp_lock(target):
+                    # Safety net: if the executor blocks indefinitely
+                    # (e.g. Windows WinError 10054 / sendall race), the
+                    # lock would never be released and subsequent OTA /
+                    # commands would hang forever until helper restart.
+                    # 600 s is well above the worst-case transfer time
+                    # (~1.7 MB / 5 KB/s).
+                    try:
+                        ok, msg = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None, _do_ota_to_device,
+                                target, bin_bytes, progress,
+                            ),
+                            timeout=600.0,
+                        )
+                    except asyncio.TimeoutError:
+                        ok = False
+                        msg = (
+                            "phase=stuck: OTA executor blocked >600 s — "
+                            "recovered"
+                        )
+                        logger.error(
+                            "OTA executor stuck for %s >600 s — forcing recovery",
+                            target,
+                        )
+            finally:
+                self._ota_in_progress.discard(target)
+
+            await self._broadcast({
+                "type": "ota_result",
+                "payload": {
+                    "device": target, "success": ok, "message": msg,
+                },
+            })
+
+            if total_targets > 1:
+                logger.info(
+                    "OTA batch %d/%d done (%s): success=%s",
+                    idx + 1, total_targets, target, ok,
+                )
+
+        if total_targets > 1:
+            await self._broadcast({
+                "type": "ota_batch",
+                "payload": {
+                    "phase": "done",
+                    "targets": list(targets),
+                    "total": total_targets,
+                },
+            })
 
     async def _handle_local_wifi_scan(self, ws, payload: dict) -> None:
         """Run an OS-native Wi-Fi scan and ship the result back.
