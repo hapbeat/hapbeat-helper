@@ -1,13 +1,16 @@
 """Windows auto-start for hapbeat-helper.
 
-Primary mechanism: Task Scheduler (schtasks) with a PowerShell action.
+Primary mechanism: Task Scheduler via PowerShell Register-ScheduledTask.
   - Works on Windows 10 and all Windows 11 versions (including 24H2+ where
     VBScript is disabled by default).
   - Uses ``powershell.exe -WindowStyle Hidden`` so no console window appears.
   - Registered as a per-user logon task; no admin rights needed.
+  - Uses ``Register-ScheduledTask`` PowerShell cmdlet (NOT ``schtasks /xml``).
+    The XML approach fails with "Access Denied" in some environments due to
+    how the <Principal> section is interpreted without an explicit <UserId>.
 
 Fallback mechanism: Startup-folder VBS shim.
-  - Used when Task Scheduler creation fails (e.g. strict Group Policy).
+  - Used when PowerShell task creation fails (e.g. strict Group Policy).
   - Requires VBScript to be enabled (works on Windows 10 / pre-24H2).
   - Windows 11 24H2+ disables VBScript by default; on those systems the
     Startup-folder shim is dropped as a last resort but will not execute.
@@ -26,7 +29,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from xml.sax.saxutils import escape as _xml_escape
 
 # Task Scheduler task name (also used as the legacy task name for cleanup).
 TASK_NAME = "HapbeatHelper"
@@ -96,71 +98,60 @@ def _task_exists() -> bool:
     return result.returncode == 0
 
 
-def _build_task_xml(exe: str, log: Path) -> str:
-    """Build a Task Scheduler XML that runs hapbeat-helper hidden at logon.
-
-    The action launches ``powershell.exe -WindowStyle Hidden`` which keeps
-    the daemon running with no visible console window. stdout/stderr are
-    redirected to the log file via PowerShell's ``*>>`` stream redirection.
-    """
-    # PowerShell argument: & 'exe' start *>> 'log'
-    # Single-quotes in exe/log paths are escaped by doubling them.
-    ps_exe = exe.replace("'", "''")
-    ps_log = str(log).replace("'", "''")
-    ps_arg = f"-WindowStyle Hidden -NoProfile -Command \"& '{ps_exe}' start *>> '{ps_log}'\""
-
-    return (
-        '<?xml version="1.0" encoding="UTF-16"?>\n'
-        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
-        "  <RegistrationInfo>\n"
-        "    <Description>Hapbeat Helper local daemon (hapbeat-helper)</Description>\n"
-        "  </RegistrationInfo>\n"
-        "  <Triggers>\n"
-        "    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>\n"
-        "  </Triggers>\n"
-        "  <Principals>\n"
-        '    <Principal id="Author">\n'
-        "      <LogonType>InteractiveToken</LogonType>\n"
-        "      <RunLevel>LeastPrivilege</RunLevel>\n"
-        "    </Principal>\n"
-        "  </Principals>\n"
-        "  <Settings>\n"
-        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
-        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
-        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
-        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
-        "    <Enabled>true</Enabled>\n"
-        "  </Settings>\n"
-        "  <Actions>\n"
-        '    <Exec>\n'
-        f"      <Command>powershell.exe</Command>\n"
-        f"      <Arguments>{_xml_escape(ps_arg)}</Arguments>\n"
-        "    </Exec>\n"
-        "  </Actions>\n"
-        "</Task>\n"
-    )
-
-
 def _try_create_scheduled_task(exe: str, log: Path) -> bool:
-    """Register a logon Task Scheduler entry. Returns True on success."""
-    xml = _build_task_xml(exe, log)
-    # schtasks /create /xml requires UTF-16 encoding.
+    """Register a per-user logon task via PowerShell Register-ScheduledTask.
+
+    Paths are passed through environment variables to avoid quoting issues.
+    The action runs ``powershell.exe -WindowStyle Hidden`` so no console
+    window appears. Admin rights are NOT required.
+
+    Returns True on success, False on failure (sets _last_error).
+    """
+    # The PS1 script uses $env:_HB_EXE / $env:_HB_LOG to receive paths,
+    # sidestepping all Python→PowerShell quoting complexity.
+    #
+    # $arg ends with `"" — breakdown:
+    #   `"  = backtick-escaped double-quote → literal " in the string
+    #   "   = closing delimiter of the outer PS double-quoted string
+    # Result stored in $arg:
+    #   -WindowStyle Hidden -NoProfile -Command "& '<exe>' start *>> '<log>'"
+    ps1 = (
+        '$exe = $env:_HB_EXE\n'
+        '$log = $env:_HB_LOG\n'
+        '$arg = "-WindowStyle Hidden -NoProfile -Command `"& \'$exe\' start *>> \'$log\'`""\n'
+        '$action    = New-ScheduledTaskAction -Execute \'powershell.exe\' -Argument $arg\n'
+        '$trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME\n'
+        '$settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew\n'
+        '$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited\n'
+        'Register-ScheduledTask -TaskName \'' + TASK_NAME + '\' '
+        '-Action $action -Trigger $trigger -Settings $settings '
+        '-Principal $principal -Force -ErrorAction Stop\n'
+    )
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".xml", delete=False, encoding="utf-16"
+        mode="w", suffix=".ps1", delete=False, encoding="utf-8"
     ) as f:
-        f.write(xml)
+        f.write(ps1)
         tmp = f.name
+
+    env = os.environ.copy()
+    env["_HB_EXE"] = exe
+    env["_HB_LOG"] = str(log)
+
     try:
         result = subprocess.run(
-            ["schtasks", "/create", "/xml", tmp, "/tn", TASK_NAME, "/f"],
+            [
+                "powershell.exe", "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", tmp,
+            ],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=20,
+            env=env,
         )
         if result.returncode != 0:
-            # Surface the error so install() can show it.
             _try_create_scheduled_task._last_error = (
-                result.stdout.strip() + result.stderr.strip()
+                (result.stdout + result.stderr).strip()
             )
         return result.returncode == 0
     finally:
