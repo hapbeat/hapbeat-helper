@@ -19,6 +19,27 @@ hapbeat-helper                  ← この CLI
 
 > Studio 側で「Helper 接続中」（緑バッジ）が出ない場合は、Helper が起動していないかポート 7703 が塞がっています。
 
+## クイックスタート（3 分で完了）
+
+Studio を開いて「Helper 未接続」と表示されている場合は、以下の 3 ステップで解決します。
+
+```bash
+# 1. pipx をまだ入れていなければ（1回だけ）
+#    macOS:   brew install pipx && pipx ensurepath
+#    Windows: py -m pip install --user pipx && py -m pipx ensurepath
+#    ↑ その後、新しいターミナルを開く
+
+# 2. helper をインストール
+pipx install hapbeat-helper
+
+# 3. ログイン時自動起動を設定（実行直後から起動します）
+hapbeat-helper install-service
+```
+
+以上で完了です。Studio をリロードすると「Helper 接続中」（緑バッジ）に変わります。
+
+---
+
 ## 必要環境
 
 - **Python 3.10 以上**（`pipx` 経由で別 venv に入るため、システム Python のバージョンに気を遣う必要はありません）
@@ -82,16 +103,26 @@ pipx install hapbeat-helper
 
 ### ログイン時自動起動（推奨）
 
-1 回だけコマンドを実行すると、以降はログインするたびに Helper が自動起動します。Studio を開けばすぐ接続済みの状態になります。
+1 回だけコマンドを実行すると、**実行直後から** Helper が起動し、以降はログインするたびに自動起動します。Studio を開けばすぐ接続済みの状態になります。
 
 ```bash
 hapbeat-helper install-service
 ```
 
+実行後すぐ以下のような出力が出ます（再ログイン不要）:
+
+```
+hapbeat-helper auto-start installed.
+  shim: C:\Users\<you>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\HapbeatHelper.vbs
+  exe:  C:\pipx\bin\hapbeat-helper.exe
+  log:  C:\Users\<you>\AppData\Local\hapbeat-helper\hapbeat-helper.log
+  next logon: Helper starts automatically (hidden).
+```
+
 | OS | 仕組み |
 |---|---|
-| macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd） |
-| Windows | スタートアップフォルダに `hapbeat-helper.vbs` shim を配置（Hidden window で `cmd /c hapbeat-helper.exe start` をログイン時起動。stdout/stderr → `%LOCALAPPDATA%\hapbeat-helper\hapbeat-helper.log`） |
+| macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd、`KeepAlive=true`） |
+| Windows | スタートアップフォルダに `HapbeatHelper.vbs` shim を配置（Hidden window で `cmd /c hapbeat-helper.exe start` をログイン時起動。stdout/stderr → `%LOCALAPPDATA%\hapbeat-helper\hapbeat-helper.log`） |
 
 登録状態を確認するには:
 
@@ -107,7 +138,7 @@ hapbeat-helper uninstall-service
 
 > ⚠️ `pipx uninstall hapbeat-helper` を実行する **前に** 必ず `hapbeat-helper uninstall-service` を先に実行してください。エントリだけ残った状態で実体を消すと、次回ログイン時に「コマンドが見つからない」エラーが出ることがあります。
 
-> 自動起動の挙動・PC 作業への影響・セキュリティリスクの詳細は **[セキュリティと動作の影響](/docs/helper/security/)** にまとめています。公共 Wi-Fi で使う前に必ず確認してください。
+> 自動起動の挙動・PC 作業への影響・セキュリティリスクの詳細は **[セキュリティと動作の影響](./security.md)** にまとめています。公共 Wi-Fi で使う前に必ず確認してください。
 
 ### フォアグラウンド起動（開発・デバッグ用）
 
@@ -120,11 +151,16 @@ hapbeat-helper start
 正常起動すると以下のようなログが出ます:
 
 ```
-WebSocket server listening on ws://127.0.0.1:7703
-mDNS browser started for _hapbeat._udp.local.
+hapbeat-helper 0.1.1 starting on ws://localhost:7703
+Press Ctrl+C to stop.
+20:48:09 INFO hapbeat_helper.udp_listener: UDP listener started on 0.0.0.0:7700
+20:48:09 INFO hapbeat_helper.mdns_scanner: mDNS browsing started for _hapbeat._udp.local.
+20:48:09 INFO websockets.server: server listening on 127.0.0.1:7703
 ```
 
 このターミナルは開きっぱなしにしておきます。Studio を使い終わったら `Ctrl+C` で止めます。
+
+> **自動起動 helper がすでに動いている場合** はポートが競合して起動に失敗します。先に `hapbeat-helper stop` を実行してから `start` してください。
 
 ## 動作確認
 
@@ -139,15 +175,52 @@ hapbeat-helper version    # 入っているバージョン
 
 ## アップデート
 
+自動起動中の helper を更新する手順:
+
 ```bash
+# 1. 現在の helper を止める
+hapbeat-helper stop
+
+# 2. 新バージョンに更新
 pipx upgrade hapbeat-helper
+
+# 3. バージョンを確認
+hapbeat-helper version
+
+# 4-a. 自動起動を使っている場合: install-service で即起動
+hapbeat-helper install-service
+
+# 4-b. フォアグラウンドで確認したい場合
+hapbeat-helper start
 ```
 
-> Studio の log drawer に `ERROR: unknown type: <message>` が出る場合、Helper が古い Studio との不整合です。`pipx upgrade hapbeat-helper` してから Helper を再起動してください。
+> **macOS の注意**: `hapbeat-helper stop` は `KeepAlive=true` のため SIGTERM 送信後に launchd が即 respawn する（実質「再起動」）。アップデート前に完全停止したい場合は `hapbeat-helper uninstall-service` → upgrade → `hapbeat-helper install-service` の順で行います。
+
+> Studio の log drawer に `ERROR: unknown type: <message>` が出る場合、Helper が古い Studio との不整合です。上記の手順でアップデートしてください。
+
+## ログの確認
+
+自動起動 helper のログはファイルに書き出されます。
+
+```bash
+hapbeat-helper logs          # 末尾 50 行を表示
+hapbeat-helper logs -n 200   # 末尾 200 行
+hapbeat-helper logs -f       # リアルタイム追跡（Ctrl+C で停止）
+```
+
+ログファイルの場所:
+
+| OS | パス |
+|---|---|
+| Windows | `%LOCALAPPDATA%\hapbeat-helper\hapbeat-helper.log` |
+| macOS | `~/Library/Logs/hapbeat-helper.log` |
+
+> フォアグラウンド起動（`hapbeat-helper start`）のログはターミナルに直接流れるため、`logs` コマンドには残りません。
 
 ## アンインストール
 
 ```bash
+hapbeat-helper uninstall-service   # 必ず先に（自動起動を解除）
 pipx uninstall hapbeat-helper
 ```
 
@@ -161,6 +234,7 @@ pipx uninstall hapbeat-helper
 | ポート 7700 / 7703 が既に使われている | 旧 `hapbeat-manager` を起動していないか確認。Helper と Manager は同時起動できません |
 | **macOS 14 (Sonoma) 以上で Wi-Fi scan が空** | `airport -s` が deprecated 化されたため、Helper の SSID 自動取得が動かないことがあります。Studio の Wi-Fi 設定で SSID を**手入力**で追加してください（パスワードは正常に設定できます） |
 | Mac で USB Serial 書き込みが動かない | デバイス名が `/dev/cu.usbmodem*` 系で出ているか確認 (`ls /dev/cu.*`)。出ない場合はデータ通信対応の USB-C ケーブルか確認 (充電専用ケーブルは不可) |
+| `stop` したのに macOS で Helper が止まらない | `KeepAlive=true` のため `stop` は即 respawn する（再起動相当）。完全に停止するには `hapbeat-helper uninstall-service` を使ってください |
 
 ## 次のステップ
 

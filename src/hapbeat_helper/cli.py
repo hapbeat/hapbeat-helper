@@ -276,7 +276,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_install = sub.add_parser(
         "install-service",
-        help="register hapbeat-helper as an OS auto-start service (launchd on macOS / Task Scheduler on Windows)",
+        help="register hapbeat-helper as an OS auto-start service (launchd on macOS / Startup-folder VBS shim on Windows); starts immediately",
     )
     p_install.set_defaults(func=_cmd_install_service)
 

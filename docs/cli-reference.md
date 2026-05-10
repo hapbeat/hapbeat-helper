@@ -10,11 +10,11 @@
 | コマンド | 用途 |
 |---|---|
 | [`start`](#start) | フォアグラウンド起動（ログがそのまま流れる） |
-| [`stop`](#stop) | 自動起動された helper を停止 |
+| [`stop`](#stop) | 起動中の helper を停止（macOS は再起動相当、下記参照） |
 | [`status`](#status) | 7703 ポートで応答するか確認 |
 | [`version`](#version) | バージョン表示 |
 | [`logs`](#logs) | 自動起動 helper のログファイルを表示・追跡 |
-| [`install-service`](#install-service) | OS のログイン時自動起動に登録 |
+| [`install-service`](#install-service) | OS のログイン時自動起動に登録（実行直後から起動） |
 | [`uninstall-service`](#uninstall-service) | 自動起動を解除 |
 | [`service-status`](#service-status) | 自動起動の登録状態を確認 |
 | [`config show`](#config-show) | 設定ファイルのパス・内容を表示 |
@@ -50,11 +50,19 @@ Press Ctrl+C to stop.
 
 ### `stop`
 
-OS の自動起動で立ち上がっている background helper を停止。Foreground (`start` で立ち上げたもの) には効きません — そちらは元のターミナルで `Ctrl+C` してください。
+起動中の helper を停止します。OS によって動作が異なります。
 
 ```powershell
 hapbeat-helper stop
 ```
+
+| OS | 動作 |
+|---|---|
+| **Windows** | `hapbeat-helper` プロセスを taskkill。自動起動・フォアグラウンド起動の両方が対象 |
+| **macOS（自動起動あり）** | launchd に `kickstart -k` (SIGTERM) を送る。`KeepAlive=true` のため launchd が即 respawn → **実質「再起動」**。完全に停止したい場合は `uninstall-service` を使うこと |
+| **macOS（自動起動なし）** | `pkill -f hapbeat-helper` でフォアグラウンドプロセスを kill |
+
+> Foreground (`start` で立ち上げたもの) を止めたい場合は、元のターミナルで `Ctrl+C` が最も確実です。
 
 ---
 
@@ -109,15 +117,24 @@ hapbeat-helper logs -n 200 -f    # 末尾 200 行を出してから follow
 
 ### `install-service`
 
-OS のログイン時自動起動に登録。
+OS のログイン時自動起動に登録し、**実行直後から** Helper を起動します（再ログイン不要）。
 
 | OS | 仕組み |
 |---|---|
-| Windows | スタートアップフォルダに `hapbeat-helper.vbs` shim を配置（Hidden window で `cmd /c hapbeat-helper.exe start` を起動） |
-| macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd） |
+| Windows | スタートアップフォルダに `HapbeatHelper.vbs` shim を配置（Hidden window で `cmd /c hapbeat-helper.exe start` を起動） |
+| macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd、`KeepAlive=true`） |
 
 ```powershell
 hapbeat-helper install-service
+```
+
+実行後の出力例（Windows）:
+```
+hapbeat-helper auto-start installed.
+  shim: C:\Users\<you>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\HapbeatHelper.vbs
+  exe:  C:\pipx\bin\hapbeat-helper.exe
+  log:  C:\Users\<you>\AppData\Local\hapbeat-helper\hapbeat-helper.log
+  next logon: Helper starts automatically (hidden).
 ```
 
 > ⚠️ `pipx uninstall hapbeat-helper` する **前に必ず** `uninstall-service` を実行してください。エントリだけ残ると次回ログイン時にコマンド未検出エラーが出ます。
@@ -126,7 +143,7 @@ hapbeat-helper install-service
 
 ### `uninstall-service`
 
-自動起動の登録を解除。helper のバイナリ自体は消しません（pipx で別途 uninstall）。
+自動起動の登録を解除し、動いていれば停止します。helper のバイナリ自体は消しません（pipx で別途 uninstall）。
 
 ```powershell
 hapbeat-helper uninstall-service
@@ -145,15 +162,15 @@ hapbeat-helper service-status
 出力例（戻り値も状態に対応）:
 | 表示 | 戻り値 | 意味 |
 |---|---|---|
-| `not registered` | 1 | install-service していない |
-| `registered, stopped` | 1 | 登録済みだが現在は止まっている |
-| `registered, running` | 0 | 登録済みかつ動作中 |
+| `hapbeat-helper service: not registered` | 1 | install-service していない |
+| `hapbeat-helper service: registered, stopped` | 1 | 登録済みだが現在は止まっている |
+| `hapbeat-helper service: registered, running` | 0 | 登録済みかつ動作中 |
 
 ---
 
 ### `config show`
 
-設定ファイルの場所と内容を表示。
+設定ファイルの場所と内容を表示。現バージョンでは設定ファイルが存在しない場合 `(no config file yet — defaults are in use)` と表示されます。
 
 ```powershell
 hapbeat-helper config show
@@ -173,26 +190,31 @@ hapbeat-helper config show
 
 ```powershell
 pipx install hapbeat-helper
-hapbeat-helper install-service     # ログイン時起動を有効化
-hapbeat-helper service-status      # → registered, running
+hapbeat-helper install-service     # 実行直後から起動（再ログイン不要）
+hapbeat-helper service-status      # → hapbeat-helper service: registered, running
 hapbeat-helper status              # → reachable
 ```
 
 ### B. アップデート
 
 ```powershell
-hapbeat-helper stop                # 走っていれば止める
+hapbeat-helper stop                # 走っていれば止める（macOS は実質再起動なので次の手順で上書き）
 pipx upgrade hapbeat-helper        # または: pipx install --force hapbeat-helper
 hapbeat-helper version             # 上がっているか確認
-hapbeat-helper start               # foreground で起動 or 自動起動を待つ
+hapbeat-helper install-service     # 自動起動を使っている場合: 新バージョンで即起動
+# または: hapbeat-helper start    # フォアグラウンドで起動して確認したい場合
 ```
+
+> **macOS**: `stop` が再起動相当のため、アップデート前に完全停止したい場合は `uninstall-service` → upgrade → `install-service` の順で行います。
 
 ### C. OTA / 通信トラブル時のデバッグ
 
 ```powershell
 # 1. 自動起動を一旦止めて衝突を避ける
 hapbeat-helper stop
-tasklist | findstr python          # 残骸があれば taskkill /F /PID <番号>
+# Windows でプロセスが残る場合:
+tasklist | findstr python          # PID を確認
+# taskkill /F /PID <番号>
 
 # 2. foreground で起動 → ログがそのまま流れる
 hapbeat-helper start
@@ -227,5 +249,6 @@ pipx uninstall hapbeat-helper
 | `status` が unreachable | `service-status` で running か / Windows なら `netstat -ano \| findstr :7703` で listening を確認 |
 | `logs` が "log file does not exist" | 自動起動が起動していない（`service-status` 確認）/ Windows でフォアグラウンド `start` した後の出力は `logs` には残らない（標準出力だけ） |
 | Studio に「Helper 接続中」が出ない | helper が動いていない or ポート 7703 を Firewall がブロック |
+| macOS で `stop` しても Helper が止まらない | `KeepAlive=true` のため意図した動作（再起動相当）。完全停止は `uninstall-service` を使う |
 
 詳細は [Getting Started](./getting-started.md) も参照。

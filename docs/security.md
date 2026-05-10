@@ -72,15 +72,17 @@ Helper を起動していなくても、**Hapbeat と同じ Wi-Fi に繋がっ�
 
 どちらもユーザースコープなので**管理者権限不要**です。Group Policy / AppLocker などで制限された企業 PC でもスタートアップフォルダ方式は通常通過します。
 
+`install-service` は登録と同時に Helper を**即座に起動**します（次回ログインまで待つ必要はありません）。
+
 ### 確認・操作コマンド（OS 共通）
 
 ```bash
-hapbeat-helper service-status    # not_registered / stopped / running
+hapbeat-helper service-status    # "registered, running" / "registered, stopped" / "not registered"
 hapbeat-helper logs              # ログファイルのパス + 末尾 50 行
 hapbeat-helper logs -f           # 末尾を follow（Ctrl+C で抜ける）
 hapbeat-helper logs -n 200       # 末尾 200 行
-hapbeat-helper stop              # 起動中のインスタンスを kill
-hapbeat-helper install-service   # 自動起動を設定
+hapbeat-helper stop              # 起動中のインスタンスを kill（macOS は再起動相当、下記参照）
+hapbeat-helper install-service   # 自動起動を設定（実行直後から起動）
 hapbeat-helper uninstall-service # 自動起動を解除（起動中なら停止も）
 ```
 
