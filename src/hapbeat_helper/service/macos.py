@@ -108,24 +108,39 @@ def uninstall() -> None:
 def stop() -> None:
     """Stop the running instance.
 
-    Uses `kickstart -k` (SIGTERM). With KeepAlive=true the launchd job
-    will respawn it — that's restart-style semantics. To stop permanently,
-    use `uninstall()` instead.
+    If registered as a service (KeepAlive=true), uses ``launchctl bootout``
+    to unload the job for the current session.  The plist remains in
+    LaunchAgents so the job will auto-start again at the next login.
+    To restart immediately without logging out, run ``install-service``.
+
+    If no service is registered, kills any foreground process via pkill.
     """
     is_reg = PLIST_PATH.exists()
     if not is_reg:
-        # No service registered → kill any helper python the user started
-        # in foreground.
-        subprocess.run(
+        # No service registered → kill any foreground process.
+        result = subprocess.run(
             ["pkill", "-f", "hapbeat[-_]helper"], check=False
         )
-        print("hapbeat-helper foreground process(es) killed.")
+        if result.returncode == 0:
+            print("hapbeat-helper stopped.")
+        else:
+            print("hapbeat-helper is not running.")
         return
-    subprocess.run(
-        ["launchctl", "kickstart", "-k", f"gui/{_uid()}/{LABEL}"],
+
+    # bootout unloads the job without deleting the plist.
+    # Unlike kickstart -k, KeepAlive does NOT cause a respawn after bootout.
+    result = subprocess.run(
+        ["launchctl", "bootout", f"gui/{_uid()}", str(PLIST_PATH)],
+        capture_output=True,
         check=False,
     )
-    print("hapbeat-helper restarted (kickstart -k; KeepAlive will respawn).")
+    if result.returncode == 0:
+        print("hapbeat-helper stopped.")
+        print("  Auto-start is still registered — will restart at next login.")
+        print("  To restart now: hapbeat-helper install-service")
+    else:
+        print("hapbeat-helper: could not stop (may already be stopped).")
+        print(f"  ({result.stderr.decode().strip()})")
 
 
 def status() -> str:

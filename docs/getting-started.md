@@ -235,7 +235,8 @@ pipx uninstall hapbeat-helper
 | **Windows: ログイン後に Helper が自動起動しない** | Windows 11 24H2+ では VBScript がデフォルト無効のため、古い VBS shim はスタートアップフォルダに存在しても実行されません。`hapbeat-helper uninstall-service` → `hapbeat-helper install-service` を実行し直すと Task Scheduler 方式に切り替わります |
 | **macOS 14 (Sonoma) 以上で Wi-Fi scan が空** | `airport -s` が deprecated 化されたため、Helper の SSID 自動取得が動かないことがあります。Studio の Wi-Fi 設定で SSID を**手入力**で追加してください（パスワードは正常に設定できます） |
 | Mac で USB Serial 書き込みが動かない | デバイス名が `/dev/cu.usbmodem*` 系で出ているか確認 (`ls /dev/cu.*`)。出ない場合はデータ通信対応の USB-C ケーブルか確認 (充電専用ケーブルは不可) |
-| `stop` したのに macOS で Helper が止まらない / `Ctrl+C` が効かない | `install-service` で登録した Helper は launchd が `KeepAlive=true` で管理しているため、`stop` は SIGTERM 後に即 respawn します（再起動相当）。ターミナルで `Ctrl+C` しようとしても、そもそもフォアグラウンドにプロセスがないため効きません。完全に停止するには `hapbeat-helper uninstall-service` を使ってください |
+| macOS で `Ctrl+C` が効かない | `install-service` で登録した Helper はバックグラウンドで動いており、ターミナルにフォアグラウンドプロセスが存在しません。`hapbeat-helper stop` で停止してください |
+| macOS で `hapbeat-helper stop` してもすぐ再起動してしまった（旧バージョン） | 旧バージョンは `kickstart -k`（SIGTERM→即 respawn）を使っていました。最新版は `bootout` で正しく停止します。`pipx upgrade hapbeat-helper` でアップデートしてください |
 
 ## 次のステップ
 

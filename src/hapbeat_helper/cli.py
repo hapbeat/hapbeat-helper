@@ -231,6 +231,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "Local daemon that bridges Hapbeat Studio (web) to "
             "Hapbeat devices on the local network."
         ),
+        epilog=(
+            "commands:\n"
+            "  start            start in foreground (Ctrl+C to stop)\n"
+            "  stop             stop the running helper\n"
+            "                   macOS: unloads launchd job (restarts at next login)\n"
+            "                   Windows: kills process (task remains registered)\n"
+            "  status           check ws://localhost:7703 reachability\n"
+            "  version          show installed version\n"
+            "  logs             show/follow the auto-start log file\n"
+            "  install-service  register & start at OS login\n"
+            "  uninstall-service  remove registration and stop\n"
+            "  service-status   show registration state\n"
+            "  config show      show config file path and contents\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_verbose(p)
     sub = p.add_subparsers(dest="cmd")
@@ -256,7 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_stop = sub.add_parser(
         "stop",
-        help="stop the auto-started helper instance",
+        help="stop the running helper (macOS: bootout; Windows: taskkill)",
     )
     p_stop.set_defaults(func=_cmd_stop)
 
@@ -292,7 +307,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_svc_status.set_defaults(func=_cmd_service_status)
 
-    p_config = sub.add_parser("config", help="config helpers")
+    p_config = sub.add_parser("config", help="config subcommands (try: config show)")
     sub_cfg = p_config.add_subparsers(dest="config_cmd")
     p_show = sub_cfg.add_parser("show", help="show config path / contents")
     p_show.set_defaults(func=_cmd_config_show)

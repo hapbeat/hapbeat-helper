@@ -96,8 +96,8 @@ GUI からの確認:
 - macOS: `~/Library/LaunchAgents/` を Finder で開く / `launchctl list | grep hapbeat` / Console.app でログを開く
 - Windows: `Win+R` → `shell:startup` で Startup フォルダを開く / `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` に直接移動
 
-> **macOS の挙動**: launchd は `KeepAlive=true` で起動するため、`hapbeat-helper stop` は SIGTERM 送信 + 自動再起動で **再起動相当** になります。完全に停止したい場合は `hapbeat-helper uninstall-service` を使います。
-> **Windows の挙動**: `stop` は単純に taskkill します。再起動したい場合は再度 `install-service` を実行（または再ログイン）してください。
+> **macOS の挙動**: `hapbeat-helper stop` は `launchctl bootout` でジョブをアンロードします。プロセスは即停止し、`KeepAlive=true` による respawn も発生しません。plist は残るため次回ログイン時には再起動します。今すぐ再起動したい場合は `hapbeat-helper install-service` を実行してください。永続的に停止するには `hapbeat-helper uninstall-service` を使います。
+> **Windows の挙動**: `stop` は taskkill します。Task Scheduler タスクは残るため次回ログイン時に再起動します。再起動したい場合は再度 `install-service` を実行（または再ログイン）してください。
 
 ## トラブルシューティング (セキュリティ関連)
 

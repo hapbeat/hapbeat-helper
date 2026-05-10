@@ -59,10 +59,10 @@ hapbeat-helper stop
 | OS | 動作 |
 |---|---|
 | **Windows** | `hapbeat-helper` プロセスを taskkill。自動起動・フォアグラウンド起動の両方が対象 |
-| **macOS（自動起動あり）** | launchd に `kickstart -k` (SIGTERM) を送る。`KeepAlive=true` のため launchd が即 respawn → **実質「再起動」**。完全に停止したい場合は `uninstall-service` を使うこと |
+| **macOS（自動起動あり）** | `launchctl bootout` でジョブをアンロード。プロセスが即停止し、respawn もしない。plist は残るため**次回ログイン時に自動起動**。今すぐ再起動したい場合は `install-service` を実行 |
 | **macOS（自動起動なし）** | `pkill -f hapbeat-helper` でフォアグラウンドプロセスを kill |
 
-> Foreground (`start` で立ち上げたもの) を止めたい場合は、元のターミナルで `Ctrl+C` が最も確実です。
+> `start` で立ち上げたフォアグラウンドプロセスを止めたい場合は、元のターミナルで `Ctrl+C` が最も確実です。
 
 ---
 
