@@ -231,7 +231,7 @@ pipx uninstall hapbeat-helper
 | Studio に「Helper 接続中」が出ない | `hapbeat-helper install-service` で自動起動を設定するか、ターミナルで `hapbeat-helper start` を実行 / ポート 7703 が他プロセスに使われていないか (`lsof -i :7703` / Windows は `netstat -ano \| findstr :7703`) |
 | ブラウザから `ws://localhost:7703` に繋がらない (Firefox) | `about:config` → `network.websocket.allowInsecureFromHTTPS` を `true` に。Chrome / Edge は不要 |
 | デバイスがサイドバーに出てこない | Helper と Hapbeat が同一 Wi-Fi LAN か確認 / hotspot/AP モードによっては UDP broadcast / mDNS が遮断される |
-| ポート 7700 / 7703 が既に使われている | 旧 `hapbeat-manager` を起動していないか確認。Helper と Manager は同時起動できません |
+| ポート 7700 または 7703 が既に使われている | Helper が二重起動していないか確認。`hapbeat-helper service-status` で動作中なら `hapbeat-helper stop` してから再起動。それ以外のプロセスが占有している場合は macOS: `lsof -i :7703` / Windows: `netstat -ano \| findstr :7703` で PID を特定し、そのアプリを終了してください |
 | **Windows: ログイン後に Helper が自動起動しない** | Windows 11 24H2+ では VBScript がデフォルト無効のため、古い VBS shim はスタートアップフォルダに存在しても実行されません。`hapbeat-helper uninstall-service` → `hapbeat-helper install-service` を実行し直すと Task Scheduler 方式に切り替わります |
 | **macOS 14 (Sonoma) 以上で Wi-Fi scan が空** | `airport -s` が deprecated 化されたため、Helper の SSID 自動取得が動かないことがあります。Studio の Wi-Fi 設定で SSID を**手入力**で追加してください（パスワードは正常に設定できます） |
 | Mac で USB Serial 書き込みが動かない | デバイス名が `/dev/cu.usbmodem*` 系で出ているか確認 (`ls /dev/cu.*`)。出ない場合はデータ通信対応の USB-C ケーブルか確認 (充電専用ケーブルは不可) |

@@ -14,10 +14,10 @@ description: hapbeat-helper を常駐させた時の PC 作業への影響と、
 | CPU | ほぼゼロ | アイドル時は WebSocket / mDNS / UDP listener が select() で待機。Studio 接続中も触覚パケットの中継のみ |
 | メモリ | 30〜60 MB | Python プロセス 1 個分。常駐 Slack/Discord 等よりずっと軽量 |
 | ネットワーク | LAN ローカルのみ | UDP 7700 / TCP 7701 / mDNS マルチキャストを **同一 LAN にしか出さない**。インターネット送信なし |
-| ポート占有 | 7700 / 7701 / 7703 | 旧 `hapbeat-manager` と同時起動するとポート競合 |
+| ポート占有 | 7700 / 7701 / 7703 | 同一ポートを使う他プロセスと競合する。Helper が二重起動していないか `hapbeat-helper service-status` で確認 |
 | ファイアウォール | 初回ダイアログのみ | mac は `Firewall`、Windows は `Defender Firewall`。LAN 通信のため許可推奨 |
 | 電源・スリープ | 影響なし | スリープ中は Python プロセスもスリープ。復帰時に自動再開 |
-| 管理者権限 | 不要 | macOS: ユーザースコープの LaunchAgent / Windows: スタートアップフォルダの `.vbs` shim |
+| 管理者権限 | 不要 | macOS: ユーザースコープの LaunchAgent / Windows: ユーザースコープのタスクスケジューラータスク |
 | ターミナル/コンソール | 表示されない | macOS: launchd が標準出力をログファイルへ。Windows: WScript の `0` (hidden) で起動 |
 | クラッシュ時の挙動 | 自動再起動なし | 次回ログオン時に再起動。常時可用性が必要なら手動でフォアグラウンド起動を併用 |
 
