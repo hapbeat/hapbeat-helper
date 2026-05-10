@@ -121,7 +121,7 @@ OS のログイン時自動起動に登録し、**実行直後から** Helper �
 
 | OS | 仕組み |
 |---|---|
-| Windows | スタートアップフォルダに `HapbeatHelper.vbs` shim を配置（Hidden window で `cmd /c hapbeat-helper.exe start` を起動） |
+| Windows | Task Scheduler に `HapbeatHelper` タスクを登録（`powershell.exe -WindowStyle Hidden` アクション）。VBScript 不使用のため Windows 11 24H2+ でも動作 |
 | macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd、`KeepAlive=true`） |
 
 ```powershell

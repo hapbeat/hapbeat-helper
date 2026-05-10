@@ -1,16 +1,21 @@
-"""Windows auto-start via the per-user Startup folder.
+"""Windows auto-start for hapbeat-helper.
 
-We previously used Task Scheduler (`schtasks /create`), but in many corporate
-or Group-Policy-restricted environments `schtasks /create` returns
-`ERROR_ACCESS_DENIED` even for a per-user logon task. The Startup folder
-approach has no such restriction: dropping a `.vbs` shim into
-`%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\` is honored
-on the next logon and works without admin rights or special policy.
+Primary mechanism: Task Scheduler (schtasks) with a PowerShell action.
+  - Works on Windows 10 and all Windows 11 versions (including 24H2+ where
+    VBScript is disabled by default).
+  - Uses ``powershell.exe -WindowStyle Hidden`` so no console window appears.
+  - Registered as a per-user logon task; no admin rights needed.
 
-The shim is a tiny `.vbs` that uses `WScript.Shell.Run(..., 0, False)` to
-launch the helper completely hidden (no console window flash). stdout /
-stderr are redirected to a log file so the user can inspect what the
-backgrounded helper is doing.
+Fallback mechanism: Startup-folder VBS shim.
+  - Used when Task Scheduler creation fails (e.g. strict Group Policy).
+  - Requires VBScript to be enabled (works on Windows 10 / pre-24H2).
+  - Windows 11 24H2+ disables VBScript by default; on those systems the
+    Startup-folder shim is dropped as a last resort but will not execute.
+
+Background: Microsoft deprecated VBScript in Windows 11 24H2 (build 26100+).
+``wscript.exe`` silently refuses to run ``.vbs`` files unless VBScript is
+explicitly re-enabled via "Optional Features". The Task Scheduler approach
+uses only PowerShell which is not deprecated.
 """
 
 from __future__ import annotations
@@ -19,11 +24,20 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
+# Task Scheduler task name (also used as the legacy task name for cleanup).
+TASK_NAME = "HapbeatHelper"
+
+# Legacy Startup-folder VBS shim name.
 SHIM_NAME = "HapbeatHelper.vbs"
-LEGACY_TASK_NAME = "HapbeatHelper"  # for one-time cleanup of older installs
 
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
 
 def _startup_dir() -> Path:
     appdata = os.environ.get("APPDATA")
@@ -48,18 +62,15 @@ def _hapbeat_helper_path() -> str:
 
     Resolution order:
     1. Sibling of sys.executable: <sys.executable parent>/hapbeat-helper.exe
-       — this is the most reliable and works under git-bash where shutil.which
-       can fail on Windows symlinks (e.g. /c/pipx/bin/hapbeat-helper.exe).
-    2. shutil.which("hapbeat-helper") — fallback for cases where the helper
-       was installed system-wide (no pipx venv).
+       — most reliable; works under git-bash where shutil.which can fail on
+       Windows symlinks (e.g. /c/pipx/bin/hapbeat-helper.exe).
+    2. shutil.which("hapbeat-helper") — fallback for system-wide installs.
     """
-    # Sibling-of-python lookup first.
     py_dir = Path(sys.executable).resolve().parent
     candidate = py_dir / "hapbeat-helper.exe"
     if candidate.is_file():
         return str(candidate)
 
-    # Fallback: PATH search.
     path = shutil.which("hapbeat-helper") or shutil.which("hapbeat-helper.exe")
     if path:
         return str(Path(path).resolve())
@@ -71,53 +82,142 @@ def _hapbeat_helper_path() -> str:
     )
 
 
-def _build_vbs(exe: str, log: Path) -> str:
-    # WScript.Shell.Run(strCommand, intWindowStyle, bWaitOnReturn)
-    #   intWindowStyle=0 -> hidden, bWaitOnReturn=False -> non-blocking
-    # We wrap the helper invocation in `cmd /c` so we can redirect stdout/
-    # stderr to a log file.
-    #
-    # VBS string-literal escaping: a single `"` inside a string is
-    # written as `""` (two double-quotes). The outer string is opened
-    # and closed by single `"`. So a VBS source line looks like:
-    #
-    #   sh.Run "cmd /c ""C:\path\exe"" start >> ""C:\path\log"" 2>&1", 0, False
-    #
-    # Earlier we accidentally emitted `"""` (three quotes) which VBS
-    # parses as `""` (escape -> literal `"`) followed by `"` (close
-    # string), leaving the rest of the line as bare code → "improper
-    # end of statement" compile error.
-    cmd = (
-        f'cmd /c ""{exe}"" start >> ""{log}"" 2>&1'
+# ---------------------------------------------------------------------------
+# Task Scheduler (primary)
+# ---------------------------------------------------------------------------
+
+def _task_exists() -> bool:
+    """Return True if the HapbeatHelper scheduled task is registered."""
+    result = subprocess.run(
+        ["schtasks", "/query", "/tn", TASK_NAME],
+        capture_output=True,
+        timeout=10,
     )
+    return result.returncode == 0
+
+
+def _build_task_xml(exe: str, log: Path) -> str:
+    """Build a Task Scheduler XML that runs hapbeat-helper hidden at logon.
+
+    The action launches ``powershell.exe -WindowStyle Hidden`` which keeps
+    the daemon running with no visible console window. stdout/stderr are
+    redirected to the log file via PowerShell's ``*>>`` stream redirection.
+    """
+    # PowerShell argument: & 'exe' start *>> 'log'
+    # Single-quotes in exe/log paths are escaped by doubling them.
+    ps_exe = exe.replace("'", "''")
+    ps_log = str(log).replace("'", "''")
+    ps_arg = f"-WindowStyle Hidden -NoProfile -Command \"& '{ps_exe}' start *>> '{ps_log}'\""
+
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <RegistrationInfo>\n"
+        "    <Description>Hapbeat Helper local daemon (hapbeat-helper)</Description>\n"
+        "  </RegistrationInfo>\n"
+        "  <Triggers>\n"
+        "    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>\n"
+        "  </Triggers>\n"
+        "  <Principals>\n"
+        '    <Principal id="Author">\n'
+        "      <LogonType>InteractiveToken</LogonType>\n"
+        "      <RunLevel>LeastPrivilege</RunLevel>\n"
+        "    </Principal>\n"
+        "  </Principals>\n"
+        "  <Settings>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "    <Enabled>true</Enabled>\n"
+        "  </Settings>\n"
+        "  <Actions>\n"
+        '    <Exec>\n'
+        f"      <Command>powershell.exe</Command>\n"
+        f"      <Arguments>{_xml_escape(ps_arg)}</Arguments>\n"
+        "    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n"
+    )
+
+
+def _try_create_scheduled_task(exe: str, log: Path) -> bool:
+    """Register a logon Task Scheduler entry. Returns True on success."""
+    xml = _build_task_xml(exe, log)
+    # schtasks /create /xml requires UTF-16 encoding.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xml", delete=False, encoding="utf-16"
+    ) as f:
+        f.write(xml)
+        tmp = f.name
+    try:
+        result = subprocess.run(
+            ["schtasks", "/create", "/xml", tmp, "/tn", TASK_NAME, "/f"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            # Surface the error so install() can show it.
+            _try_create_scheduled_task._last_error = (
+                result.stdout.strip() + result.stderr.strip()
+            )
+        return result.returncode == 0
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+_try_create_scheduled_task._last_error = ""  # type: ignore[attr-defined]
+
+
+def _run_task_now() -> None:
+    """Trigger the registered task to run immediately (best-effort)."""
+    subprocess.run(
+        ["schtasks", "/run", "/tn", TASK_NAME],
+        capture_output=True,
+        timeout=10,
+    )
+
+
+# ---------------------------------------------------------------------------
+# VBS shim (fallback)
+# ---------------------------------------------------------------------------
+
+def _build_vbs(exe: str, log: Path) -> str:
+    # VBS string-literal escaping: a literal " inside a string is written
+    # as "" (two double-quotes).
+    cmd = f'cmd /c ""{exe}"" start >> ""{log}"" 2>&1'
     return (
         "' Auto-generated by `hapbeat-helper install-service`.\r\n"
         "' Launches hapbeat-helper hidden at user logon and writes\r\n"
         f"' stdout/stderr to: {log}\r\n"
-        "Set sh = CreateObject(\"WScript.Shell\")\r\n"
-        f"sh.Run \"{cmd}\", 0, False\r\n"
+        "' NOTE: requires VBScript to be enabled (Windows 10 / pre-24H2).\r\n"
+        "' On Windows 11 24H2+ VBScript is disabled by default and this\r\n"
+        "' shim will silently fail. Use Task Scheduler instead.\r\n"
+        'Set sh = CreateObject("WScript.Shell")\r\n'
+        f'sh.Run "{cmd}", 0, False\r\n'
     )
 
 
-def _cleanup_legacy_task() -> None:
-    """Best-effort removal of an old Task Scheduler entry from prior versions."""
-    subprocess.run(
-        ["schtasks", "/delete", "/tn", LEGACY_TASK_NAME, "/f"],
-        capture_output=True,
-    )
-
+# ---------------------------------------------------------------------------
+# Process detection
+# ---------------------------------------------------------------------------
 
 def _running_pids() -> list[int]:
-    """PIDs of python.exe processes launched as hapbeat-helper."""
+    """PIDs of python.exe / hapbeat-helper.exe running as hapbeat-helper."""
     try:
         out = subprocess.run(
             [
                 "powershell.exe",
                 "-NoProfile",
                 "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" "
-                "| Where-Object { $_.CommandLine -match 'hapbeat[-_]helper' } "
-                "| Select-Object -ExpandProperty ProcessId",
+                (
+                    "Get-CimInstance Win32_Process "
+                    "-Filter \"Name='python.exe' OR Name='pythonw.exe' "
+                    "OR Name='hapbeat-helper.exe'\" "
+                    "| Where-Object { $_.CommandLine -match 'hapbeat[-_]helper' } "
+                    "| Select-Object -ExpandProperty ProcessId"
+                ),
             ],
             capture_output=True,
             text=True,
@@ -135,53 +235,93 @@ def _running_pids() -> list[int]:
     return pids
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def install() -> None:
     exe = _hapbeat_helper_path()
     log = log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
-    startup = _startup_dir()
-    startup.mkdir(parents=True, exist_ok=True)
-    shim = _shim_path()
-    shim.write_text(_build_vbs(exe, log), encoding="utf-8")
 
-    _cleanup_legacy_task()
+    used_task_scheduler = False
 
-    # Launch immediately so the user doesn't have to log out / back in.
-    subprocess.Popen(
-        ["wscript.exe", str(shim)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    print("hapbeat-helper auto-start installed.")
-    print(f"  shim: {shim}")
-    print(f"  exe:  {exe}")
-    print(f"  log:  {log}")
-    print("  next logon: Helper starts automatically (hidden).")
+    # --- Primary: Task Scheduler ---
+    if _try_create_scheduled_task(exe, log):
+        used_task_scheduler = True
+        # Also remove any leftover VBS shim from a previous install.
+        shim = _shim_path()
+        if shim.exists():
+            shim.unlink()
+        # Start immediately — no need to log out / back in.
+        _run_task_now()
+        print("hapbeat-helper auto-start installed (Task Scheduler).")
+        print(f"  task: {TASK_NAME}")
+        print(f"  exe:  {exe}")
+        print(f"  log:  {log}")
+        print("  Helper is starting now. No need to log out and back in.")
+    else:
+        err = getattr(_try_create_scheduled_task, "_last_error", "")
+        print(
+            f"Task Scheduler registration failed ({err.strip() or 'unknown error'}).\n"
+            "Falling back to Startup-folder VBS shim.\n"
+            "Note: On Windows 11 24H2+ VBScript is disabled by default and the\n"
+            "shim will not execute at logon. To re-enable VBScript, open\n"
+            "Settings → Apps → Optional Features → Add a feature → 'VBSCRIPT'."
+        )
+
+    # --- Fallback: VBS shim ---
+    if not used_task_scheduler:
+        startup = _startup_dir()
+        startup.mkdir(parents=True, exist_ok=True)
+        shim = _shim_path()
+        shim.write_text(_build_vbs(exe, log), encoding="utf-8")
+        # Try to launch immediately; may silently do nothing on 24H2+.
+        subprocess.Popen(
+            ["wscript.exe", str(shim)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("hapbeat-helper auto-start installed (VBS shim).")
+        print(f"  shim: {shim}")
+        print(f"  exe:  {exe}")
+        print(f"  log:  {log}")
 
 
 def uninstall() -> None:
+    removed_something = False
+
+    # Remove Task Scheduler entry.
+    if _task_exists():
+        subprocess.run(
+            ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
+            capture_output=True,
+            timeout=10,
+        )
+        print(f"removed Task Scheduler task: {TASK_NAME}")
+        removed_something = True
+
+    # Remove VBS shim (migration / fallback cleanup).
     shim = _shim_path()
     if shim.exists():
         shim.unlink()
-        print(f"removed: {shim}")
-    else:
-        print(f"not installed (no shim at {shim})")
-    _cleanup_legacy_task()
+        print(f"removed VBS shim: {shim}")
+        removed_something = True
 
-    # Stop the currently-running instance so the user doesn't have to hunt
-    # python.exe in Task Manager.
+    if not removed_something:
+        print("hapbeat-helper auto-start was not registered.")
+
+    # Stop the currently-running instance.
     pids = _running_pids()
     for pid in pids:
-        subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid)], capture_output=True
-        )
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
     if pids:
         print(f"stopped running helper (pid={','.join(str(p) for p in pids)})")
     print("hapbeat-helper auto-start removed.")
 
 
 def stop() -> None:
-    """Kill any running auto-started instance (without removing the shim)."""
+    """Kill any running hapbeat-helper instance (without removing registration)."""
     pids = _running_pids()
     if not pids:
         print("hapbeat-helper is not running.")
@@ -193,6 +333,8 @@ def stop() -> None:
 
 def status() -> str:
     """Return one of: 'not_registered', 'stopped', 'running'."""
-    if not _shim_path().exists():
+    task_reg = _task_exists()
+    shim_reg = _shim_path().exists()
+    if not task_reg and not shim_reg:
         return "not_registered"
     return "running" if _running_pids() else "stopped"

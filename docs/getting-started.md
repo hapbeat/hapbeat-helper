@@ -122,7 +122,7 @@ hapbeat-helper auto-start installed.
 | OS | 仕組み |
 |---|---|
 | macOS | `~/Library/LaunchAgents/com.hapbeat.helper.plist`（launchd、`KeepAlive=true`） |
-| Windows | スタートアップフォルダに `HapbeatHelper.vbs` shim を配置（Hidden window で `cmd /c hapbeat-helper.exe start` をログイン時起動。stdout/stderr → `%LOCALAPPDATA%\hapbeat-helper\hapbeat-helper.log`） |
+| Windows | **Task Scheduler**（`HapbeatHelper` タスク）に `powershell.exe -WindowStyle Hidden` アクションを登録。VBScript を使わないため Windows 11 24H2+ でも動作。stdout/stderr → `%LOCALAPPDATA%\hapbeat-helper\hapbeat-helper.log` |
 
 登録状態を確認するには:
 
@@ -232,9 +232,10 @@ pipx uninstall hapbeat-helper
 | ブラウザから `ws://localhost:7703` に繋がらない (Firefox) | `about:config` → `network.websocket.allowInsecureFromHTTPS` を `true` に。Chrome / Edge は不要 |
 | デバイスがサイドバーに出てこない | Helper と Hapbeat が同一 Wi-Fi LAN か確認 / hotspot/AP モードによっては UDP broadcast / mDNS が遮断される |
 | ポート 7700 / 7703 が既に使われている | 旧 `hapbeat-manager` を起動していないか確認。Helper と Manager は同時起動できません |
+| **Windows: ログイン後に Helper が自動起動しない** | Windows 11 24H2+ では VBScript がデフォルト無効のため、古い VBS shim はスタートアップフォルダに存在しても実行されません。`hapbeat-helper uninstall-service` → `hapbeat-helper install-service` を実行し直すと Task Scheduler 方式に切り替わります |
 | **macOS 14 (Sonoma) 以上で Wi-Fi scan が空** | `airport -s` が deprecated 化されたため、Helper の SSID 自動取得が動かないことがあります。Studio の Wi-Fi 設定で SSID を**手入力**で追加してください（パスワードは正常に設定できます） |
 | Mac で USB Serial 書き込みが動かない | デバイス名が `/dev/cu.usbmodem*` 系で出ているか確認 (`ls /dev/cu.*`)。出ない場合はデータ通信対応の USB-C ケーブルか確認 (充電専用ケーブルは不可) |
-| `stop` したのに macOS で Helper が止まらない | `KeepAlive=true` のため `stop` は即 respawn する（再起動相当）。完全に停止するには `hapbeat-helper uninstall-service` を使ってください |
+| `stop` したのに macOS で Helper が止まらない / `Ctrl+C` が効かない | `install-service` で登録した Helper は launchd が `KeepAlive=true` で管理しているため、`stop` は SIGTERM 後に即 respawn します（再起動相当）。ターミナルで `Ctrl+C` しようとしても、そもそもフォアグラウンドにプロセスがないため効きません。完全に停止するには `hapbeat-helper uninstall-service` を使ってください |
 
 ## 次のステップ
 

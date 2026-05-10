@@ -68,9 +68,11 @@ Helper を起動していなくても、**Hapbeat と同じ Wi-Fi に繋がっ�
 | OS | 仕組み | ファイル / エントリ |
 |---|---|---|
 | macOS | launchd LaunchAgent | `~/Library/LaunchAgents/com.hapbeat.helper.plist` |
-| Windows | スタートアップフォルダの VBScript shim | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\HapbeatHelper.vbs` |
+| Windows | Task Scheduler（ユーザーのログオンタスク） | タスク名 `HapbeatHelper`。`powershell.exe -WindowStyle Hidden` アクションで実行 |
 
-どちらもユーザースコープなので**管理者権限不要**です。Group Policy / AppLocker などで制限された企業 PC でもスタートアップフォルダ方式は通常通過します。
+どちらもユーザースコープなので**管理者権限不要**です。
+
+> **Windows VBScript について**: Windows 11 24H2 以降、VBScript はデフォルトで無効化されています（Microsoft による段階的廃止）。以前のバージョンでは Startup フォルダへの VBS shim を使用していましたが、現バージョンは Task Scheduler + PowerShell に移行済みです。古い VBS shim が残っている場合は `hapbeat-helper uninstall-service` → `hapbeat-helper install-service` で移行できます。
 
 `install-service` は登録と同時に Helper を**即座に起動**します（次回ログインまで待つ必要はありません）。
 

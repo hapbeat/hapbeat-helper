@@ -7,7 +7,7 @@ Subcommands:
 - ``version``                             print version
 - ``stop``                                stop the auto-started helper
 - ``logs [-f] [-n N]``                    show log file + tail recent lines
-- ``install-service``                     register as OS auto-start service
+- ``install-service``                     register as OS auto-start service (Task Scheduler on Windows / launchd on macOS)
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
 """
