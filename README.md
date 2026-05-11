@@ -192,6 +192,11 @@ echo '{"type":"list_devices","payload":{}}' | websocat ws://localhost:7703
   a new terminal. As a fallback, every `pipx X` call also works as
   `py -m pipx X`.
 
+## ドキュメント
+
+公式ドキュメントは [https://devtools.hapbeat.com/docs/helper/](https://devtools.hapbeat.com/docs/helper/) を参照してください。
+インストール手順 / CLI リファレンス / セキュリティ解説などをまとめています。
+
 ## License
 
 MIT
