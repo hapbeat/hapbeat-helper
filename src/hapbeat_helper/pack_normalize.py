@@ -21,6 +21,11 @@ from typing import List
 logger = logging.getLogger(__name__)
 
 TARGET_RATE = 16000
+# Hapbeat SDK の stream session は単一 format で固定 (rate+channels 共通) なので、
+# 複数 clip が同時 stream される場合に mono / stereo が混在すると session
+# mismatch で reject される。Studio / Helper の Pack normalize で stereo (2ch) に
+# 揃えておくことで衝突を未然回避する。mono は ffmpeg の標準 up-mix で L=R に複製される。
+TARGET_CHANNELS = 2
 
 
 def _ffmpeg_available() -> bool:
@@ -39,6 +44,7 @@ def _convert_with_ffmpeg(in_path: Path, out_path: Path) -> None:
     cmd = [
         "ffmpeg", "-y", "-i", str(in_path),
         "-ar", str(TARGET_RATE),
+        "-ac", str(TARGET_CHANNELS),
         "-acodec", "pcm_s16le",
         str(out_path),
     ]
@@ -48,20 +54,39 @@ def _convert_with_ffmpeg(in_path: Path, out_path: Path) -> None:
         raise RuntimeError(f"ffmpeg failed: {stderr}")
 
 
+def _find_manifest(pack_dir: Path) -> Path | None:
+    """Locate the kit manifest inside *pack_dir*.
+
+    Convention (2026-05-17): `<pack_dir.name>-manifest.json` preferred,
+    fallback to any `*manifest*.json` (legacy `manifest.json` matches).
+    Mirrors the rule in server.py / Studio / Unity SDK.
+    """
+    preferred = pack_dir / f"{pack_dir.name}-manifest.json"
+    if preferred.exists():
+        return preferred
+    for child in sorted(pack_dir.iterdir()):
+        if not child.is_file():
+            continue
+        name = child.name.lower()
+        if name.endswith(".json") and "manifest" in name:
+            return child
+    return None
+
+
 def normalize_pack(pack_dir: Path) -> List[str]:
     """Normalize all clips/*.wav in *pack_dir* to 16 kHz PCM16.
 
     Returns a list of informational messages — one per clip that was
     actually converted. Empty list means no conversion was needed.
     """
-    manifest_path = pack_dir / "manifest.json"
-    if not manifest_path.exists():
+    manifest_path = _find_manifest(pack_dir)
+    if manifest_path is None:
         return []
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        logger.warning("pack_normalize: cannot read manifest.json: %s", exc)
+        logger.warning("pack_normalize: cannot read %s: %s", manifest_path.name, exc)
         return []
 
     clips_map: dict = manifest.get("clips", {})
@@ -95,7 +120,7 @@ def normalize_pack(pack_dir: Path) -> List[str]:
             )
             continue
 
-        if rate == TARGET_RATE and sampwidth == 2:
+        if rate == TARGET_RATE and sampwidth == 2 and channels == TARGET_CHANNELS:
             clips_map[fname] = {
                 "duration_ms": round(frames / rate * 1000, 2),
                 "sample_rate": rate,
@@ -139,6 +164,6 @@ def normalize_pack(pack_dir: Path) -> List[str]:
             encoding="utf-8",
         )
     except Exception as exc:
-        logger.warning("pack_normalize: cannot write manifest.json: %s", exc)
+        logger.warning("pack_normalize: cannot write %s: %s", manifest_path.name, exc)
 
     return messages

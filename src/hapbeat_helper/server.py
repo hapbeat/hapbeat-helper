@@ -424,6 +424,12 @@ class HelperServer:
                     "name": r.get("name"),
                     "mac": r.get("mac"),
                     "fw": r.get("fw"),
+                    # Firmware build commit short SHA (7 chars). Added in
+                    # firmware ≥ 0.1.2d* (auto-generated FIRMWARE_VERSION
+                    # via scripts/build_version.py). Studio shows it next
+                    # to fw in the Manage tab so two dev builds with the
+                    # same FIRMWARE_VERSION are distinguishable.
+                    "build": r.get("build"),
                     "group": r.get("group"),
                     "wifi_connected": r.get("wifi_connected"),
                     # Hardware board ID (e.g. band_wl_v3 / band_wl_v4 /
@@ -1693,6 +1699,33 @@ def _send_tcp_passthrough(ip: str, cmd: dict) -> Optional[dict]:
         return resp
 
 
+def _looks_like_manifest(filename: str) -> bool:
+    """True if *filename* matches the kit-manifest discovery pattern.
+
+    Convention (2026-05-17, instructions-kitname-manifest-rename):
+    kits ship `<kit-name>-manifest.json`. We accept any `*manifest*.json`
+    (case-insensitive) as a manifest candidate so the legacy
+    `manifest.json` filename also matches.
+    """
+    n = filename.lower()
+    return n.endswith(".json") and "manifest" in n
+
+
+def _find_kit_manifest(pack_dir: Path) -> Path | None:
+    """Return the kit manifest path inside *pack_dir*, or None if missing.
+
+    Preferred name: `<pack_dir.name>-manifest.json` exact match.
+    Fallback: first `*manifest*.json` (case-insensitive) at the kit root.
+    """
+    preferred = pack_dir / f"{pack_dir.name}-manifest.json"
+    if preferred.exists():
+        return preferred
+    for child in sorted(pack_dir.iterdir()):
+        if child.is_file() and _looks_like_manifest(child.name):
+            return child
+    return None
+
+
 def _deploy_kit_to_device(
     ip: str, pack_dir: Path, kit_id_default: str,
     on_progress=None,
@@ -1709,9 +1742,14 @@ def _deploy_kit_to_device(
         (install, commit). Caller is responsible for thread-safety; this
         function calls it synchronously from the worker thread.
     """
-    manifest_path = pack_dir / "manifest.json"
-    if not manifest_path.exists():
-        return False, "manifest.json missing"
+    # Manifest file naming (2026-05-17): kits ship `<kit-name>-manifest.json`
+    # so multiple kits stay identifiable in OS Explorer. We try the preferred
+    # name first, then fall back to any `*manifest*.json` (covers legacy
+    # `manifest.json` and any custom suffix). Mirrors the SDK & Studio
+    # discovery rule from `instructions-kitname-manifest-rename-202605161800.md`.
+    manifest_path = _find_kit_manifest(pack_dir)
+    if manifest_path is None:
+        return False, "manifest missing (looked for <name>-manifest.json / *manifest*.json)"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
@@ -1726,6 +1764,16 @@ def _deploy_kit_to_device(
             # The firmware does not store them; exclude to avoid wasting
             # LittleFS space and to prevent install-commit confusion.
             if rel.startswith("stream-clips/"):
+                continue
+            # Normalize the manifest filename on the wire. Device firmware
+            # reads `manifest.json` from its LittleFS (kit_loader.cpp); the
+            # `<kit-name>-` prefix is a host-side identifier only.
+            if fp == manifest_path:
+                rel = "manifest.json"
+            elif _looks_like_manifest(fp.name) and fp.parent == pack_dir:
+                # Stray secondary manifest sitting next to the chosen one
+                # — skip so the device doesn't receive two manifests in
+                # one kit (would leave LittleFS in an ambiguous state).
                 continue
             files.append((rel, fp))
     total_size = sum(fp.stat().st_size for _, fp in files)
