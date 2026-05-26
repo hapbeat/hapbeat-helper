@@ -1754,7 +1754,12 @@ def _deploy_kit_to_device(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
         return False, f"manifest read failed: {exc}"
-    kit_id = manifest.get("kit_id", kit_id_default or "unknown")
+    # Schema 2.0.0 (DEC-028): the kit's identity field is `name` — the
+    # legacy `kit_id` field was removed. We still honor the WS-supplied
+    # `kit_id_default` first because the caller (Studio) sends it
+    # explicitly and that's the value the device will store; manifest
+    # `name` is the fallback when the caller didn't pass one.
+    kit_id = kit_id_default or manifest.get("name") or "unknown"
 
     files: list[tuple[str, Path]] = []
     for fp in sorted(pack_dir.rglob("*")):

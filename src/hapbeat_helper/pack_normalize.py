@@ -1,8 +1,9 @@
 """Pack WAV normalization to 16 kHz PCM16.
 
 Device firmware plays Pack WAV files at a fixed 16 kHz I2S clock and does
-not resample. All clips in a Pack must therefore be 16 kHz PCM16 before
-they are transferred to the device.
+not resample. All clips under ``install-clips/`` (= manifest 2.0.0's
+``install_clips`` bucket) must therefore be 16 kHz PCM16 before they are
+transferred to the device.
 
 Studio (2026-04-21+) already normalizes on export. This module acts as a
 safety net for kits built via other routes.
@@ -74,10 +75,16 @@ def _find_manifest(pack_dir: Path) -> Path | None:
 
 
 def normalize_pack(pack_dir: Path) -> List[str]:
-    """Normalize all clips/*.wav in *pack_dir* to 16 kHz PCM16.
+    """Normalize all install-clips/*.wav in *pack_dir* to 16 kHz PCM16.
 
     Returns a list of informational messages — one per clip that was
     actually converted. Empty list means no conversion was needed.
+
+    Only the ``install_clips`` bucket is processed: device-resident clips
+    must be 16 kHz PCM16 because the firmware does not resample. The
+    ``stream_events`` clips live under ``stream-clips/`` and are streamed
+    by the SDK at runtime in whatever session format the SDK negotiates,
+    so they're not normalized here.
     """
     manifest_path = _find_manifest(pack_dir)
     if manifest_path is None:
@@ -89,7 +96,7 @@ def normalize_pack(pack_dir: Path) -> List[str]:
         logger.warning("pack_normalize: cannot read %s: %s", manifest_path.name, exc)
         return []
 
-    clips_map: dict = manifest.get("clips", {})
+    clips_map: dict = manifest.get("install_clips", {})
     if not clips_map:
         return []
 
@@ -103,7 +110,7 @@ def normalize_pack(pack_dir: Path) -> List[str]:
     messages: List[str] = []
 
     for fname in list(clips_map.keys()):
-        wav_path = pack_dir / "clips" / fname
+        wav_path = pack_dir / "install-clips" / fname
         if not wav_path.exists():
             continue
 
@@ -157,7 +164,7 @@ def normalize_pack(pack_dir: Path) -> List[str]:
         messages.append(msg)
         logger.info("pack_normalize: %s", msg)
 
-    manifest["clips"] = clips_map
+    manifest["install_clips"] = clips_map
     try:
         manifest_path.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False),
