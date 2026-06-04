@@ -436,6 +436,21 @@ class HelperServer:
                     # duo_wl_v3) — Studio uses this to warn the user
                     # before flashing a build for the wrong board.
                     "board": r.get("board"),
+                    # node-roles taxonomy (DEC-034). Absent → Studio
+                    # treats the node as a receiver on udp.
+                    "role": r.get("role"),
+                    "transport": r.get("transport"),
+                    "transports": r.get("transports"),
+                    # role-specific config snapshot (only set for the
+                    # relevant role; harmless None otherwise).
+                    "espnow_channel": r.get("espnow_channel"),
+                    "gain": r.get("gain"),
+                    "input_level": r.get("input_level"),
+                    "broker_host": r.get("broker_host"),
+                    "static_octet": r.get("static_octet"),
+                    "mqtt_port": r.get("mqtt_port"),
+                    "mqtt_running": r.get("mqtt_running"),
+                    "mappings_count": r.get("mappings_count"),
                 },
             )
 
@@ -494,6 +509,60 @@ class HelperServer:
                 ws, payload,
                 {"cmd": "kit_delete",
                  "kit_id": payload.get("kit_id", "")},
+            )
+
+        # ── node-roles config (DEC-034) ──
+        # Per-role setup commands relayed verbatim to the device's TCP
+        # 7701 config handler. The firmware ignores commands that don't
+        # apply to its role (returns an error the UI surfaces). Studio's
+        # serial transport drives the identical JSON over Web Serial.
+        elif msg_type == "set_broker_host":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_broker_host",
+                 "host": payload.get("host", "auto")},
+            )
+
+        elif msg_type == "set_espnow_channel":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_espnow_channel",
+                 "channel": int(payload.get("channel", 1))},
+            )
+
+        elif msg_type == "set_gain":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_gain",
+                 "gain": float(payload.get("gain", 0.8))},
+            )
+
+        elif msg_type == "set_input_level":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_input_level",
+                 "level": int(payload.get("level", 50))},
+            )
+
+        elif msg_type == "set_broker_config":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_broker_config",
+                 "static_octet": int(payload.get("static_octet", 10)),
+                 "port": int(payload.get("port", 1883))},
+            )
+
+        elif msg_type == "set_sensor_mapping":
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_sensor_mapping",
+                 "mappings": payload.get("mappings", [])},
+            )
+
+        elif msg_type == "get_sensor_mapping":
+            await self._handle_passthrough_query(
+                ws, payload, {"cmd": "get_sensor_mapping"},
+                "sensor_mapping_result",
             )
 
         elif msg_type == "play_event":
