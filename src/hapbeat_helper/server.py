@@ -451,6 +451,7 @@ class HelperServer:
                     "mqtt_port": r.get("mqtt_port"),
                     "mqtt_running": r.get("mqtt_running"),
                     "mappings_count": r.get("mappings_count"),
+                    "sensor_type": r.get("sensor_type"),
                 },
             )
 
@@ -563,6 +564,14 @@ class HelperServer:
             await self._handle_passthrough_query(
                 ws, payload, {"cmd": "get_sensor_mapping"},
                 "sensor_mapping_result",
+            )
+
+        elif msg_type == "get_sensor_reading":
+            # Live sensor value for Studio's threshold-tuning view
+            # (polled ~1 Hz while the mapping tab is open).
+            await self._handle_passthrough_query(
+                ws, payload, {"cmd": "get_sensor_reading"},
+                "sensor_reading_result",
             )
 
         elif msg_type == "play_event":
