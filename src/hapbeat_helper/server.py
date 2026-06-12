@@ -193,6 +193,17 @@ class HelperServer:
             last_online_state: dict[str, bool] = {}
             while True:
                 self.udp.send_broadcast_ping()
+                # Also unicast-PING every known device. Wi-Fi APs deliver
+                # broadcasts on the DTIM beacon at the lowest rate and many
+                # power-saving stations drop them — that intermittent loss is
+                # what made cards flap offline for a moment (user report
+                # 2026-06-13). Unicast frames are buffered/retried by the AP,
+                # so a sleepy ESP32 still gets them reliably.
+                for ip in self.registry.get_all_ips():
+                    try:
+                        self.udp.send_ping(ip)
+                    except OSError:
+                        pass  # interface change mid-scan — next tick recovers
                 await asyncio.sleep(2.0)
                 # Detect liveness transitions and push if anything flipped.
                 current = {
@@ -452,9 +463,17 @@ class HelperServer:
                     "gain": r.get("gain"),
                     "input_level": r.get("input_level"),
                     "broker_host": r.get("broker_host"),
+                    "broker_port": r.get("broker_port"),
+                    "topic_root": r.get("topic_root"),
                     "static_octet": r.get("static_octet"),
                     "mqtt_port": r.get("mqtt_port"),
                     "mqtt_running": r.get("mqtt_running"),
+                    # broker stats for the Studio MQTT flow chart
+                    # (mqtt-transport.md §8)
+                    "mqtt_clients": r.get("mqtt_clients"),
+                    "mqtt_pub_count": r.get("mqtt_pub_count"),
+                    "mqtt_last_topic": r.get("mqtt_last_topic"),
+                    "mqtt_last_payload": r.get("mqtt_last_payload"),
                     "mappings_count": r.get("mappings_count"),
                     "sensor_type": r.get("sensor_type"),
                 },
