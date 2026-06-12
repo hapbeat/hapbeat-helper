@@ -34,6 +34,12 @@ class HapbeatDevice:
     address: str = ""  # path-based address e.g. "player_1/chest"
     firmware: str = ""
 
+    # Node role/transport (DEC-034). Sourced from the mDNS TXT records
+    # (bridge-api.md); empty when the firmware predates them. Studio
+    # treats empty as receiver/udp.
+    role: str = ""
+    transport: str = ""
+
     last_seen: float = 0.0  # time.monotonic()
     discovered_via: str = ""  # "mdns", "udp_broadcast"
 
@@ -90,6 +96,8 @@ class DeviceRegistry:
             dev.mac = info.get("mac", dev.mac) or dev.mac
             dev.address = info.get("address", dev.address) or dev.address
             dev.firmware = info.get("firmware", dev.firmware) or dev.firmware
+            dev.role = info.get("role", dev.role) or dev.role
+            dev.transport = info.get("transport", dev.transport) or dev.transport
             dev.last_seen = time.monotonic()
             dev.discovered_via = info.get("discovered_via", dev.discovered_via)
 

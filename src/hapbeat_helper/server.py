@@ -52,6 +52,11 @@ def _device_to_dict(ip: str, dev: HapbeatDevice) -> dict:
         "firmwareVersion": dev.firmware,
         "online": dev.is_online,
         "serialConnected": False,  # Helper does not own serial
+        # Node role/transport from the mDNS TXT records (DEC-034) —
+        # None when the firmware predates them (Studio defaults to
+        # receiver/udp).
+        "role": dev.role or None,
+        "transport": dev.transport or None,
         "volumeLevel": dev.volume_level,
         "volumeWiper": dev.volume_wiper,
         "volumeSteps": dev.volume_steps,

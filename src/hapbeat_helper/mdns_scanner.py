@@ -112,6 +112,11 @@ class MdnsScanner:
             "group": int(txt.get("group", "0") or "0"),
             "firmware": txt.get("fw", ""),
             "mac": txt.get("mac", ""),
+            # Node role/transport (DEC-034, bridge-api.md TXT records).
+            # Older firmware omits them — registry/UI default to
+            # receiver/udp.
+            "role": txt.get("role", ""),
+            "transport": txt.get("transport", ""),
             "discovered_via": "mdns",
         }
         with self._lock:
