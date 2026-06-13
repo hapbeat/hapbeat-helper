@@ -542,11 +542,16 @@ class HelperServer:
         # apply to its role (returns an error the UI surfaces). Studio's
         # serial transport drives the identical JSON over Web Serial.
         elif msg_type == "set_broker_host":
-            await self._handle_tcp_command(
-                ws, payload,
-                {"cmd": "set_broker_host",
-                 "host": payload.get("host", "auto")},
-            )
+            cmd: dict = {"cmd": "set_broker_host",
+                         "host": payload.get("host", "auto")}
+            # Optional client-side MQTT knobs (mqtt-transport.md §7) —
+            # forward only when Studio sent them so older firmware
+            # keeps seeing the legacy single-field command.
+            if payload.get("port") is not None:
+                cmd["port"] = payload["port"]
+            if payload.get("topic_root") is not None:
+                cmd["topic_root"] = payload["topic_root"]
+            await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "set_espnow_channel":
             await self._handle_tcp_command(
