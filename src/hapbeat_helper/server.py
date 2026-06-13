@@ -1239,13 +1239,20 @@ class HelperServer:
     async def _handle_deploy_kit_data(self, ws, payload: dict) -> None:
         kit_id = payload.get("kit_id", "")
         zip_b64 = payload.get("zip_base64", "")
-        targets = _resolve_targets(payload, self.registry)
+        # A kit write is destructive (flashes the device's LittleFS + audio
+        # partition), so it must target EXPLICIT IPs — never the
+        # broadcast-fallback to every known device. Studio sends the
+        # selected playback receivers; if that's missing/empty, refuse rather
+        # than write a kit to everything (incl. sensors). (bug 2026-06-13:
+        # a kit got pushed to the ATOM Lite sensor via the all-devices fallback.)
+        raw_targets = payload.get("targets")
+        targets = [str(ip) for ip in raw_targets if ip] if isinstance(raw_targets, list) else []
         if not zip_b64 or not targets:
             await ws.send(json.dumps({
                 "type": "deploy_result",
                 "payload": {
                     "success": False,
-                    "message": "missing zip_base64 or targets",
+                    "message": "kit deploy requires explicit targets (refusing all-devices broadcast)",
                 },
             }))
             return
