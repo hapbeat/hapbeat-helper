@@ -485,6 +485,8 @@ class HelperServer:
                     # (item 10). Both are plain passthrough.
                     "sensor_types": r.get("sensor_types"),
                     "alert_loop": r.get("alert_loop"),
+                    # receiver subscribe topic roots (item 8)
+                    "recv_topics": r.get("recv_topics"),
                 },
             )
 
@@ -605,6 +607,15 @@ class HelperServer:
                 ws, payload,
                 {"cmd": "set_alert_mode",
                  "loop": bool(payload.get("loop", True))},
+            )
+
+        elif msg_type == "set_recv_topics":
+            # MQTT receiver subscribe topic roots (item 8). Relay the list;
+            # the firmware persists it (effective on reconnect/reboot).
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_recv_topics",
+                 "topics": payload.get("topics", [])},
             )
 
         elif msg_type == "get_sensor_mapping":
