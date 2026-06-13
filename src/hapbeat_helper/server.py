@@ -1096,6 +1096,18 @@ class HelperServer:
             }))
             return
 
+        # Serial pseudo-devices ("serial:<mac>") stream their logs over the
+        # USB serial conn, not TCP 7701. A log-tail to that string just
+        # NXDOMAINs (`getaddrinfo failed`) and the self-healing supervisor
+        # retries it in a tight loop forever (user report 2026-06-13). Refuse
+        # anything that isn't a real IPv4 device address.
+        if target.startswith("serial:") or not _is_ipv4(target):
+            await ws.send(json.dumps({
+                "type": "log_subscription",
+                "payload": {"device": target, "ok": False, "error": "no_tcp_log"},
+            }))
+            return
+
         if target in self._log_threads:
             await ws.send(json.dumps({
                 "type": "log_subscription",
@@ -1128,7 +1140,11 @@ class HelperServer:
         # when the explicit `stop` event is set (= unsubscribe / WS
         # close handler).
         def _supervised_worker() -> None:
-            backoff = 0.3
+            # Start at 1s (was 0.3s): on a single-slot device the tail is
+            # displaced by every poll, so a tight 0.3s restart just ping-pongs
+            # against the poller and churns the device's TCP. A 1–4s backoff
+            # lets the poll finish before the tail re-grabs the slot.
+            backoff = 1.0
             while not stop.is_set():
                 try:
                     _log_tail_worker(target, stop, relay)
@@ -1148,9 +1164,11 @@ class HelperServer:
                     # Short backoff before reconnecting; longer if firmware
                     # is busy (give the displacing command time to finish).
                     time.sleep(backoff)
-                    backoff = min(backoff * 1.5, 2.0)
+                    backoff = min(backoff * 1.5, 4.0)
                     if not stop.is_set():
-                        logger.info("log tail (%s) auto-restart", target)
+                        # debug, not info: displacement-driven restarts are
+                        # routine churn, not something the user needs to watch.
+                        logger.debug("log tail (%s) auto-restart", target)
             # Natural exit — clean up dict entries so subsequent
             # subscribe_logs requests can re-create the thread.
             self._log_stop_flags.pop(target, None)
@@ -1705,6 +1723,15 @@ def _do_ota_to_device(
             return False, f"phase=io: {type(exc).__name__}: {exc}"
 
 
+def _is_ipv4(s: str) -> bool:
+    """True for a dotted-quad IPv4 literal (rejects "serial:<mac>", hosts)."""
+    try:
+        socket.inet_aton(s)
+    except OSError:
+        return False
+    return s.count(".") == 3
+
+
 def _log_tail_worker(ip: str, stop: threading.Event, relay) -> None:
     """Hold a TCP 7701 connection and forward firmware log lines.
 
@@ -1746,7 +1773,15 @@ def _log_tail_worker(ip: str, stop: threading.Event, relay) -> None:
                 if obj.get("type") == "log":
                     relay(str(obj.get("msg", "")))
     except OSError as exc:
-        logger.warning("log tail (%s): %s", ip, exc)
+        # A connection reset/abort is the EXPECTED outcome when a regular
+        # command (get_info / get_sensor_reading poll, kit deploy, …)
+        # displaces this tail on the device's single TCP slot. Log it quietly
+        # so normal operation doesn't produce a 10054 warning storm; only
+        # genuinely unexpected errors stay at warning level.
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+            logger.debug("log tail (%s) displaced: %s", ip, exc)
+        else:
+            logger.warning("log tail (%s): %s", ip, exc)
     finally:
         if sock is not None:
             try:
