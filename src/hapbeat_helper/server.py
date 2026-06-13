@@ -465,6 +465,10 @@ class HelperServer:
                     "broker_host": r.get("broker_host"),
                     "broker_port": r.get("broker_port"),
                     "topic_root": r.get("topic_root"),
+                    # MQTT QoS + client link state (mqtt-transport.md §7) —
+                    # Studio's MQTT tab shows the QoS toggle + 接続中/未接続 dot.
+                    "mqtt_qos": r.get("mqtt_qos"),
+                    "mqtt_connected": r.get("mqtt_connected"),
                     "static_octet": r.get("static_octet"),
                     "mqtt_port": r.get("mqtt_port"),
                     "mqtt_running": r.get("mqtt_running"),
@@ -476,7 +480,11 @@ class HelperServer:
                     "mqtt_last_payload": r.get("mqtt_last_payload"),
                     "mqtt_last_from": r.get("mqtt_last_from"),
                     "mappings_count": r.get("mappings_count"),
-                    "sensor_type": r.get("sensor_type"),
+                    # sensor hardware type(s) — array so one sender can host
+                    # several (item 3); alert_loop = MQTT receiver loop mode
+                    # (item 10). Both are plain passthrough.
+                    "sensor_types": r.get("sensor_types"),
+                    "alert_loop": r.get("alert_loop"),
                 },
             )
 
@@ -588,6 +596,15 @@ class HelperServer:
                 ws, payload,
                 {"cmd": "set_sensor_mapping",
                  "mappings": payload.get("mappings", [])},
+            )
+
+        elif msg_type == "set_alert_mode":
+            # MQTT receiver alert-loop on/off (item 10). Relay the bool;
+            # the firmware persists it (takes effect on next reboot).
+            await self._handle_tcp_command(
+                ws, payload,
+                {"cmd": "set_alert_mode",
+                 "loop": bool(payload.get("loop", True))},
             )
 
         elif msg_type == "get_sensor_mapping":
