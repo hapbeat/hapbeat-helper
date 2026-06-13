@@ -474,6 +474,7 @@ class HelperServer:
                     "mqtt_pub_count": r.get("mqtt_pub_count"),
                     "mqtt_last_topic": r.get("mqtt_last_topic"),
                     "mqtt_last_payload": r.get("mqtt_last_payload"),
+                    "mqtt_last_from": r.get("mqtt_last_from"),
                     "mappings_count": r.get("mappings_count"),
                     "sensor_type": r.get("sensor_type"),
                 },
