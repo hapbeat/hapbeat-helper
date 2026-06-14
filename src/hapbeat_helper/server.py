@@ -646,7 +646,13 @@ class HelperServer:
             await self._handle_unsubscribe_logs(ws, payload)
 
         elif msg_type == "ota_data":
-            await self._handle_ota_data(ws, payload)
+            # Spawn as a background task instead of awaiting inline, so the OTA
+            # stream does NOT block this connection's receive loop. The user can
+            # then switch devices and start another device's OTA without waiting
+            # for the first to finish — per-device independent OTA (#5). Same-
+            # device safety is unchanged: the per-IP TCP lock + _ota_in_progress
+            # serialize traffic to one IP; different IPs run concurrently.
+            asyncio.create_task(self._ota_data_bg(ws, payload))
 
         elif msg_type == "scan_wifi":
             # PC-side Wi-Fi scan. Studio's onboarding assumes
@@ -941,9 +947,19 @@ class HelperServer:
             # No remove API on UdpListener; clear by resetting the list.
             self.udp.remove_rtt_listener(on_rtt)
 
+    async def _ota_data_bg(self, ws, payload: dict) -> None:
+        """Background wrapper for _handle_ota_data (spawned, not awaited inline,
+        so OTA doesn't block the receive loop). _handle_ota_data broadcasts its
+        own per-target ota_result; this only guards against an unexpected crash
+        leaving Studio's spinner stuck."""
+        try:
+            await self._handle_ota_data(ws, payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("ota_data background task error")
+
     async def _handle_ota_data(self, ws, payload: dict) -> None:
         """Receive a base64-encoded firmware image and stream it to one or
-        more devices sequentially.
+        more devices.
 
         Each target gets its own ``ota_progress`` events keyed on
         ``device: <ip>``; final outcome per target is broadcast as
