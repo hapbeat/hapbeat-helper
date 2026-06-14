@@ -485,6 +485,9 @@ class HelperServer:
                     # (item 10). Both are plain passthrough.
                     "sensor_types": r.get("sensor_types"),
                     "alert_loop": r.get("alert_loop"),
+                    # restricted mode: receiver plays critical-only when ON
+                    # (mqtt-transport.md §6.3). Plain passthrough.
+                    "alert_limit": r.get("alert_limit"),
                     # receiver subscribe topic roots (item 8)
                     "recv_topics": r.get("recv_topics"),
                 },
