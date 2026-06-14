@@ -1014,50 +1014,70 @@ class HelperServer:
             })
 
         for idx, target in enumerate(targets):
-            await ws.send(json.dumps({
-                "type": "ota_progress",
-                "payload": {
-                    "device": target,
-                    "phase": "begin",
-                    "percent": 0,
-                    "message": (
-                        f"OTA 開始 ({idx + 1}/{total_targets} — {len(bin_bytes):,} bytes)"
-                        if total_targets > 1
-                        else f"OTA 開始 ({len(bin_bytes):,} bytes)"
-                    ),
-                },
-            }))
-
-            # Bind the closure to *this* target so per-target progress
-            # events stay tagged with the right IP across the loop.
-            def make_progress(ip: str):
-                def _p(phase: str, percent: int, message: str) -> None:
-                    asyncio.run_coroutine_threadsafe(
-                        self._broadcast({
-                            "type": "ota_progress",
-                            "payload": {
-                                "device": ip, "phase": phase,
-                                "percent": percent, "message": message,
-                            },
-                        }),
-                        loop,
-                    )
-                return _p
-            progress = make_progress(target)
-
-            # NOTE: do NOT explicitly pause the log_tail supervisor here.
-            # The supervisor's own loop already checks
-            # ``target in self._ota_in_progress`` before reconnecting and
-            # naturally waits out the OTA.
-
-            # Per-IP lock — OTA holds the device's TCP slot for the full
-            # transfer. Without serialization, a stray get_info /
-            # get_ap_status query from Studio would race for the same
-            # slot and either kick OTA off or itself fail.
+            # Fail-fast: refuse a second concurrent OTA to the SAME ip. Now that
+            # ota_data runs as a spawned task (different IPs go in parallel), a
+            # rapid retry — or a same-ip request that races the timeout-recovery
+            # window where the lock is briefly free before the finally discards —
+            # could otherwise start a second stream into the same device socket
+            # and corrupt the transfer. Claim the slot with NO await between the
+            # check and the add so the guard is atomic under asyncio.
+            if target in self._ota_in_progress:
+                await self._broadcast({
+                    "type": "ota_result",
+                    "payload": {
+                        "device": target,
+                        "success": False,
+                        "message": (
+                            "この機器は既に OTA 実行中です。"
+                            "完了を待ってから再試行してください。"
+                        ),
+                    },
+                })
+                continue
             self._ota_in_progress.add(target)
             ok = False
             msg = ""
             try:
+                await ws.send(json.dumps({
+                    "type": "ota_progress",
+                    "payload": {
+                        "device": target,
+                        "phase": "begin",
+                        "percent": 0,
+                        "message": (
+                            f"OTA 開始 ({idx + 1}/{total_targets} — {len(bin_bytes):,} bytes)"
+                            if total_targets > 1
+                            else f"OTA 開始 ({len(bin_bytes):,} bytes)"
+                        ),
+                    },
+                }))
+
+                # Bind the closure to *this* target so per-target progress
+                # events stay tagged with the right IP across the loop.
+                def make_progress(ip: str):
+                    def _p(phase: str, percent: int, message: str) -> None:
+                        asyncio.run_coroutine_threadsafe(
+                            self._broadcast({
+                                "type": "ota_progress",
+                                "payload": {
+                                    "device": ip, "phase": phase,
+                                    "percent": percent, "message": message,
+                                },
+                            }),
+                            loop,
+                        )
+                    return _p
+                progress = make_progress(target)
+
+                # NOTE: do NOT explicitly pause the log_tail supervisor here.
+                # The supervisor's own loop already checks
+                # ``target in self._ota_in_progress`` before reconnecting and
+                # naturally waits out the OTA.
+
+                # Per-IP lock — OTA holds the device's TCP slot for the full
+                # transfer. Without serialization, a stray get_info /
+                # get_ap_status query from Studio would race for the same
+                # slot and either kick OTA off or itself fail.
                 async with self._get_tcp_lock(target):
                     # Safety net: if the executor blocks indefinitely
                     # (e.g. Windows WinError 10054 / sendall race), the
