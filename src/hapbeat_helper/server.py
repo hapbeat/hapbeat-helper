@@ -488,6 +488,8 @@ class HelperServer:
                     # restricted mode: receiver plays critical-only when ON
                     # (mqtt-transport.md §6.3). Plain passthrough.
                     "alert_limit": r.get("alert_limit"),
+                    # deliberate-hold ack duration ms (§6.1). Plain passthrough.
+                    "ack_hold_ms": r.get("ack_hold_ms"),
                     # receiver subscribe topic roots (item 8)
                     "recv_topics": r.get("recv_topics"),
                 },
@@ -565,6 +567,8 @@ class HelperServer:
                 cmd["port"] = payload["port"]
             if payload.get("topic_root") is not None:
                 cmd["topic_root"] = payload["topic_root"]
+            if payload.get("qos") is not None:
+                cmd["qos"] = payload["qos"]
             await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "set_espnow_channel":
@@ -604,13 +608,17 @@ class HelperServer:
             )
 
         elif msg_type == "set_alert_mode":
-            # MQTT receiver alert-loop on/off (item 10). Relay the bool;
-            # the firmware persists it (takes effect on next reboot).
-            await self._handle_tcp_command(
-                ws, payload,
-                {"cmd": "set_alert_mode",
-                 "loop": bool(payload.get("loop", True))},
-            )
+            # MQTT receiver alert behaviour. `loop` (bool) and `ack_hold_ms`
+            # (deliberate-hold ms, §6.1) are INDEPENDENTLY optional
+            # (serial-config.md §4.15) — forward ONLY what Studio sent. Defaulting
+            # loop=True here would silently re-enable alert-loop on an ack-hold-only
+            # change (and drop ack_hold_ms entirely). Mirror set_broker_host.
+            cmd = {"cmd": "set_alert_mode"}
+            if payload.get("loop") is not None:
+                cmd["loop"] = bool(payload["loop"])
+            if payload.get("ack_hold_ms") is not None:
+                cmd["ack_hold_ms"] = int(payload["ack_hold_ms"])
+            await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "set_recv_topics":
             # MQTT receiver subscribe topic roots (item 8). Relay the list;
