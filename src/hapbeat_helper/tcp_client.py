@@ -81,9 +81,13 @@ class TcpRawConnection:
         # sleep + 追加 1 回の retry を試す (stuck slot recovery)。
         handshake_failure_seen = False
 
+        # Routine connect/handshake chatter is DEBUG — at the ~1 Hz config-poll
+        # cadence (Studio mapping/MQTT tabs) it otherwise floods the log, and the
+        # single-TCP-slot contention that occasionally trips the recovery path is
+        # expected and self-healing. Only a genuine give-up is WARNING (below).
         for attempt in range(retries + 1):
             try:
-                logger.info(
+                logger.debug(
                     "TCP connect %s:%d (attempt %d/%d)",
                     self.ip, self.port, attempt + 1, retries + 1,
                 )
@@ -96,17 +100,17 @@ class TcpRawConnection:
                 self.send_json({"cmd": "get_info"})
                 resp = self.read_response(timeout=READ_TIMEOUT)
                 if resp and resp.get("status") == "ok":
-                    logger.info(
+                    logger.debug(
                         "TCP handshake ok (%s: %s)",
                         self.ip, resp.get("name", "?"),
                     )
                     return True
 
-                logger.info("TCP handshake failed (%s): %s", self.ip, resp)
+                logger.debug("TCP handshake failed (%s): %s", self.ip, resp)
                 handshake_failure_seen = True
                 self.close()
             except OSError as exc:
-                logger.info("TCP connect error (%s): %s", self.ip, exc)
+                logger.debug("TCP connect error (%s): %s", self.ip, exc)
                 self.close()
 
             # Short pause before retry — long enough that the firmware
@@ -118,14 +122,14 @@ class TcpRawConnection:
         # Stuck-slot recovery path: handshake が無応答だったら
         # firmware の idle timeout 経過を待って 1 回だけ再試行する。
         if handshake_failure_seen:
-            logger.info(
+            logger.debug(
                 "TCP recovery: waiting %.1fs for firmware idle-timeout "
                 "to release stuck client (%s:%d)",
                 RECOVERY_SLEEP, self.ip, self.port,
             )
             time.sleep(RECOVERY_SLEEP)
             try:
-                logger.info(
+                logger.debug(
                     "TCP connect %s:%d (recovery attempt)",
                     self.ip, self.port,
                 )
@@ -137,18 +141,18 @@ class TcpRawConnection:
                 self.send_json({"cmd": "get_info"})
                 resp = self.read_response(timeout=READ_TIMEOUT)
                 if resp and resp.get("status") == "ok":
-                    logger.info(
+                    logger.debug(
                         "TCP handshake ok after recovery (%s: %s)",
                         self.ip, resp.get("name", "?"),
                     )
                     return True
-                logger.info(
+                logger.debug(
                     "TCP recovery handshake also failed (%s): %s",
                     self.ip, resp,
                 )
                 self.close()
             except OSError as exc:
-                logger.info(
+                logger.debug(
                     "TCP recovery connect error (%s): %s", self.ip, exc,
                 )
                 self.close()
