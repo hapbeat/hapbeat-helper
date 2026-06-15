@@ -18,12 +18,12 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Liveness window. Scan loop pings every 2s (see server._scan_loop),
-# so a device is treated as offline after ~2 missed PONGs (5s window).
-# Manager parity: Manager uses 2s scan / 8s threshold; we run a touch
-# tighter so power-off shows up in the Studio UI within ~5s instead
-# of the 12s the previous "5s/12s" pair allowed.
-_OFFLINE_THRESHOLD = 5.0
+# Liveness window. Scan loop pings every 2s (see server._scan_loop).
+# 8s = ~3 missed PONGs of jitter margin. 以前は 5s だったが、2s scan との
+# 差が ~1s しかなく、PONG が AP のバッファ等で 1s でも遅れるとデバイスが
+# online↔offline を往復してリスト上で点滅していた (user 2026-06-16)。
+# Manager と同じ 8s に合わせて余裕を持たせる。電源 OFF は依然 ~8s で反映。
+_OFFLINE_THRESHOLD = 8.0
 
 
 @dataclass
