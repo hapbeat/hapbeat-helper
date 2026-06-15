@@ -31,6 +31,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
+from websockets.exceptions import ConnectionClosed
+
 from hapbeat_helper import protocol
 from hapbeat_helper.device_registry import DeviceRegistry, HapbeatDevice
 from hapbeat_helper.mdns_scanner import MdnsScanner
@@ -281,12 +283,22 @@ class HelperServer:
                     continue
                 try:
                     await self._dispatch(ws, msg)
+                except ConnectionClosed:
+                    # Studio (browser) closed the socket mid-request — tab
+                    # reload / navigate-away (1001 going away). Benign: the
+                    # response we were sending just has nowhere to go. Stop
+                    # handling this socket; the finally block cleans up.
+                    logger.debug("client disconnected during dispatch (benign)")
+                    break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("dispatch error")
-                    await ws.send(json.dumps({
-                        "type": "error",
-                        "payload": {"message": str(exc)},
-                    }))
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "error",
+                            "payload": {"message": str(exc)},
+                        }))
+                    except ConnectionClosed:
+                        break
         except Exception:  # noqa: BLE001
             pass
         finally:
