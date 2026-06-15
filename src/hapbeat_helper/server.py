@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -131,12 +132,43 @@ class HelperServer:
         # で OTA が刺さる現象は再現性がある".)
         self._tcp_locks: dict[str, asyncio.Lock] = {}
 
+        # ip -> count of commands currently using the device's TCP slot.
+        # The firmware has a single TCP client slot; an active log_tail holds
+        # it. When we connect a command, the firmware displaces the (now-stale)
+        # log_tail — but the log_tail *supervisor* would immediately reconnect
+        # and steal the slot back, ping-ponging with our command's connect →
+        # "TCP connect failed" even though the OS-level TCP succeeds. While this
+        # counter is > 0 the supervisor suppresses reconnects (same mechanism as
+        # _ota_in_progress). Written from the asyncio loop, read by the log_tail
+        # supervisor thread (GIL-atomic dict ops; a one-tick stale read is fine).
+        self._cmd_in_progress: dict[str, int] = {}
+
     def _get_tcp_lock(self, ip: str) -> asyncio.Lock:
         lock = self._tcp_locks.get(ip)
         if lock is None:
             lock = asyncio.Lock()
             self._tcp_locks[ip] = lock
         return lock
+
+    @contextlib.asynccontextmanager
+    async def _tcp_session(self, ip: str):
+        """Serialize per-IP TCP traffic AND keep the log_tail supervisor from
+        re-grabbing the firmware's single TCP slot mid-command.
+
+        Marks a command in flight (so the supervisor waits to reconnect),
+        then takes the per-IP lock. Failure mode if the counter ever leaked:
+        log forwarding pauses — never a command deadlock (always decremented
+        in finally; the command's own connect retry covers the rest)."""
+        self._cmd_in_progress[ip] = self._cmd_in_progress.get(ip, 0) + 1
+        try:
+            async with self._get_tcp_lock(ip):
+                yield
+        finally:
+            n = self._cmd_in_progress.get(ip, 0) - 1
+            if n <= 0:
+                self._cmd_in_progress.pop(ip, None)
+            else:
+                self._cmd_in_progress[ip] = n
 
     # ── Run / shutdown ───────────────────────────────────────
 
@@ -805,7 +837,7 @@ class HelperServer:
                     "phase": "sending",
                 },
             })
-            async with self._get_tcp_lock(ip):
+            async with self._tcp_session(ip):
                 r = await loop.run_in_executor(None, _send_tcp_to_one, ip, cmd)
             results.append(r)
             resp = r.get("response") or {}
@@ -883,7 +915,7 @@ class HelperServer:
             return
         loop = asyncio.get_running_loop()
         # Per-IP lock — see _handle_tcp_command for rationale.
-        async with self._get_tcp_lock(target):
+        async with self._tcp_session(target):
             result = await loop.run_in_executor(
                 None, _send_tcp_query, target, cmd_name,
             )
@@ -917,7 +949,7 @@ class HelperServer:
             return
         loop = asyncio.get_running_loop()
         # Per-IP lock — see _handle_tcp_command for rationale.
-        async with self._get_tcp_lock(target):
+        async with self._tcp_session(target):
             result = await loop.run_in_executor(
                 None, _send_tcp_passthrough, target, cmd,
             )
@@ -1101,7 +1133,7 @@ class HelperServer:
                 # transfer. Without serialization, a stray get_info /
                 # get_ap_status query from Studio would race for the same
                 # slot and either kick OTA off or itself fail.
-                async with self._get_tcp_lock(target):
+                async with self._tcp_session(target):
                     # Safety net: if the executor blocks indefinitely
                     # (e.g. Windows WinError 10054 / sendall race), the
                     # lock would never be released and subsequent OTA /
@@ -1240,13 +1272,18 @@ class HelperServer:
                     logger.exception("log tail (%s) crashed; restarting", target)
                 if stop.is_set():
                     break
-                # OTA 中は log_tail の再接続を抑止して静かに待機する。
-                # OTA 完了後に 1 回だけ再接続させる。
-                if target in self._ota_in_progress:
-                    while not stop.is_set() and target in self._ota_in_progress:
-                        time.sleep(0.5)
+                # OTA 中 / 通常コマンド実行中は log_tail の再接続を抑止して
+                # 静かに待機する。再接続するとファームの単一 TCP スロットを
+                # 奪い返し、コマンドの connect と ping-pong して
+                # "TCP connect failed" を誘発するため。完了後に 1 回だけ再接続。
+                def _busy() -> bool:
+                    return (target in self._ota_in_progress
+                            or self._cmd_in_progress.get(target, 0) > 0)
+                if _busy():
+                    while not stop.is_set() and _busy():
+                        time.sleep(0.3)
                     if not stop.is_set():
-                        logger.info("log tail (%s) OTA 完了 — 再接続", target)
+                        logger.debug("log tail (%s) busy 解消 — 再接続", target)
                     backoff = 0.3
                 else:
                     # Short backoff before reconnecting; longer if firmware
@@ -1297,7 +1334,7 @@ class HelperServer:
             return
         loop = asyncio.get_running_loop()
         # Per-IP lock — see _handle_tcp_command for rationale.
-        async with self._get_tcp_lock(target):
+        async with self._tcp_session(target):
             result = await loop.run_in_executor(
                 None, _send_tcp_query, target, "get_volume",
             )
@@ -1406,7 +1443,7 @@ class HelperServer:
                 # Per-IP lock — kit deploy holds the device's TCP slot
                 # for the full transfer (multiple file_begin / chunks /
                 # kit_commit). See _handle_tcp_command for rationale.
-                async with self._get_tcp_lock(ip):
+                async with self._tcp_session(ip):
                     ok, msg = await loop.run_in_executor(
                         None, _deploy_kit_to_device,
                         ip, pack_dir, kit_id, make_progress(ip),
