@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import socket
 import sys
 from pathlib import Path
@@ -45,20 +46,68 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel pending tasks and CLOSE the loop fully, ignoring Ctrl+C.
+
+    SIGINT is temporarily ignored so a second Ctrl+C during teardown can't
+    interrupt ``loop.close()`` partway through. On Windows the default
+    ProactorEventLoop, if left half-closed (``_ssock`` already None but the loop
+    not yet marked closed), re-enters ``_close_self_pipe()`` from its ``__del__``
+    at interpreter exit and raises::
+
+        Exception ignored in: <function BaseEventLoop.__del__ ...>
+        AttributeError: 'NoneType' object has no attribute 'close'
+
+    It is harmless (the process is exiting) but looks like a crash. Guaranteeing
+    a complete ``close()`` here removes it.
+    """
+    prev_handler = None
+    try:
+        prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass  # not the main thread / unsupported — best effort
+    try:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception:
+        pass  # teardown is best-effort; the close() below is what matters
+    finally:
+        loop.close()
+        if prev_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, prev_handler)
+            except (ValueError, OSError):
+                pass
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
     server = HelperServer(port=args.port)
     print(f"hapbeat-helper {__version__} starting on ws://localhost:{args.port}")
     print("Press Ctrl+C to stop.")
+    # Own the event loop (instead of asyncio.run) so _shutdown_loop can
+    # guarantee a complete close() on Ctrl+C — see its docstring for the
+    # Windows ProactorEventLoop __del__ noise this prevents.
+    rc = 0
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(server.run())
+        loop.run_until_complete(server.run())
     except KeyboardInterrupt:
         print("\nshutting down…")
-        return 0
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
-    return 0
+        rc = 1
+    finally:
+        _shutdown_loop(loop)
+        asyncio.set_event_loop(None)
+    return rc
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
