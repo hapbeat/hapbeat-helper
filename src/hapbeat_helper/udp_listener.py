@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 HAPBEAT_UDP_PORT = 7700
 
+# Drop an RTT-pending ping if its PONG hasn't arrived within this window — it
+# isn't coming (RTT only matters for a couple seconds anyway), and the entry
+# would otherwise leak in _pending_pings forever.
+PENDING_PING_TTL_S = 5.0
+
 PongCallback = Callable[[dict, str], None]
 RttCallback = Callable[[str, float], None]
 
@@ -36,8 +41,13 @@ class UdpListener:
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        # seq -> (ip, perf_counter when sent) for RTT correlation
+        # seq -> (ip, perf_counter when sent) for RTT correlation. Only
+        # RTT-tracked pings (ping_device) land here; the ~1 Hz liveness pings
+        # do NOT, so this never accumulates (see send_ping).
         self._pending_pings: dict[int, tuple[str, float]] = {}
+        # Monotonic 16-bit ping seq. A free-running counter (not a timestamp)
+        # so back-to-back pings in one scan-loop burst get DISTINCT seqs.
+        self._seq = 0
         self._lock = threading.Lock()
 
         self._pong_callbacks: list[PongCallback] = []
@@ -103,21 +113,50 @@ class UdpListener:
 
     # ── Send API ─────────────────────────────────────────────
 
-    def send_ping(self, target_ip: str) -> int:
+    def _next_seq(self) -> int:
+        with self._lock:
+            self._seq = (self._seq + 1) & 0xFFFF
+            return self._seq
+
+    def _reap_pending(self, now: float) -> None:
+        """Evict RTT-pending pings whose PONG never came. Caller holds _lock."""
+        if not self._pending_pings:
+            return
+        for s in [
+            s for s, (_, t0) in self._pending_pings.items()
+            if now - t0 > PENDING_PING_TTL_S
+        ]:
+            self._pending_pings.pop(s, None)
+
+    def send_ping(self, target_ip: str, *, track_rtt: bool = False) -> int:
+        """Send a PING. `track_rtt` records the seq for RTT correlation.
+
+        The ~1 Hz liveness pings from the scan loop pass `track_rtt=False`:
+        liveness comes from the PONG callback (`_dispatch_pong`), independent
+        of seq correlation. Tracking them would leak — lost or seq-collided
+        PONGs are never popped, so `_pending_pings` would grow unbounded over
+        a long session, inflating its lock-hold on the asyncio loop thread and
+        eventually delaying UDP sends (restart "fixed" it). Only `ping_device`
+        (which actually reports RTT) tracks.
+        """
         sock = self._sock
         if sock is None:
             return -1
-        seq = int(time.monotonic_ns() // 1000) & 0xFFFF
+        seq = self._next_seq()
         ts_us = int(time.time() * 1_000_000)
         pkt = protocol.build_ping(seq, ts_us)
-        with self._lock:
-            self._pending_pings[seq] = (target_ip, time.perf_counter())
+        if track_rtt:
+            now = time.perf_counter()
+            with self._lock:
+                self._reap_pending(now)
+                self._pending_pings[seq] = (target_ip, now)
         try:
             sock.sendto(pkt, (target_ip, self._port))
         except OSError as exc:
             logger.warning("UDP send_ping(%s) failed: %s", target_ip, exc)
-            with self._lock:
-                self._pending_pings.pop(seq, None)
+            if track_rtt:
+                with self._lock:
+                    self._pending_pings.pop(seq, None)
             return -1
         return seq
 
@@ -125,7 +164,7 @@ class UdpListener:
         sock = self._sock
         if sock is None:
             return -1
-        seq = int(time.monotonic_ns() // 1000) & 0xFFFF
+        seq = self._next_seq()
         ts_us = int(time.time() * 1_000_000)
         pkt = protocol.build_ping(seq, ts_us)
         try:

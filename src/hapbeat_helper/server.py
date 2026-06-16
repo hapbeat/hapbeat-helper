@@ -986,7 +986,9 @@ class HelperServer:
         # One-shot listener; removed after this ping resolves.
         self.udp.add_rtt_listener(on_rtt)
         try:
-            self.udp.send_ping(target)
+            # track_rtt=True: this is the only path that actually reports RTT,
+            # so it's the only one that should populate _pending_pings.
+            self.udp.send_ping(target, track_rtt=True)
             try:
                 rtt = await asyncio.wait_for(rtt_future, timeout=2.0)
                 await ws.send(json.dumps({
