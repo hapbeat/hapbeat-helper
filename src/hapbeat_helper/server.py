@@ -1608,8 +1608,12 @@ def _send_tcp_to_one(ip: str, cmd: dict) -> dict:
 
 
 def _send_tcp_query(ip: str, cmd_name: str) -> Optional[dict]:
+    # Read-only poll (get_info / get_sensor_reading … at ~1 Hz): skip the 6 s
+    # stuck-slot recovery so a slow/unresponsive device can't pin an executor
+    # thread for ~10 s per poll and slow the whole helper (see TcpRawConnection
+    # .connect). A missed poll just retries on the next tick.
     with TcpRawConnection(ip) as conn:
-        if not conn.connect():
+        if not conn.connect(recover=False):
             return None
         conn.send_json({"cmd": cmd_name})
         return conn.read_response(timeout=5.0)
@@ -1963,8 +1967,12 @@ def _drain_one_line(sock: socket.socket) -> None:
 
 def _send_tcp_passthrough(ip: str, cmd: dict) -> Optional[dict]:
     """Send `cmd` and return the full response dict (status field stripped)."""
+    # `get_*` relays (get_sensor_mapping / get_sensor_reading … polled for live
+    # tuning) are reads → skip the 6 s stuck-slot recovery so they can't pin an
+    # executor thread per poll. Writes (set_* …) keep recovery (slot matters).
+    recover = not str(cmd.get("cmd", "")).startswith("get_")
     with TcpRawConnection(ip) as conn:
-        if not conn.connect():
+        if not conn.connect(recover=recover):
             return {"error": "connect failed"}
         conn.send_json(cmd)
         resp = conn.read_response(timeout=10.0)

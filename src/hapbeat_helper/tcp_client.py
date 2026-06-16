@@ -75,7 +75,16 @@ class TcpRawConnection:
         self.port = port
         self.sock: Optional[socket.socket] = None
 
-    def connect(self, retries: int = 1) -> bool:
+    def connect(self, retries: int = 1, recover: bool = True) -> bool:
+        # `recover`: run the stuck-slot recovery path (RECOVERY_SLEEP + 1 retry)
+        # on a handshake failure. Default True for writes (set_* / OTA / deploy)
+        # where slot recovery matters. Pass False for HIGH-FREQUENCY READ POLLS
+        # (get_info / get_sensor_reading at ~1 Hz): a buggy/slow device that
+        # never replies would otherwise pin an executor thread for ~10 s
+        # (1.5 connect + 1.5 handshake + 6 sleep + retry) EVERY poll, so demand
+        # outruns the shared ThreadPoolExecutor and a backlog builds up that
+        # delays even UDP play/stream sends (helper "slows down over time" until
+        # restart). A missed read poll just retries on the next tick.
         # `handshake_failure_seen` は「TCP は通ったが get_info 応答無し」を
         # 1 回でも観測したかを保持。観測したら最後に IDLE_TIMEOUT を超える
         # sleep + 追加 1 回の retry を試す (stuck slot recovery)。
@@ -121,7 +130,8 @@ class TcpRawConnection:
 
         # Stuck-slot recovery path: handshake が無応答だったら
         # firmware の idle timeout 経過を待って 1 回だけ再試行する。
-        if handshake_failure_seen:
+        # 高頻度 read poll では recover=False で丸ごとスキップ (上記コメント)。
+        if handshake_failure_seen and recover:
             logger.debug(
                 "TCP recovery: waiting %.1fs for firmware idle-timeout "
                 "to release stuck client (%s:%d)",
