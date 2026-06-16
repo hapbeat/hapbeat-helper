@@ -18,9 +18,11 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import socket
 import sys
+import threading
 from pathlib import Path
 
 from hapbeat_helper import __version__
@@ -47,20 +49,24 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel pending tasks and CLOSE the loop fully, ignoring Ctrl+C.
+    """Best-effort, time-BOUNDED teardown on Ctrl+C.
 
-    SIGINT is temporarily ignored so a second Ctrl+C during teardown can't
-    interrupt ``loop.close()`` partway through. On Windows the default
-    ProactorEventLoop, if left half-closed (``_ssock`` already None but the loop
-    not yet marked closed), re-enters ``_close_self_pipe()`` from its ``__del__``
-    at interpreter exit and raises::
+    Graceful asyncio teardown can stall indefinitely on a daemon: zeroconf's
+    blocking ``unregister_all_services``, websockets' ``wait_closed()``, or a
+    cancelled task parked on a still-blocked ``run_in_executor`` thread can all
+    hang. So Ctrl+C must NEVER leave the process wedged.
 
-        Exception ignored in: <function BaseEventLoop.__del__ ...>
-        AttributeError: 'NoneType' object has no attribute 'close'
-
-    It is harmless (the process is exiting) but looks like a crash. Guaranteeing
-    a complete ``close()`` here removes it.
+    Strategy: a watchdog timer force-exits as a hard backstop; the cancel/close
+    work is bounded by a short timeout. SIGINT is ignored only DURING this brief
+    window (to avoid the Windows ProactorEventLoop ``__del__`` "NoneType has no
+    attribute 'close'" noise from a half-closed loop) — the watchdog guarantees
+    it can't trap the user.
     """
+    # Hard backstop — if anything below stalls, terminate anyway.
+    watchdog = threading.Timer(3.0, lambda: os._exit(0))
+    watchdog.daemon = True
+    watchdog.start()
+
     prev_handler = None
     try:
         prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -71,19 +77,23 @@ def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
         for task in pending:
             task.cancel()
         if pending:
-            loop.run_until_complete(
-                asyncio.gather(*pending, return_exceptions=True)
-            )
+            # Bounded: do NOT wait forever for a task stuck on a blocked
+            # executor thread — the watchdog/os._exit handles that case.
+            loop.run_until_complete(asyncio.wait(pending, timeout=2.0))
         loop.run_until_complete(loop.shutdown_asyncgens())
     except Exception:
         pass  # teardown is best-effort; the close() below is what matters
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
         if prev_handler is not None:
             try:
                 signal.signal(signal.SIGINT, prev_handler)
             except (ValueError, OSError):
                 pass
+    watchdog.cancel()
 
 
 def _cmd_start(args: argparse.Namespace) -> int:
@@ -95,18 +105,27 @@ def _cmd_start(args: argparse.Namespace) -> int:
     # guarantee a complete close() on Ctrl+C — see its docstring for the
     # Windows ProactorEventLoop __del__ noise this prevents.
     rc = 0
+    interrupted = False
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(server.run())
     except KeyboardInterrupt:
         print("\nshutting down…")
+        interrupted = True
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         rc = 1
     finally:
         _shutdown_loop(loop)
         asyncio.set_event_loop(None)
+    if interrupted:
+        # The daemon ran, so blocking-TCP threads may still sit in the default
+        # ThreadPoolExecutor whose atexit join would hang a normal exit. Force
+        # an immediate exit — everything user-visible is already torn down.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     return rc
 
 
