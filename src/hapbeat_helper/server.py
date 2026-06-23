@@ -288,6 +288,44 @@ class HelperServer:
     def _on_registry_change(self) -> None:
         self._post_to_loop(self._broadcast(self._device_list_msg()))
 
+    async def _handle_reset_discovery(self, ws) -> None:
+        """Rebuild the UDP + mDNS discovery layer in-process.
+
+        Recovers from a wedged discovery socket (the symptom the
+        SIO_UDP_CONNRESET fix prevents) without dropping the WebSocket or
+        restarting the daemon. The registry itself is NOT cleared — known
+        devices stay listed (as offline) and flip back online as their PONGs
+        arrive, so the user never sees the list empty out."""
+        logger.info("reset_discovery requested — rebuilding UDP + mDNS")
+
+        def _rebuild() -> bool:
+            ok = self.udp.restart()
+            try:
+                self.mdns.restart()
+            except Exception:  # noqa: BLE001
+                logger.exception("mDNS restart failed during reset_discovery")
+            return ok
+
+        # Teardown blocks (socket close + thread join up to ~1s, zeroconf
+        # close) — run it off the event loop so the WS stays responsive.
+        ok = await asyncio.to_thread(_rebuild)
+
+        # Kick an immediate broadcast PING so devices re-announce promptly,
+        # then push the refreshed device_list to every client.
+        try:
+            self.udp.send_broadcast_ping()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reset_discovery: broadcast_ping failed: %s", exc)
+        await asyncio.sleep(0.25)
+        await self._broadcast(self._device_list_msg())
+        try:
+            await ws.send(json.dumps({
+                "type": "reset_discovery_result",
+                "payload": {"ok": ok},
+            }))
+        except ConnectionClosed:
+            pass
+
     # ── WS handlers ──────────────────────────────────────────
 
     async def _handler(self, ws) -> None:
@@ -380,6 +418,14 @@ class HelperServer:
             # Give devices ~250ms to PONG, then broadcast device_list.
             await asyncio.sleep(0.25)
             await self._broadcast(self._device_list_msg())
+
+        elif msg_type == "reset_discovery":
+            # In-process recovery: rebuild the UDP socket + recv thread and the
+            # mDNS browser without restarting the daemon. This is the Studio-
+            # triggered equivalent of `hapbeat-helper stop && start` for a
+            # wedged discovery layer (root cause now fixed via
+            # SIO_UDP_CONNRESET, but kept as a manual escape hatch).
+            await self._handle_reset_discovery(ws)
 
         elif msg_type == "preview_event":
             await self._handle_preview_event(ws, payload)

@@ -63,6 +63,19 @@ class MdnsScanner:
             self._zeroconf.close()
             self._zeroconf = None
 
+    def restart(self) -> None:
+        """Recreate the zeroconf browser, preserving registered listeners.
+
+        Recovery path for ``reset_discovery``: rebuilds the mDNS layer (whose
+        internal cache can hold a stale record after a device reboots and
+        re-announces) without restarting the daemon. The known-device cache is
+        cleared so the fresh browse re-populates from scratch; callbacks live
+        on the instance and survive stop()/start()."""
+        self.stop()
+        with self._lock:
+            self._known.clear()
+        self.start()
+
     # ── Query ────────────────────────────────────────────────
 
     def get_devices(self) -> dict[str, dict]:

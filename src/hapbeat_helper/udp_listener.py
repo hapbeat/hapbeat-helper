@@ -73,6 +73,25 @@ class UdpListener:
     def start(self) -> bool:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Windows only: a prior sendto() to an unreachable peer queues an ICMP
+        # port/host-unreachable, which Winsock then surfaces as
+        # ConnectionResetError (WinError 10054) on the *next* recvfrom() — even
+        # on this unconnected socket. That happens routinely during a firmware
+        # reflash: the scan loop keeps unicast-PINGing a device that just
+        # rebooted and isn't listening on 7700 yet. Without this the recv loop
+        # below would die on that OSError and the helper would go deaf to ALL
+        # PONGs until a full process restart (user report: 「ファーム書換後に
+        # デバイスを見失い、helper 再起動でしか戻らない」). SIO_UDP_CONNRESET=False
+        # tells Windows to ignore those resets. No-op on macOS/Linux (the
+        # constant only exists on Windows). asyncio's own UDP transports set
+        # this automatically, but we run a raw blocking socket so we must too.
+        if hasattr(socket, "SIO_UDP_CONNRESET"):
+            try:
+                sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except OSError as exc:
+                logger.debug(
+                    "SIO_UDP_CONNRESET ioctl failed (non-fatal): %s", exc,
+                )
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except OSError:
@@ -110,6 +129,20 @@ class UdpListener:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+
+    def restart(self) -> bool:
+        """Tear down and recreate the socket + recv thread, preserving the
+        registered pong/RTT listeners.
+
+        Recovery path for the helper's ``reset_discovery`` command: if the
+        recv thread ever wedged (it shouldn't anymore — see SIO_UDP_CONNRESET
+        in ``start``), this clears it in-process without restarting the whole
+        daemon. Listeners live on the instance and survive stop()/start();
+        only the in-flight RTT bookkeeping is dropped."""
+        self.stop()
+        with self._lock:
+            self._pending_pings.clear()
+        return self.start()
 
     # ── Send API ─────────────────────────────────────────────
 
@@ -201,8 +234,17 @@ class UdpListener:
                 data, addr = sock.recvfrom(4096)
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except OSError as exc:
+                if not self._running:
+                    break  # socket closed by stop()/restart() — expected exit
+                # Transient error while still running: residual ICMP-unreachable
+                # (should be suppressed by SIO_UDP_CONNRESET, but stay defensive
+                # in case it's unavailable), or a brief NIC flap. Killing the
+                # only recv thread here is exactly what made the helper need a
+                # restart, so DON'T break — back off briefly and keep listening.
+                logger.debug("UDP recv transient error (continuing): %s", exc)
+                time.sleep(0.2)
+                continue
 
             ip = addr[0]
             pong = protocol.parse_pong(data)
