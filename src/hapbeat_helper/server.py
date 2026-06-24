@@ -83,6 +83,22 @@ def _resolve_targets(payload: dict, registry: DeviceRegistry) -> list[str]:
     return registry.get_all_ips()
 
 
+def _explicit_ips(payload: dict) -> list[str]:
+    """Explicit destination device IPs from a play/stop payload.
+
+    Unlike :func:`_resolve_targets`, this returns ``[]`` (NOT "all known
+    devices") when nothing is specified, so a caller can choose to broadcast
+    instead of unicast-spamming every device. Crucially it looks ONLY at
+    ``targets`` (list) and ``ip`` — NOT ``target``: for PLAY/STOP, ``target``
+    is the *address-filter string* (player_N/pos_xxx/group_N), not an IP, so
+    treating it as an IP would send to a bogus host."""
+    raw = payload.get("targets")
+    if isinstance(raw, list) and raw:
+        return [str(ip) for ip in raw if ip]
+    one = payload.get("ip")
+    return [str(one)] if one else []
+
+
 class HelperServer:
     """The WebSocket server + the subsystems it relays to.
 
@@ -810,15 +826,25 @@ class HelperServer:
 
         seq = int(time.monotonic_ns() // 1000) & 0xFFFF
         pkt = protocol.build_play(seq, event_id, target=target, gain=gain)
-        # PLAY is sent as broadcast — devices self-filter by address.
-        self.udp.send_raw(pkt, "<broadcast>")
+        # Destination: if Studio gave explicit device IPs (`targets`/`ip`),
+        # unicast the PLAY to exactly those — this is how "play only on the
+        # checked devices" works WITHOUT the user setting an address string.
+        # With no IPs, broadcast (devices self-filter by the address string)
+        # so "play all" / address-routed sends keep working as before.
+        ips = _explicit_ips(payload)
+        if ips:
+            for ip in ips:
+                self.udp.send_raw(pkt, ip)
+            dest = f"{len(ips)} target(s)={ips}"
+        else:
+            self.udp.send_raw(pkt, "<broadcast>")
+            dest = f"<broadcast> target='{target}'" if target else "<broadcast>"
         # Echo a detailed result line. Studio surfaces this in the log
         # drawer as `[helper] play sent ...`, so include the wire
         # values that drive device-side playback.
-        target_label = target if target else "<broadcast>"
         msg = (
             f"play sent — event_id={event_id} "
-            f"target={target_label} gain={gain:.3f} seq={seq} "
+            f"dest={dest} gain={gain:.3f} seq={seq} "
             f"udp_bytes={len(pkt)}"
         )
         await ws.send(json.dumps({
@@ -834,7 +860,15 @@ class HelperServer:
             pkt = protocol.build_stop(seq, event_id, target=target)
         else:
             pkt = protocol.build_stop_all(seq, target=target)
-        self.udp.send_raw(pkt, "<broadcast>")
+        # Mirror preview_event: unicast to explicit IPs when given, else
+        # broadcast. Broadcast STOP is the safe default (reaches a device
+        # regardless of IP), so callers that don't pass IPs still stop all.
+        ips = _explicit_ips(payload)
+        if ips:
+            for ip in ips:
+                self.udp.send_raw(pkt, ip)
+        else:
+            self.udp.send_raw(pkt, "<broadcast>")
         await ws.send(json.dumps({
             "type": "write_result",
             "payload": {"success": True, "message": "stop sent"},
