@@ -24,6 +24,7 @@ on:
       - master
     paths:
       - 'docs/**'
+      - 'CHANGELOG.md'
   workflow_dispatch:
 
 jobs:
