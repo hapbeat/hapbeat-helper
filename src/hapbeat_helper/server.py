@@ -489,6 +489,41 @@ class HelperServer:
                 lambda r: {"level": r.get("level", 2)},
             )
 
+        # ── DuoWL v4 audio stage config (DEC-041) ──
+        # board-agnostic relay: firmware rejects non-duo_wl_v4 boards with
+        # {"status":"error","message":"unsupported board"}, Helper just
+        # forwards. All fields are partial-update (omit = keep current),
+        # so only include a field in the outgoing cmd dict if the caller
+        # actually sent it — do NOT backfill with defaults here, that
+        # would defeat the firmware's "omitted = leave unchanged" contract.
+        elif msg_type == "set_haptic_gain":
+            cmd = {"cmd": "set_haptic_gain"}
+            if "pam_db" in payload:
+                cmd["pam_db"] = int(payload["pam_db"])
+            if "lineout_db" in payload:
+                cmd["lineout_db"] = int(payload["lineout_db"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_dac_boost":
+            cmd = {"cmd": "set_dac_boost"}
+            if "boost_db" in payload:
+                cmd["boost_db"] = int(payload["boost_db"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_headphone_volume":
+            cmd = {"cmd": "set_headphone_volume"}
+            if "hp_db" in payload:
+                cmd["hp_db"] = int(payload["hp_db"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_stream_buffer":
+            cmd = {"cmd": "set_stream_buffer"}
+            if "buffer_ms" in payload:
+                cmd["buffer_ms"] = int(payload["buffer_ms"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
         elif msg_type == "reboot":
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "reboot"},
@@ -598,6 +633,10 @@ class HelperServer:
                     "ack_hold_ms": r.get("ack_hold_ms"),
                     # receiver subscribe topic roots (item 8)
                     "recv_topics": r.get("recv_topics"),
+                    # DuoWL v4 audio stage config snapshot (DEC-041):
+                    # {pam_db, lineout_db, boost_db, hp_db}. None on
+                    # non-v4 boards — Studio ignores it in that case.
+                    "audio": r.get("audio"),
                 },
             )
 
