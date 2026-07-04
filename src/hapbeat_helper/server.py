@@ -524,6 +524,12 @@ class HelperServer:
                 cmd["buffer_ms"] = int(payload["buffer_ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
+        elif msg_type == "set_input_mode":
+            cmd = {"cmd": "set_input_mode"}
+            if "mode" in payload:
+                cmd["mode"] = str(payload["mode"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
         elif msg_type == "reboot":
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "reboot"},
@@ -634,7 +640,7 @@ class HelperServer:
                     # receiver subscribe topic roots (item 8)
                     "recv_topics": r.get("recv_topics"),
                     # DuoWL v4 audio stage config snapshot (DEC-041):
-                    # {pam_db, lineout_db, boost_db, hp_db}. None on
+                    # {pam_db, lineout_db, boost_db, hp_db, input_mode}. None on
                     # non-v4 boards — Studio ignores it in that case.
                     "audio": r.get("audio"),
                 },
