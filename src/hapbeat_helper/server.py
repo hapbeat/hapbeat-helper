@@ -510,24 +510,132 @@ class HelperServer:
             cmd = {"cmd": "set_dac_boost"}
             if "boost_db" in payload:
                 cmd["boost_db"] = int(payload["boost_db"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "set_headphone_volume":
             cmd = {"cmd": "set_headphone_volume"}
             if "hp_db" in payload:
                 cmd["hp_db"] = int(payload["hp_db"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "set_stream_buffer":
             cmd = {"cmd": "set_stream_buffer"}
             if "buffer_ms" in payload:
                 cmd["buffer_ms"] = int(payload["buffer_ms"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "set_input_mode":
             cmd = {"cmd": "set_input_mode"}
             if "mode" in payload:
                 cmd["mode"] = str(payload["mode"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_eq_band":
+            # DuoWL v4 in-codec EQ (audio-dsp-config.md §2). Partial-update
+            # forwarding like the other DuoWL v4 audio setters.
+            cmd = {"cmd": "set_eq_band"}
+            if "codec" in payload:
+                cmd["codec"] = str(payload["codec"])
+            if "band" in payload:
+                cmd["band"] = int(payload["band"])
+            if "ftype" in payload:
+                cmd["ftype"] = str(payload["ftype"])
+            if "coeffs" in payload:
+                cmd["coeffs"] = [int(c) for c in payload["coeffs"]]
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_av_delay":
+            # DuoWL v4 audio-vs-haptic delay (audio-dsp-config.md §3). Signed
+            # ms (-100..+100): negative delays haptic, positive delays HP.
+            cmd = {"cmd": "set_av_delay"}
+            if "ms" in payload:
+                cmd["ms"] = int(payload["ms"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        # ---- AIC3204 full DSP feature set (DuoWL v4) --------------------
+        # Processing-block profile + the blocks it unlocks (6-band EQ, 1st-order
+        # IIR, DRC compressor, 3D, beep test-tone, line-in AGC). All partial-
+        # update forwards, same style as the DEC-041 audio setters above.
+        elif msg_type == "set_dsp_profile":
+            cmd = {"cmd": "set_dsp_profile"}
+            if "codec" in payload:
+                cmd["codec"] = str(payload["codec"])
+            if "profile" in payload:
+                cmd["profile"] = str(payload["profile"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_eq_iir":
+            cmd = {"cmd": "set_eq_iir"}
+            if "codec" in payload:
+                cmd["codec"] = str(payload["codec"])
+            if "coeffs" in payload:
+                cmd["coeffs"] = [int(c) for c in payload["coeffs"]]
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_drc":
+            # hold/attack/decay are RAW hardware codes (0..15), not dB/ms.
+            cmd = {"cmd": "set_drc"}
+            if "codec" in payload:
+                cmd["codec"] = str(payload["codec"])
+            for f in ("enable", "enable_l", "enable_r"):
+                if f in payload:
+                    cmd[f] = bool(payload[f])
+            for f in ("threshold_db", "hysteresis_db", "hold", "attack", "decay"):
+                if f in payload:
+                    cmd[f] = int(payload[f])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_beep":
+            # One-shot test tone (profile "full" only). enable=false stops it.
+            cmd = {"cmd": "set_beep"}
+            if "codec" in payload:
+                cmd["codec"] = str(payload["codec"])
+            for f in ("freq_hz", "volume_db", "length_ms"):
+                if f in payload:
+                    cmd[f] = int(payload[f])
+            if "enable" in payload:
+                cmd["enable"] = bool(payload["enable"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_3d":
+            cmd = {"cmd": "set_3d"}
+            if "codec" in payload:
+                cmd["codec"] = str(payload["codec"])
+            if "depth" in payload:
+                cmd["depth"] = float(payload["depth"])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_agc":
+            # Line-in (HP codec) AGC — no `codec` field by design.
+            cmd = {"cmd": "set_agc"}
+            if "enable" in payload:
+                cmd["enable"] = bool(payload["enable"])
+            for f in ("target_level_db", "max_gain_db", "attack", "decay",
+                      "noise_threshold_db", "hysteresis_db"):
+                if f in payload:
+                    cmd[f] = float(payload[f]) if f in ("max_gain_db", "hysteresis_db") else int(payload[f])
+            if "persist" in payload:
+                cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "reboot":
