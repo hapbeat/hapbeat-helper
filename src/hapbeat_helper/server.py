@@ -46,6 +46,28 @@ logger = logging.getLogger(__name__)
 WS_PORT = 7703
 HOST = "localhost"
 
+# How long one OTA chunk's sendall() may block on device backpressure before we
+# call the transfer dead. sendall only blocks once the socket send buffer fills,
+# i.e. when the device has stopped draining.
+#
+# 3 s, set from measurement rather than guesswork: a full 1.78 MB OTA to a
+# band_wl_v3 over Wi-Fi (2026-07-25) ran at ~254 KB/s with a WORST single 4 KB
+# sendall block of 0.094 s (99%ile 0.077 s, median 0.013 s). Blocking scales
+# inversely with link rate, so even a link 30x worse than that stalls a chunk
+# for only ~0.5 s — still 6x inside this budget. Tripping at 3 s effectively
+# means "~1 KB/s or dead", and a 1.78 MB OTA at 1 KB/s (30 min) is not worth
+# waiting out; failing fast and retrying is the better trade.
+#
+# This was 10 s, a defensive value picked back when the device drained only
+# 1 KB per loop and a 1.5 s timeout was firing spuriously. That root cause was
+# fixed (device now drains 4 KB/call) but the timeout was never revisited.
+#
+# Keep BELOW the device's own TRANSFER_WATCHDOG_MS (5 s, device-firmware
+# tcp_server.cpp) so the sender gives up first: helper closing the socket puts
+# the device on its immediate disconnect path, whereas the device's watchdog is
+# the slower fallback for when helper can't signal at all (killed / unplugged).
+OTA_CHUNK_SEND_TIMEOUT_S = 3.0
+
 
 def _device_to_dict(ip: str, dev: HapbeatDevice) -> dict:
     return {
@@ -1963,7 +1985,7 @@ def _do_ota_to_device(
             for off in range(0, file_size, chunk_size):
                 chunk = bin_bytes[off : off + chunk_size]
                 try:
-                    conn.send_raw(chunk, timeout=10.0)
+                    conn.send_raw(chunk, timeout=OTA_CHUNK_SEND_TIMEOUT_S)
                 except OSError as exc:
                     return False, (
                         f"phase=stream-send: {type(exc).__name__}: {exc} "
@@ -2351,7 +2373,12 @@ def _deploy_kit_to_device(
                         chunk = f.read(chunk_size)
                         if not chunk:
                             break
-                        conn.send_raw(chunk)
+                        # Explicit, same budget as the OTA path. Without it this
+                        # inherited whatever the last read_response() left on the
+                        # socket (5 s from file_begin) — which happens to equal
+                        # the device's own 5 s transfer watchdog, making it a
+                        # toss-up which side gave up first.
+                        conn.send_raw(chunk, timeout=OTA_CHUNK_SEND_TIMEOUT_S)
                         chunks_sent += 1
                         file_chunk_idx += 1
                         pct = int(chunks_sent / total_chunks * 99) if total_chunks else 99
