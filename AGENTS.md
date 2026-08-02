@@ -84,8 +84,12 @@ echo '{"type":"list_devices","payload":{}}' | websocat ws://localhost:7703
 
 Request `type` values handled by `_dispatch` (verbatim):
 - session/discovery: `ping` → `pong`; `list_devices` / `rescan` → `device_list`
-- playback (UDP broadcast, devices self-filter): `preview_event` (alias
-  `play_event`), `stop_event` — `payload`: `event_id`, `target`, `gain`
+- playback (UDP; devices self-filter on `target` regardless of routing):
+  `preview_event` (alias `play_event`), `stop_event` — `payload`: `event_id`,
+  `target`, `gain`, optional `targets`/`ip`.
+  Destination order: explicit `targets`/`ip` → online devices whose address
+  matches `target` (unicast) → broadcast. Broadcast is the last resort, never a
+  skip: a dropped STOP would leave a looping clip running. Never both at once.
 - TCP config (→ device TCP 7701): `write_ui_config`, `set_wifi`, `set_name`,
   `set_address`, `set_oled_brightness`, `reboot`, `clear_wifi`,
   `connect_wifi_profile`, `remove_wifi_profile`, `kit_delete`

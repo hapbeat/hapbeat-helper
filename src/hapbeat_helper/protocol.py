@@ -23,6 +23,50 @@ CMD_STREAM_END = 0x32
 CMD_ERROR = 0xFF
 
 
+def address_matches(target: Optional[str], device_address: Optional[str]) -> bool:
+    """Does ``device_address`` accept a packet aimed at ``target``?
+
+    A port of the firmware's ``addressMatch()``
+    (hapbeat-device-firmware/src/address_match.cpp), which is the authority:
+    the device re-applies this filter on receipt, so the helper only uses it to
+    pick unicast destinations, never to decide what plays.
+
+    Rules (contracts/specs/device-addressing.md §4.3):
+
+    - an empty target matches every address;
+    - both strings are split on ``/`` and compared **positionally**, so
+      ``group_2`` alone is compared against the *player* slot and never
+      matches — write ``*/*/group_2``;
+    - a ``*`` target segment matches any single address segment, but only when
+      the whole segment is ``*`` (``pos_*`` is compared literally);
+    - fewer target segments than address segments is a front-match;
+    - more target segments than address segments is a mismatch;
+    - a single trailing ``/`` is ignored (``"player_1/" == "player_1"``),
+      because firmware walks pointers and exits at the terminator rather than
+      producing an empty segment. Splitting naively would drop a device the
+      firmware *would* have accepted.
+    """
+    if not target:
+        return True
+
+    target_segments = target.split("/")
+    address_segments = (device_address or "").split("/")
+
+    # Only the last empty segment is dropped, and only once: "a//" really does
+    # compare an empty segment in firmware, and still mismatches.
+    count = len(target_segments)
+    if count > 1 and target_segments[count - 1] == "":
+        count -= 1
+
+    for i in range(count):
+        if i >= len(address_segments):
+            return False  # target longer than address = mismatch
+        if target_segments[i] != "*" and target_segments[i] != address_segments[i]:
+            return False
+
+    return True  # front-match or exact match
+
+
 def build_header(command_type: int, seq: int, payload_length: int) -> bytes:
     """Build 8-byte Layer 1 header.
 

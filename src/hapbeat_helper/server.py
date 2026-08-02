@@ -121,6 +121,32 @@ def _explicit_ips(payload: dict) -> list[str]:
     return [str(one)] if one else []
 
 
+def _address_routed_ips(target: str, registry: DeviceRegistry) -> list[str]:
+    """Online devices whose address accepts ``target`` — the destinations for a
+    PLAY/STOP that Studio sent without explicit IPs.
+
+    Unicast rather than broadcast because Wi-Fi APs hold group-addressed frames
+    until the next DTIM beacon (100-300 ms) whenever *any* client on the AP is
+    power-saving, which lands as a late haptic. All SDKs route this way now;
+    without this the same "play on every device" action would be prompt from an
+    SDK and late from Studio.
+
+    Returns ``[]`` when nothing is known or nothing matches — the caller then
+    broadcasts (see the call sites for why that is not a skip).
+
+    A device that has not reported an address is kept (fail open): worst case
+    is one extra unicast the device filters out itself, whereas dropping it
+    would silently lose the command.
+    """
+    ips: list[str] = []
+    for ip, dev in registry.get_all_devices().items():
+        if not dev.is_online:
+            continue
+        if not dev.address or protocol.address_matches(target, dev.address):
+            ips.append(ip)
+    return ips
+
+
 class HelperServer:
     """The WebSocket server + the subsystems it relays to.
 
@@ -1001,17 +1027,31 @@ class HelperServer:
 
         seq = int(time.monotonic_ns() // 1000) & 0xFFFF
         pkt = protocol.build_play(seq, event_id, target=target, gain=gain)
-        # Destination: if Studio gave explicit device IPs (`targets`/`ip`),
-        # unicast the PLAY to exactly those — this is how "play only on the
-        # checked devices" works WITHOUT the user setting an address string.
-        # With no IPs, broadcast (devices self-filter by the address string)
-        # so "play all" / address-routed sends keep working as before.
+        # Destination, in order:
+        #   1. explicit device IPs from Studio (`targets`/`ip`) — this is how
+        #      "play only on the checked devices" works WITHOUT the user
+        #      setting an address string;
+        #   2. otherwise the online devices whose address accepts `target`
+        #      (see _address_routed_ips for why unicast);
+        #   3. otherwise broadcast.
+        # Never both: firmware older than the (source ip, seq) dedupe would
+        # fire the same PLAY twice.
         ips = _explicit_ips(payload)
+        if ips:
+            dest = f"{len(ips)} target(s)={ips}"
+        else:
+            ips = _address_routed_ips(target, self.registry)
+            dest = f"unicast {len(ips)} device(s)={ips} target='{target}'"
         if ips:
             for ip in ips:
                 self.udp.send_raw(pkt, ip)
-            dest = f"{len(ips)} target(s)={ips}"
         else:
+            # Nothing known, or nothing matched. Broadcasting (rather than
+            # skipping) is deliberate: the device re-applies the target filter
+            # on receipt so this cannot fire a device the target excluded,
+            # while skipping would lose the packet whenever our cached address
+            # is stale — e.g. right after the user changes group/player in
+            # Studio. For STOP that means a looping clip never stops.
             self.udp.send_raw(pkt, "<broadcast>")
             dest = f"<broadcast> target='{target}'" if target else "<broadcast>"
         # Echo a detailed result line. Studio surfaces this in the log
@@ -1035,18 +1075,20 @@ class HelperServer:
             pkt = protocol.build_stop(seq, event_id, target=target)
         else:
             pkt = protocol.build_stop_all(seq, target=target)
-        # Mirror preview_event: unicast to explicit IPs when given, else
-        # broadcast. Broadcast STOP is the safe default (reaches a device
-        # regardless of IP), so callers that don't pass IPs still stop all.
-        ips = _explicit_ips(payload)
+        # Same routing as preview_event: explicit IPs > address-matched online
+        # devices > broadcast. Broadcast stays the last resort rather than a
+        # skip, because a STOP that goes nowhere leaves a looping clip running.
+        ips = _explicit_ips(payload) or _address_routed_ips(target, self.registry)
         if ips:
             for ip in ips:
                 self.udp.send_raw(pkt, ip)
+            dest = f"{len(ips)} device(s)={ips}"
         else:
             self.udp.send_raw(pkt, "<broadcast>")
+            dest = "<broadcast>"
         await ws.send(json.dumps({
             "type": "write_result",
-            "payload": {"success": True, "message": "stop sent"},
+            "payload": {"success": True, "message": f"stop sent — dest={dest}"},
         }))
 
     async def _handle_tcp_command(
