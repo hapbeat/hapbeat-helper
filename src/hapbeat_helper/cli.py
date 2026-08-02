@@ -23,20 +23,15 @@ import signal
 import socket
 import sys
 import threading
-from pathlib import Path
 
 from hapbeat_helper import __version__
 from hapbeat_helper.server import HelperServer, WS_PORT
+from hapbeat_helper import update_check
 
 logger = logging.getLogger("hapbeat-helper")
 
-
-def _config_dir() -> Path:
-    if sys.platform == "win32":
-        import os
-        base = Path(os.environ.get("APPDATA", str(Path.home())))
-        return base / "hapbeat-helper"
-    return Path.home() / ".config" / "hapbeat-helper"
+# 設定・状態ファイルの置き場は update_check と共有する (状態ファイルもここ)。
+_config_dir = update_check.config_dir
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -96,11 +91,21 @@ def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
     watchdog.cancel()
 
 
+def _apply_update_check_flag(args: argparse.Namespace) -> None:
+    """``--no-update-check`` を env に写して opt-out を一元化する。"""
+    if getattr(args, "no_update_check", False):
+        os.environ["HAPBEAT_NO_UPDATE_CHECK"] = "1"
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
+    _apply_update_check_flag(args)
     server = HelperServer(port=args.port)
     print(f"hapbeat-helper {__version__} starting on ws://localhost:{args.port}")
     print("Press Ctrl+C to stop.")
+    # 起動をブロックせずに release feed を見に行き、新しい版があれば 1 行だけ
+    # 出す。同じ版について 2 回目は出さない (DEC-053 §5.1)。オフラインなら黙る。
+    update_check.notify_in_background(__version__, stream=sys.stdout)
     # Own the event loop (instead of asyncio.run) so _shutdown_loop can
     # guarantee a complete close() on Ctrl+C — see its docstring for the
     # Windows ProactorEventLoop __del__ noise this prevents.
@@ -147,8 +152,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
         sock.close()
 
 
-def _cmd_version(_args: argparse.Namespace) -> int:
+def _cmd_version(args: argparse.Namespace) -> int:
+    _apply_update_check_flag(args)
     print(f"hapbeat-helper {__version__}")
+    # ここは「ユーザーが自分でバージョンを聞きに来た」場面なので、
+    # 1 版 1 回の抑制を無視して毎回出す (DEC-053 §5.2 の「見に行く場所」)。
+    notice = update_check.pending_notice(__version__, respect_dismissed=False)
+    if notice:
+        print(notice)
     return 0
 
 
@@ -292,6 +303,13 @@ def _add_verbose(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_no_update_check(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-update-check", action="store_true",
+        help="skip the release-feed lookup (same as HAPBEAT_NO_UPDATE_CHECK=1)",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hapbeat-helper",
@@ -323,6 +341,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="start the daemon in the foreground (Ctrl+C to stop)",
     )
     _add_verbose(p_start)
+    _add_no_update_check(p_start)
     p_start.add_argument(
         "--port", type=int, default=WS_PORT,
         help=f"WebSocket port (default: {WS_PORT})",
@@ -334,7 +353,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--port", type=int, default=WS_PORT)
     p_status.set_defaults(func=_cmd_status)
 
-    p_version = sub.add_parser("version", help="print version")
+    p_version = sub.add_parser("version", help="print version (and any newer release)")
+    _add_no_update_check(p_version)
     p_version.set_defaults(func=_cmd_version)
 
     p_stop = sub.add_parser(

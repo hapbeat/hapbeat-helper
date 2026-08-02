@@ -102,6 +102,18 @@ the next process start.
 > `ERROR: unknown type: <message>` in the log drawer, your helper is
 > older than the Studio build. `git pull && restart` (or `pipx upgrade`).
 
+#### Update notices
+
+When a newer release exists on PyPI, `hapbeat-helper start` prints a single
+line about it, and `hapbeat-helper version` always reports it. **The same
+version is only announced once** — pinning a version while you work never
+means dismissing the same message on every start.
+
+The lookup reads a static release feed
+(`https://devtools.hapbeat.com/releases.json`), times out after 3 seconds and
+stays completely silent on failure, so it is a no-op on isolated networks.
+Disable it with `--no-update-check` or `HAPBEAT_NO_UPDATE_CHECK=1`.
+
 ### Uninstalling
 
 ```bash
@@ -150,7 +162,7 @@ Press `Ctrl+C` to stop.
 
 ```bash
 hapbeat-helper status      # check whether a daemon is reachable on 7703
-hapbeat-helper version     # print version
+hapbeat-helper version     # print version (and any newer release)
 hapbeat-helper config show # show config path
 ```
 
