@@ -105,9 +105,9 @@ the next process start.
 #### Update notices
 
 When a newer release exists on PyPI, `hapbeat-helper start` prints a single
-line about it, and `hapbeat-helper version` always reports it. **The same
-version is only announced once** — pinning a version while you work never
-means dismissing the same message on every start.
+line about it, and `hapbeat-helper version` always reports it. It is one
+scrolling line with nothing to dismiss, so it simply prints on every start
+rather than being suppressed after the first sighting.
 
 The lookup reads a static release feed
 (`https://devtools.hapbeat.com/releases.json`), times out after 3 seconds and

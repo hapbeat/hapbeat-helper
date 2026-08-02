@@ -1,12 +1,11 @@
 """Update notice (release feed) の挙動テスト。
 
-守るべき性質は 3 つ (hapbeat-contracts specs/release-feed.md §5, DEC-053):
-  1. 新しい版があれば 1 回だけ知らせる
-  2. 一度知らせた版は、より新しい版が出るまで二度と知らせない
-  3. 取得できない / 分からない時は黙る (誤報を出さない・失敗を通知しない)
+守るべき性質 (hapbeat-contracts specs/release-feed.md §5, DEC-053):
+  1. 新しい版があれば起動ごとに 1 行知らせる (§5.1 B — 閉じる操作が無い表示なので
+     版ごとの永続抑制はしない。daemon の起動自体が稀でうるさくならない)
+  2. 取得できない / 分からない時は黙る (誤報を出さない・失敗を通知しない)
+  3. 起動をブロックしない
 """
-import json
-
 import pytest
 
 from hapbeat_helper import update_check as uc
@@ -70,34 +69,23 @@ def test_is_newer():
 # notice lifecycle
 
 
-def test_notifies_once_then_stays_quiet(feed_ok):
+def test_notifies_on_every_start(feed_ok):
+    """閉じる操作の無い 1 行なので、起動のたびに出してよい (§5.1 B)。
+
+    版ごとに永続抑制すると「一度見逃したら二度と出ない」方の害が大きい。
+    daemon の起動は稀なのでうるさくならない。
+    """
     first = uc.pending_notice("0.3.1")
     assert first is not None and "0.4.0" in first and "pipx upgrade" in first
-
-    uc.mark_notified("0.3.1")
-    assert uc.pending_notice("0.3.1") is None
-
-
-def test_newer_release_breaks_the_silence(feed_ok, monkeypatch):
-    uc.pending_notice("0.3.1")
-    uc.mark_notified("0.3.1")
-    assert uc.pending_notice("0.3.1") is None
-
-    monkeypatch.setattr(uc, "_fetch_entry", lambda: {**ENTRY, "latest": "0.5.0"})
-    # キャッシュを無効化して再取得させる (24h TTL を跨いだ状況)
-    state = json.loads((uc.config_dir() / uc.STATE_FILENAME).read_text())
-    state["checked_at"] = 0
-    (uc.config_dir() / uc.STATE_FILENAME).write_text(json.dumps(state))
-
-    again = uc.pending_notice("0.3.1")
-    assert again is not None and "0.5.0" in again
+    # 2 回目 (= 次の起動) でも同じように出る
+    assert uc.pending_notice("0.3.1") == first
 
 
-def test_version_command_ignores_dismissal(feed_ok):
-    """`hapbeat-helper version` は「見に行く場所」なので毎回出す。"""
-    uc.mark_notified("0.3.1")
-    assert uc.pending_notice("0.3.1") is None
-    assert uc.pending_notice("0.3.1", respect_dismissed=False) is not None
+def test_notice_is_english(feed_ok):
+    """CLI 出力は英語で統一 (ログ・コンソール出力の既存慣習に合わせる)。"""
+    msg = uc.pending_notice("0.3.1")
+    assert msg is not None
+    assert not any("぀" <= ch <= "鿿" for ch in msg)
 
 
 def test_quiet_when_up_to_date(feed_ok):
@@ -136,7 +124,16 @@ def test_cache_avoids_refetch(monkeypatch):
 
 
 def test_unwritable_state_dir_does_not_raise(feed_ok, monkeypatch):
-    """状態を残せなくても落ちない (通知が再度出るのは許容)。"""
+    """キャッシュを保存できない環境でも落ちない (毎回 fetch するだけ)。"""
     monkeypatch.setattr(uc, "config_dir", lambda: "\0invalid")
     assert uc.pending_notice("0.3.1") is not None
-    uc.mark_notified("0.3.1")  # must not raise
+
+
+def test_notify_in_background_prints_and_never_raises(feed_down, capsys):
+    """取得に失敗しても daemon を巻き込まない。"""
+    import threading
+    uc.notify_in_background("0.1.0")
+    for t in threading.enumerate():
+        if t.name == "hapbeat-update-check":
+            t.join(timeout=5)
+    assert capsys.readouterr().err == ""

@@ -104,7 +104,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     print(f"hapbeat-helper {__version__} starting on ws://localhost:{args.port}")
     print("Press Ctrl+C to stop.")
     # 起動をブロックせずに release feed を見に行き、新しい版があれば 1 行だけ
-    # 出す。同じ版について 2 回目は出さない (DEC-053 §5.1)。オフラインなら黙る。
+    # 出す (起動ごと。DEC-053 §5.1 B)。オフラインなら黙る。
     update_check.notify_in_background(__version__, stream=sys.stdout)
     # Own the event loop (instead of asyncio.run) so _shutdown_loop can
     # guarantee a complete close() on Ctrl+C — see its docstring for the
@@ -155,9 +155,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 def _cmd_version(args: argparse.Namespace) -> int:
     _apply_update_check_flag(args)
     print(f"hapbeat-helper {__version__}")
-    # ここは「ユーザーが自分でバージョンを聞きに来た」場面なので、
-    # 1 版 1 回の抑制を無視して毎回出す (DEC-053 §5.2 の「見に行く場所」)。
-    notice = update_check.pending_notice(__version__, respect_dismissed=False)
+    notice = update_check.pending_notice(__version__)
     if notice:
         print(notice)
     return 0

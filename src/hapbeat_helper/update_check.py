@@ -7,9 +7,10 @@
 
 守っている作法 (spec §5):
 
-* **1 版につき 1 回だけ**通知する。一度出した版は記録し、より新しい版が出るまで
-  黙る。起動のたびに同じ行を出すのは、版を意図的に固定している人にとって
-  ノイズでしかない。
+* **起動ごとに 1 回**出す (§5.1 B)。閉じる操作を要求しない 1 行なので、版ごとに
+  永続抑制して見逃させるより、起動のたびに流れる方が親切。daemon の起動自体が
+  稀なのでうるさくならない。バナーのように「閉じさせる」表示を出す場合は
+  版ごと 1 回に絞ること (§5.1 A)。
 * 取得失敗は**完全にサイレント**。Hapbeat は外部ネットワークの無い現場でも
   使われるので、「最新版を確認できませんでした」は出さない。
 * 起動を**ブロックしない** (バックグラウンドスレッドで実行)。
@@ -149,11 +150,11 @@ def latest_release(*, use_cache: bool = True) -> dict[str, Any] | None:
 # public API
 
 
-def pending_notice(current: str, *, respect_dismissed: bool = True) -> str | None:
-    """通知すべきなら 1 行のメッセージを返す。無ければ None。
+def pending_notice(current: str) -> str | None:
+    """新しい版があれば 1 行のメッセージを返す。無ければ None。
 
-    ``respect_dismissed=False`` で「1 版 1 回」の抑制を無視する
-    (``version`` サブコマンドのような *ユーザーが自分で聞きに来た* 場面用)。
+    抑制はしない — 呼び出し側 (daemon 起動 / ``version`` サブコマンド) はどちらも
+    実行頻度が低く、1 行流れて困る場面が無いため (§5.1 B)。
     """
     if opted_out():
         return None
@@ -163,25 +164,8 @@ def pending_notice(current: str, *, respect_dismissed: bool = True) -> str | Non
     latest = entry.get("latest")
     if not is_newer(latest, current):
         return None
-
-    if respect_dismissed:
-        notified = _load_state().get("notified")
-        # まだ何も通知していなければ出す。通知済みなら、それより新しい版の時だけ。
-        # (is_newer は baseline が無いと False を返すので、None を先に弾く)
-        if notified and not is_newer(latest, notified):
-            return None
-
     upgrade = entry.get("upgrade") or "pipx upgrade hapbeat-helper"
-    return f"  → hapbeat-helper {latest} が公開されています:  {upgrade}"
-
-
-def mark_notified(current: str) -> None:
-    """いま通知した版を記録し、次回以降は黙るようにする。"""
-    entry = latest_release()
-    if entry and entry.get("latest"):
-        state = _load_state()
-        state["notified"] = entry["latest"]
-        _save_state(state)
+    return f"  → hapbeat-helper {latest} is available:  {upgrade}"
 
 
 def notify_in_background(current: str, *, stream=None) -> None:
@@ -199,7 +183,6 @@ def notify_in_background(current: str, *, stream=None) -> None:
             msg = pending_notice(current)
             if msg:
                 print(msg, file=out, flush=True)
-                mark_notified(current)
         except Exception:
             pass  # 更新通知が原因で daemon を壊さない
 
