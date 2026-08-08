@@ -12,6 +12,8 @@
   `hapbeat-helper version` でもいつでも確認できる。
   無効化は `--no-update-check` または `HAPBEAT_NO_UPDATE_CHECK=1`。
   取得は 3 秒でタイムアウトし、失敗しても何も出さない（オフライン運用のため）。
+- BandWL v4 PWM 実験ファーム向けに `set_pwm_bias` / `pwm_tone` / `set_volume` /
+  `pwm_status` / `pwm_probe` を中継し、`get_info` の `haptic_pwm` を透過するようにした。
 
 ### Changed
 

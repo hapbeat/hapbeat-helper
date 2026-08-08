@@ -686,6 +686,58 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
+        # ── BandWL v4 PWM experimental firmware ──
+        # Only the `band_v4_pwm` build implements these; every other build
+        # replies "unknown cmd", so the helper relays board-agnostically
+        # (same policy as the DEC-041 audio setters above).
+        elif msg_type == "set_pwm_bias":
+            # Signed DC bias: sign = motor direction, magnitude = force.
+            # `duty` and `ma` are alternative units — forward whichever
+            # Studio sent rather than defaulting, so an omitted field can
+            # never be mistaken for an explicit 0 (= stop).
+            cmd = {"cmd": "set_pwm_bias"}
+            if "duty" in payload:
+                cmd["duty"] = float(payload["duty"])
+            if "ma" in payload:
+                cmd["ma"] = int(payload["ma"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "pwm_tone":
+            cmd = {"cmd": "pwm_tone"}
+            if "hz" in payload:
+                cmd["hz"] = int(payload["hz"])
+            if "amp" in payload:
+                cmd["amp"] = float(payload["amp"])
+            if "ms" in payload:
+                cmd["ms"] = int(payload["ms"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_volume":
+            cmd = {"cmd": "set_volume"}
+            if "level" in payload:
+                cmd["level"] = int(payload["level"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "pwm_status":
+            # Rich status dict (state / carrier / bias / underruns / clips) —
+            # pass through verbatim, the helper has no business filtering it.
+            await self._handle_passthrough_query(
+                ws, payload, {"cmd": "pwm_status"}, "pwm_status_result",
+            )
+
+        elif msg_type == "pwm_probe":
+            # The device BLOCKS for up to 3 s driving the gates directly.
+            # _send_tcp_passthrough reads with timeout=10 s, so the reply
+            # still lands well inside the window — no special-casing needed.
+            cmd = {"cmd": "pwm_probe"}
+            if "hz" in payload:
+                cmd["hz"] = int(payload["hz"])
+            if "ms" in payload:
+                cmd["ms"] = int(payload["ms"])
+            await self._handle_passthrough_query(
+                ws, payload, cmd, "pwm_probe_result",
+            )
+
         elif msg_type == "reboot":
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "reboot"},
@@ -799,6 +851,10 @@ class HelperServer:
                     # {pam_db, lineout_db, boost_db, hp_db, input_mode}. None on
                     # non-v4 boards — Studio ignores it in that case.
                     "audio": r.get("audio"),
+                    # BandWL v4 PWM experimental build only:
+                    # {carrier_hz, gpio_a, gpio_b, state}. Absent on every
+                    # other build — Studio keys the PWM tab off its presence.
+                    "haptic_pwm": r.get("haptic_pwm"),
                 },
             )
 
