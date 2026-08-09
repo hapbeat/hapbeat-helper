@@ -27,6 +27,11 @@ classifiers = [
 dependencies = [
     "websockets>=12",
     "zeroconf>=0.131",
+    # Local interface enumeration with netmasks, used to derive subnet-directed
+    # broadcast addresses (udp_listener.enumerate_broadcast_routes). Already
+    # installed as a zeroconf dependency; declared explicitly because we import
+    # it directly and must not depend on that staying true.
+    "ifaddr>=0.1.7",
 ]
 
 [project.urls]
