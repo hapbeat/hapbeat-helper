@@ -23,9 +23,26 @@ def test_play_packet_layout():
     payload = pkt[protocol.HEADER_SIZE:]
     assert payload.startswith(b"explosion\x00player_1/chest\x00")
     tail = payload[len("explosion\x00player_1/chest\x00"):]
-    target_time, gain = struct.unpack("<qf", tail)
+    target_time, gain, pan = struct.unpack("<qff", tail)
     assert target_time == 0
     assert abs(gain - 0.5) < 1e-6
+    assert pan == 0.0
+
+
+def test_play_packet_pan():
+    pkt = protocol.build_play(1, "e", target="", gain=1.0, pan=-0.25)
+    payload = pkt[protocol.HEADER_SIZE:]
+    tail = payload[len("e\x00\x00"):]
+    _, _, pan = struct.unpack("<qff", tail)
+    assert abs(pan - (-0.25)) < 1e-6
+
+
+def test_play_pan_is_clamped():
+    for raw, want in ((5.0, 1.0), (-5.0, -1.0)):
+        pkt = protocol.build_play(1, "e", pan=raw)
+        tail = pkt[protocol.HEADER_SIZE + len("e\x00\x00"):]
+        _, _, pan = struct.unpack("<qff", tail)
+        assert pan == want
 
 
 def test_pong_parser_extended():

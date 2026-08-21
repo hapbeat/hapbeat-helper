@@ -1074,6 +1074,7 @@ class HelperServer:
         event_id = payload.get("event_id", "")
         target = payload.get("target", "")
         gain = float(payload.get("gain", 1.0))
+        pan = float(payload.get("pan", 0.0))
         if not event_id:
             await ws.send(json.dumps({
                 "type": "error",
@@ -1082,7 +1083,7 @@ class HelperServer:
             return
 
         seq = int(time.monotonic_ns() // 1000) & 0xFFFF
-        pkt = protocol.build_play(seq, event_id, target=target, gain=gain)
+        pkt = protocol.build_play(seq, event_id, target=target, gain=gain, pan=pan)
         # Destination, in order:
         #   1. explicit device IPs from Studio (`targets`/`ip`) — this is how
         #      "play only on the checked devices" works WITHOUT the user

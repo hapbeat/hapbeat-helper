@@ -48,14 +48,27 @@ def test_build_play_structure():
 
     payload = pkt[protocol.HEADER_SIZE:]
     assert hdr["payload_length"] == len(payload)
-    # event_id\0 target\0 <q(target_time_us) f(gain)
+    # event_id\0 target\0 <q(target_time_us) f(gain) f(pan)
     event, rest = payload.split(b"\x00", 1)
     target, tail = rest.split(b"\x00", 1)
     assert event.decode() == "alert-kit.urgent"
     assert target.decode() == "player_1/chest"
-    ttime, gain = struct.unpack("<qf", tail)
+    ttime, gain, pan = struct.unpack("<qff", tail)
     assert ttime == 0
     assert abs(gain - 0.75) < 1e-6
+    # pan is always emitted (DEC-055); omitted by the caller means center.
+    assert pan == 0.0
+
+
+def test_build_play_pan_round_trip():
+    pkt = protocol.build_play(
+        seq=8, event_id="alert-kit.urgent", target="", gain=1.0, pan=0.5,
+    )
+    payload = pkt[protocol.HEADER_SIZE:]
+    _, rest = payload.split(b"\x00", 1)
+    _, tail = rest.split(b"\x00", 1)
+    _, _, pan = struct.unpack("<qff", tail)
+    assert abs(pan - 0.5) < 1e-6
 
 
 def test_build_play_empty_event_and_target():
@@ -66,4 +79,4 @@ def test_build_play_empty_event_and_target():
     target, tail = rest.split(b"\x00", 1)
     assert event == b""
     assert target == b""
-    assert len(tail) == struct.calcsize("<qf")
+    assert len(tail) == struct.calcsize("<qff")

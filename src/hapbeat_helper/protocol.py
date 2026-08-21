@@ -104,15 +104,22 @@ def build_play(
     target: str = "",
     target_time_us: int = 0,
     gain: float = 1.0,
+    pan: float = 0.0,
     group: int = 0,  # legacy compat — ignored if target is set
 ) -> bytes:
-    """Build a PLAY command packet."""
+    """Build a PLAY command packet.
+
+    `pan` (-1.0 left / 0.0 center / +1.0 right) is the trailing optional field
+    of the 0x01 payload (DEC-055). We always emit it; older firmware simply
+    reads the payload up to `gain` and ignores the extra 4 bytes.
+    """
     event_bytes = event_id.encode("utf-8") + b"\x00"
     target_bytes = target.encode("utf-8") + b"\x00"
+    pan = max(-1.0, min(1.0, float(pan)))
     payload = (
         event_bytes
         + target_bytes
-        + struct.pack("<qf", target_time_us, gain)
+        + struct.pack("<qff", target_time_us, gain, pan)
     )
     return build_header(CMD_PLAY, seq, len(payload)) + payload
 

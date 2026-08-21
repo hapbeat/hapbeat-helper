@@ -13,6 +13,9 @@
   動いていなければデバイスへ直接ストリームする。送信前に app image を検証し、
   merged image (`firmware_full_serial.bin`) は弾く。終了コードは 0 成功 / 1 OTA 失敗 /
   2 引数・宛先エラー。
+- **PLAY (0x01) に `pan` を追加した**（DEC-055、-1.0 左 / 0.0 中央 / +1.0 右）。
+  `preview_event` の payload に任意フィールド `pan`（既定 0.0）を受け、送信時は
+  `[-1, 1]` にクランプして常に付与する。STOP / STOP_ALL は変更なし。
 
 ### Fixed
 
