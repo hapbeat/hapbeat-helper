@@ -166,6 +166,21 @@ hapbeat-helper version     # print version (and any newer release)
 hapbeat-helper config show # show config path
 ```
 
+### Firmware OTA from the CLI
+
+Push a firmware app image to one device over Wi-Fi, without opening Studio:
+
+```bash
+hapbeat-helper ota 192.168.0.48 dist/necklace_v3/firmware_app_ota.bin
+hapbeat-helper ota duo-01 dist/necklace_v3/firmware_app_ota.bin   # by device name
+```
+
+The target is an IP address or a device name; names are resolved through the
+running daemon, so an IP is required when no daemon is up. Pass the app-only
+image (`firmware_app_ota.bin`) — a merged serial image is rejected before
+anything is sent. Exit code is 0 on success, 1 on OTA failure, 2 on a bad
+argument or an unresolvable target.
+
 ## Verify
 
 Quick smoke test using `websocat`:

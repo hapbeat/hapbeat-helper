@@ -7,6 +7,7 @@ Subcommands:
 - ``version``                             print version
 - ``stop``                                stop the auto-started helper
 - ``logs [-f] [-n N]``                    show log file + tail recent lines
+- ``ota <target> <bin>``                  push a firmware app image over Wi-Fi
 - ``install-service``                     register as OS auto-start service (Task Scheduler on Windows / launchd on macOS)
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
@@ -284,6 +285,41 @@ def _cmd_service_status(_args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_ota(args: argparse.Namespace) -> int:
+    """Push a firmware app image to one device.
+
+    Exit codes: 0 success / 1 OTA failure / 2 bad argument or target.
+    """
+    _setup_logging(args.verbose)
+    if not args.verbose:
+        # The one-line progress display is the output here; INFO records from
+        # the transfer would break it apart mid-line. -v restores them.
+        logging.getLogger().setLevel(logging.WARNING)
+    from hapbeat_helper import ota_client
+
+    bin_bytes, err = ota_client.load_ota_image(args.bin)
+    if err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+
+    if ota_client.daemon_reachable(args.port):
+        return asyncio.run(ota_client.run_ota_via_ws(
+            args.port, args.target, bin_bytes, args.verbose,
+        ))
+
+    # No daemon: we can still stream directly, but device discovery lives in
+    # the daemon, so a name cannot be resolved here.
+    if not ota_client.is_ip_address(args.target):
+        print(
+            f"error: helper is not running on port {args.port}, so the device "
+            f"name {args.target!r} cannot be resolved. Start it with "
+            "`hapbeat-helper start`, or pass the device's IP address.",
+            file=sys.stderr,
+        )
+        return 2
+    return ota_client.run_ota_direct(args.target, bin_bytes, args.verbose)
+
+
 def _cmd_config_show(_args: argparse.Namespace) -> int:
     cfg = _config_dir()
     print(f"config dir: {cfg}")
@@ -324,6 +360,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  status           check ws://localhost:7703 reachability\n"
             "  version          show installed version\n"
             "  logs             show/follow the auto-start log file\n"
+            "  ota              push a firmware app image to one device\n"
             "  install-service  register & start at OS login\n"
             "  uninstall-service  remove registration and stop\n"
             "  service-status   show registration state\n"
@@ -375,6 +412,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_logs.set_defaults(func=_cmd_logs)
 
+    p_ota = sub.add_parser(
+        "ota",
+        help="push a firmware app image (.bin) to one device over Wi-Fi",
+        description=(
+            "Push a firmware app image to a single device. TARGET is an IP "
+            "address or a device name (names need a running helper to "
+            "resolve). BIN must be an app-only image such as "
+            "firmware_app_ota.bin; a merged serial image is rejected."
+        ),
+    )
+    _add_verbose(p_ota)
+    p_ota.add_argument("target", help="device IP address or device name")
+    p_ota.add_argument("bin", help="path to the OTA app image (.bin)")
+    p_ota.add_argument(
+        "--port", type=int, default=WS_PORT,
+        help=f"WebSocket port of the running helper (default: {WS_PORT})",
+    )
+    p_ota.set_defaults(func=_cmd_ota)
+
     p_install = sub.add_parser(
         "install-service",
         help="register hapbeat-helper as an OS auto-start service (launchd on macOS / Startup-folder VBS shim on Windows); starts immediately",
@@ -401,7 +457,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _make_console_lossy() -> None:
+    """Never let an unencodable character kill a command.
+
+    A Japanese Windows console is cp932, which has no U+2014 EM DASH. Both
+    our own help text and the messages the daemon/firmware hand back (e.g.
+    ``phase=stuck: ... — recovered``) contain one, and printing it raised
+    UnicodeEncodeError, taking down the whole command. Degrade the
+    character instead of the command.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # not a reconfigurable text stream (redirect / capture)
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_console_lossy()
     parser = _build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

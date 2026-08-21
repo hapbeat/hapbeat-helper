@@ -5,7 +5,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`hapbeat-helper ota <target> <bin>`** を追加した。dev ビルドのファームを Studio を
+  開かずに CLI から流せる。`<target>` は IP またはデバイス名（名前の解決には稼働中の
+  helper が要る）。helper が動いていれば WS 経由（per-IP ロック・OTA 排他と協調）、
+  動いていなければデバイスへ直接ストリームする。送信前に app image を検証し、
+  merged image (`firmware_full_serial.bin`) は弾く。終了コードは 0 成功 / 1 OTA 失敗 /
+  2 引数・宛先エラー。
+
 ### Fixed
+
+- `python -m hapbeat_helper` が終了コードを捨てていたのを修正した（常に 0 を返していた）。
+- Windows の日本語コンソール (cp932) で、`—` を含むメッセージを出力するとコマンドごと
+  `UnicodeEncodeError` で落ちていたのを修正した。表示できない文字だけを置換する。
 
 - **マルチホーム PC で、mDNS が使えないときにデバイスを発見できない問題**を修正した。
   ブロードキャスト PING の宛先が `255.255.255.255`（limited broadcast）だったが、これは
