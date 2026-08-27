@@ -45,6 +45,23 @@ def test_play_pan_is_clamped():
         assert pan == want
 
 
+def test_stream_begin_carries_complete_endpoint_address():
+    target = "player_1/pos_neck/group_2"
+    pkt = protocol.build_stream_begin(
+        9, sample_rate=16000, channels=2, fmt=0,
+        total_samples=0, gain=1.0, target=target,
+    )
+    header = protocol.parse_header(pkt)
+    assert header["command_type"] == protocol.CMD_STREAM_BEGIN
+    payload = pkt[protocol.HEADER_SIZE:]
+    sample_rate, channels, fmt, total_samples, gain = struct.unpack(
+        "<HBBIf", payload[:12],
+    )
+    assert (sample_rate, channels, fmt, total_samples) == (16000, 2, 0, 0)
+    assert gain == 1.0
+    assert payload[12:] == target.encode("utf-8") + b"\x00"
+
+
 def test_pong_parser_extended():
     # build a fake PONG with all extended fields
     payload = struct.pack("<qq", 12345, 67890)

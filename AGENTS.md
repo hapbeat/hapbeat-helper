@@ -106,7 +106,9 @@ Request `type` values handled by `_dispatch` (verbatim):
 - firmware/kit: `ota_data` (`payload.bin_base64`) → `ota_progress`/`ota_result`;
   `deploy_kit_data` (`payload.zip_base64` + explicit `targets`) →
   `deploy_progress`/`deploy_result`
-- streaming: `stream_begin` / `stream_data` / `stream_end`
+- streaming: `stream_begin` payload carries exact `ip` + complete address
+  `target`; `stream_data` / `stream_end` carry the same exact `ip`. This keeps
+  concurrent endpoint sessions isolated because DATA/END have no wire target.
 
 Unknown types reply `{"type":"error","payload":{"message":"unknown type: ..."}}`.
 

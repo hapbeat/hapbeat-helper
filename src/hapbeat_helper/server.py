@@ -1835,6 +1835,7 @@ class HelperServer:
             fmt=1 if payload.get("format", "adpcm") == "adpcm" else 0,
             total_samples=int(payload.get("total_samples", 0)),
             gain=float(payload.get("gain", 1.0)),
+            target=str(payload.get("target", "")),
         )
         for ip in targets:
             self.udp.send_raw(pkt, ip)

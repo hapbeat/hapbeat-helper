@@ -148,8 +148,12 @@ def build_stream_begin(
     fmt: int = 1,
     total_samples: int = 0,
     gain: float = 1.0,
+    target: str = "",
 ) -> bytes:
-    payload = struct.pack("<HBBIf", sample_rate, channels, fmt, total_samples, gain)
+    payload = (
+        struct.pack("<HBBIf", sample_rate, channels, fmt, total_samples, gain)
+        + target.encode("utf-8") + b"\x00"
+    )
     return build_header(CMD_STREAM_BEGIN, seq, len(payload)) + payload
 
 

@@ -45,13 +45,16 @@
 
 ### Changed
 
+- Browser SDK の endpoint-scoped multi-stream 用に、`stream_begin` の
+  `payload.target`（完全 device address）を UDP `STREAM_BEGIN` payload へ
+  透過するようにした。BEGIN/DATA/END の `payload.ip` と組み合わせ、複数
+  endpoint の同時 session を broadcast せず分離する。
 - `ifaddr` を依存関係に明示した。ローカル NIC のネットマスク取得に直接使うため
   （`zeroconf` の依存として以前から入っていたが、それに依存し続ける前提は置けない）。
 
 ### 検証
 
-- pytest 77 件（宛先算出・重複排除・探索と再生の経路分離・列挙失敗時のフォールバック・
-  単一 NIC の非回帰）
+- pytest 100 件通過（STREAM_BEGIN address target layout を含む）。実機未検証。
 - **Hapbeat 実機（duo_wl_v3 / fw 0.3.1）で確認済み**: PING が全サブネット宛てに
   ファンアウトし、実機の PONG でそのサブネットに確定、`send_raw` の `<broadcast>` は
   単一宛先のまま。稼働中のデーモンでも
