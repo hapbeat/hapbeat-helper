@@ -167,7 +167,12 @@ class HelperServer:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._clients: set[Any] = set()
-        self._stream_seq = 0
+        # Browser audio streams are identified independently from the UDP
+        # sequence field. A target belongs to the most recent (WS client,
+        # stream_id) pair that sent STREAM_BEGIN, so a delayed END/DATA from
+        # an aborted preview cannot stop or corrupt its replacement.
+        self._active_streams: dict[str, tuple[int, str]] = {}
+        self._stream_sequences: dict[tuple[int, str], int] = {}
         self._scan_task: Optional[asyncio.Task] = None
         # ip -> background log-tail thread state. One subscriber per
         # device is enough for the MVP; if a second client subscribes
@@ -436,6 +441,7 @@ class HelperServer:
         except Exception:  # noqa: BLE001
             pass
         finally:
+            self._end_streams_owned_by(ws)
             self._clients.discard(ws)
             # If this was the last WS client, tear down all log_tail
             # subscribers. Without this, a closed-tab / refreshed Studio
@@ -691,16 +697,81 @@ class HelperServer:
         # replies "unknown cmd", so the helper relays board-agnostically
         # (same policy as the DEC-041 audio setters above).
         elif msg_type == "set_pwm_bias":
-            # Signed DC bias: sign = motor direction, magnitude = force.
-            # `duty` and `ma` are alternative units — forward whichever
-            # Studio sent rather than defaulting, so an omitted field can
-            # never be mistaken for an explicit 0 (= stop).
+            # Standing DC bias. Keep accepting legacy `duty`, but preserve the
+            # explicit idle_duty field so callers cannot confuse it with the
+            # profile used while audio is actually playing.
             cmd = {"cmd": "set_pwm_bias"}
+            if "idle_duty" in payload:
+                cmd["idle_duty"] = float(payload["idle_duty"])
             if "duty" in payload:
                 cmd["duty"] = float(payload["duty"])
             if "ma" in payload:
                 cmd["ma"] = int(payload["ma"])
             await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_pwm_play_bias":
+            cmd = {"cmd": "set_pwm_play_bias"}
+            if "duty" in payload:
+                cmd["duty"] = float(payload["duty"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_pwm_bias_enabled":
+            # Device-owned persistent gate for the two saved DC profiles.
+            # Keep false explicit; a truthiness fallback would turn OFF into ON.
+            cmd = {"cmd": "set_pwm_bias_enabled"}
+            if "enabled" in payload:
+                cmd["enabled"] = bool(payload["enabled"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_pwm_playback_gain":
+            cmd = {"cmd": "set_pwm_playback_gain"}
+            if "db" in payload:
+                cmd["db"] = int(payload["db"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_pwm_post_play_hold":
+            cmd = {"cmd": "set_pwm_post_play_hold"}
+            if "ms" in payload:
+                cmd["ms"] = int(payload["ms"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_pwm_post_play_return":
+            # The device owns this timer and persists it with the two bias
+            # profiles. Helper only relays the explicit duration.
+            cmd = {"cmd": "set_pwm_post_play_return"}
+            if "ms" in payload:
+                cmd["ms"] = int(payload["ms"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "set_haptic_output_mode":
+            # Runtime A/B switch inside the hybrid band_v4_pwm firmware. The
+            # device owns persistence and the safety-critical PAM/GPIO handoff;
+            # Helper only preserves the explicit mode string.
+            cmd = {"cmd": "set_haptic_output_mode"}
+            if "mode" in payload:
+                cmd["mode"] = str(payload["mode"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "pwm_bias_test":
+            cmd = {"cmd": "pwm_bias_test"}
+            if "enabled" in payload:
+                cmd["enabled"] = bool(payload["enabled"])
+            if "mode" in payload:
+                cmd["mode"] = str(payload["mode"])
+            if "profile" in payload:
+                cmd["profile"] = str(payload["profile"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "pwm_rewind":
+            cmd = {"cmd": "pwm_rewind"}
+            if "duty" in payload:
+                cmd["duty"] = float(payload["duty"])
+            if "ms" in payload:
+                cmd["ms"] = int(payload["ms"])
+            await self._handle_tcp_command(ws, payload, cmd)
+
+        elif msg_type == "pwm_bias_off":
+            await self._handle_tcp_command(ws, payload, {"cmd": "pwm_bias_off"})
 
         elif msg_type == "pwm_tone":
             cmd = {"cmd": "pwm_tone"}
@@ -710,6 +781,8 @@ class HelperServer:
                 cmd["amp"] = float(payload["amp"])
             if "ms" in payload:
                 cmd["ms"] = int(payload["ms"])
+            if "wave" in payload:
+                cmd["wave"] = str(payload["wave"])
             await self._handle_tcp_command(ws, payload, cmd)
 
         elif msg_type == "set_volume":
@@ -1819,17 +1892,86 @@ class HelperServer:
 
     # ── Streaming ────────────────────────────────────────────
 
+    @staticmethod
+    def _stream_key(ws, payload: dict) -> Optional[tuple[int, str]]:
+        stream_id = payload.get("stream_id")
+        if stream_id is None:
+            # Strictly serial clients may use one implicit transaction per WS
+            # connection. Overlapping/cancellable clients must send an ID.
+            return (id(ws), "<implicit>")
+        if not isinstance(stream_id, str) or not stream_id.strip():
+            return None
+        return (id(ws), stream_id)
+
+    def _drop_sequence_if_unused(self, key: tuple[int, str]) -> None:
+        if key not in self._active_streams.values():
+            self._stream_sequences.pop(key, None)
+
+    def _matching_stream_targets(
+        self,
+        key: tuple[int, str],
+        payload: dict,
+    ) -> list[str]:
+        return [
+            ip for ip in _resolve_targets(payload, self.registry)
+            if self._active_streams.get(ip) == key
+        ]
+
+    def _end_streams_owned_by(self, ws) -> None:
+        """End only streams this disconnected client still owns.
+
+        If another client already replaced a target's stream, that target no
+        longer matches this owner and is deliberately left untouched.
+        """
+        client_id = id(ws)
+        by_key: dict[tuple[int, str], list[str]] = {}
+        for ip, key in self._active_streams.items():
+            if key[0] == client_id:
+                by_key.setdefault(key, []).append(ip)
+
+        for key, targets in by_key.items():
+            seq = self._stream_sequences.get(key, 0) + 1
+            pkt = protocol.build_stream_end(seq=seq)
+            for ip in targets:
+                if self._active_streams.get(ip) == key:
+                    self.udp.send_raw(pkt, ip)
+                    self._active_streams.pop(ip, None)
+            self._stream_sequences.pop(key, None)
+
     async def _handle_stream_begin(self, ws, payload: dict) -> None:
-        targets = _resolve_targets(payload, self.registry)
-        if not targets:
+        key = self._stream_key(ws, payload)
+        if key is None:
             await ws.send(json.dumps({
                 "type": "stream_ack",
-                "payload": {"status": "no_target"},
+                "payload": {
+                    "status": "error",
+                    "message": "stream_id is required",
+                },
             }))
             return
-        self._stream_seq = 0
+        targets = _resolve_targets(payload, self.registry)
+        if not targets:
+            ack_payload = {"status": "no_target"}
+            if "stream_id" in payload:
+                ack_payload["stream_id"] = key[1]
+            await ws.send(json.dumps({
+                "type": "stream_ack",
+                "payload": ack_payload,
+            }))
+            return
+        displaced = {
+            active for ip in targets
+            if (active := self._active_streams.get(ip)) is not None
+            and active != key
+        }
+        for ip in targets:
+            self._active_streams[ip] = key
+        for old_key in displaced:
+            self._drop_sequence_if_unused(old_key)
+
+        self._stream_sequences[key] = 0
         pkt = protocol.build_stream_begin(
-            seq=self._stream_seq,
+            seq=0,
             sample_rate=int(payload.get("sample_rate", 16000)),
             channels=int(payload.get("channels", 1)),
             fmt=1 if payload.get("format", "adpcm") == "adpcm" else 0,
@@ -1839,33 +1981,44 @@ class HelperServer:
         )
         for ip in targets:
             self.udp.send_raw(pkt, ip)
-        await ws.send(json.dumps({
-            "type": "stream_ack",
-            "payload": {"status": "ok", "targets": targets},
-        }))
+        ack_payload = {"status": "ok", "targets": targets}
+        if "stream_id" in payload:
+            ack_payload["stream_id"] = key[1]
+        await ws.send(json.dumps({"type": "stream_ack", "payload": ack_payload}))
 
     async def _handle_stream_data(self, ws, payload: dict) -> None:
-        targets = _resolve_targets(payload, self.registry)
+        key = self._stream_key(ws, payload)
+        if key is None:
+            return
+        targets = self._matching_stream_targets(key, payload)
         if not targets:
             return
         offset = int(payload.get("offset", 0))
         data_b64 = payload.get("data", "")
         audio = base64.b64decode(data_b64) if data_b64 else b""
-        self._stream_seq += 1
+        seq = self._stream_sequences.get(key, 0) + 1
+        self._stream_sequences[key] = seq
         pkt = protocol.build_stream_data(
-            seq=self._stream_seq, offset=offset, data=audio,
+            seq=seq, offset=offset, data=audio,
         )
         for ip in targets:
             self.udp.send_raw(pkt, ip)
 
     async def _handle_stream_end(self, ws, payload: dict) -> None:
-        targets = _resolve_targets(payload, self.registry)
+        key = self._stream_key(ws, payload)
+        if key is None:
+            return
+        targets = self._matching_stream_targets(key, payload)
         if not targets:
             return
-        self._stream_seq += 1
-        pkt = protocol.build_stream_end(seq=self._stream_seq)
+        seq = self._stream_sequences.get(key, 0) + 1
+        self._stream_sequences[key] = seq
+        pkt = protocol.build_stream_end(seq=seq)
         for ip in targets:
             self.udp.send_raw(pkt, ip)
+            if self._active_streams.get(ip) == key:
+                self._active_streams.pop(ip, None)
+        self._drop_sequence_if_unused(key)
 
     # ── Helpers ──────────────────────────────────────────────
 
@@ -2439,6 +2592,7 @@ def _deploy_kit_to_device(
             logger.exception("deploy on_progress callback failed")
 
     _progress(0, f"connecting to {ip}…")
+    logger.info("Kit deploy %s: starting kit=%s files=%d bytes=%d", ip, kit_id, len(files), total_size)
 
     with TcpRawConnection(ip) as conn:
         if not conn.connect():
@@ -2494,14 +2648,24 @@ def _deploy_kit_to_device(
                     return False, f"file recv nack ({rel_path})"
 
             _progress(99, "committing…")
+            commit_started = time.monotonic()
             conn.send_json({"cmd": "kit_commit"})
             resp = conn.read_response(timeout=15.0)
             if not resp or resp.get("status") != "ok":
+                logger.warning(
+                    "Kit deploy %s: commit failed after %.2fs: %r",
+                    ip, time.monotonic() - commit_started, resp,
+                )
                 return False, f"commit nack: {resp}"
+            logger.info(
+                "Kit deploy %s: commit ok in %.2fs",
+                ip, time.monotonic() - commit_started,
+            )
         except OSError as exc:
             return False, f"io error: {exc}"
 
     _progress(100, "complete")
+    logger.info("Kit deploy %s: complete kit=%s", ip, kit_id)
     return True, "ok"
 
 
