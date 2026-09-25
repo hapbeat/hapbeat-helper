@@ -66,7 +66,7 @@ def test_pong_parser_extended():
     # build a fake PONG with all extended fields
     payload = struct.pack("<qq", 12345, 67890)
     payload += b"hapbeat-test\x00player_1/chest\x00v1.2.3\x00"
-    payload += bytes([100, 50, 7])  # level, wiper, steps
+    payload += bytes([100, 50])  # level, wiper (firmware sends no steps byte)
     pkt = protocol.build_header(protocol.CMD_PONG, 1, len(payload)) + payload
 
     out = protocol.parse_pong(pkt)
@@ -77,7 +77,8 @@ def test_pong_parser_extended():
     assert out["firmware_version"] == "v1.2.3"
     assert out["volume_level"] == 100
     assert out["volume_wiper"] == 50
-    assert out["volume_steps"] == 7
+    assert "volume_steps" not in out
+    assert out["stream_tail"] == {"status": "absent"}
 
 
 def test_pong_parser_rejects_wrong_magic():

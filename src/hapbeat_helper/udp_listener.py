@@ -26,6 +26,7 @@ import time
 from typing import Callable, List, Optional
 
 from hapbeat_helper import protocol
+from hapbeat_helper.stream_session import StreamLeaseTable
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,9 @@ class UdpListener:
 
         self._pong_callbacks: list[PongCallback] = []
         self._rtt_callbacks: list[RttCallback] = []
+        # Stream-v2 leases and the per-device v2/legacy class, fed by matched
+        # replies to our own (always 16-byte) PINGs. Survives restart().
+        self.stream_leases = StreamLeaseTable()
 
     # ── Listener API ─────────────────────────────────────────
 
@@ -260,6 +264,14 @@ class UdpListener:
             self._seq = (self._seq + 1) & 0xFFFF
             return self._seq
 
+    def _build_ping(self) -> tuple[int, bytes]:
+        """A 16-byte stream-v2 PING. Pre-v2 firmware reads only the timestamp
+        (it rejects only payloads shorter than 8 bytes) and replies as before."""
+        seq = self._next_seq()
+        ts_us = int(time.time() * 1_000_000)
+        incarnation = self.stream_leases.note_ping(seq, ts_us)
+        return seq, protocol.build_ping(seq, ts_us, incarnation)
+
     def _reap_pending(self, now: float) -> None:
         """Evict RTT-pending pings whose PONG never came. Caller holds _lock."""
         if not self._pending_pings:
@@ -284,9 +296,7 @@ class UdpListener:
         sock = self._sock
         if sock is None:
             return -1
-        seq = self._next_seq()
-        ts_us = int(time.time() * 1_000_000)
-        pkt = protocol.build_ping(seq, ts_us)
+        seq, pkt = self._build_ping()
         if track_rtt:
             now = time.perf_counter()
             with self._lock:
@@ -341,9 +351,7 @@ class UdpListener:
         sock = self._sock
         if sock is None:
             return -1
-        seq = self._next_seq()
-        ts_us = int(time.time() * 1_000_000)
-        pkt = protocol.build_ping(seq, ts_us)
+        seq, pkt = self._build_ping()
 
         locked = self._locked_route
         if locked is not None or not self._routes:
@@ -429,6 +437,9 @@ class UdpListener:
                     rtt_ms = (time.perf_counter() - t0) * 1000
                     self._dispatch_rtt(ip, rtt_ms)
 
+            changed = self.stream_leases.on_pong(ip, pong)
+            if changed is not None:
+                logger.info("stream mode %s at %s", changed, ip)
             self._dispatch_pong(pong, ip)
 
     def _dispatch_pong(self, pong: dict, ip: str) -> None:

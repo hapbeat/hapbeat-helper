@@ -34,7 +34,7 @@ from typing import Any, Optional
 
 from websockets.exceptions import ConnectionClosed
 
-from hapbeat_helper import protocol
+from hapbeat_helper import protocol, stream_session
 from hapbeat_helper.device_registry import DeviceRegistry, HapbeatDevice
 from hapbeat_helper.mdns_scanner import MdnsScanner
 from hapbeat_helper.pack_normalize import normalize_pack
@@ -173,6 +173,9 @@ class HelperServer:
         # an aborted preview cannot stop or corrupt its replacement.
         self._active_streams: dict[str, tuple[int, str]] = {}
         self._stream_sequences: dict[tuple[int, str], int] = {}
+        # ip -> wire format fixed at STREAM_BEGIN for the session that owns
+        # the ip: [mode, StreamIdentity|None, next v2 byte offset].
+        self._stream_wire: dict[str, list] = {}
         self._scan_task: Optional[asyncio.Task] = None
         # ip -> background log-tail thread state. One subscriber per
         # device is enough for the MVP; if a second client subscribes
@@ -1931,12 +1934,56 @@ class HelperServer:
 
         for key, targets in by_key.items():
             seq = self._stream_sequences.get(key, 0) + 1
-            pkt = protocol.build_stream_end(seq=seq)
             for ip in targets:
                 if self._active_streams.get(ip) == key:
-                    self.udp.send_raw(pkt, ip)
+                    self._send_stream_end(ip, seq)
                     self._active_streams.pop(ip, None)
             self._stream_sequences.pop(key, None)
+
+    # Stream session v2 with a per-device legacy fallback (DEC-075):
+    # stream-v2 firmware gets (boot id, lease ticket, generation) packets with
+    # no cooldown; pre-v2 firmware keeps the v1 format and a 300 ms END->BEGIN
+    # guard. The format is fixed per ip when its session begins.
+
+    STREAM_DISCOVERY_WAIT_S = 0.4
+
+    async def _prepare_stream_targets(self, targets: list[str]) -> tuple[list[str], list[str]]:
+        """Resolve each target's wire format, discovering unknown ones.
+
+        A target that is unknown, has no usable lease or is superseded gets a
+        unicast PING and up to STREAM_DISCOVERY_WAIT_S for a matched reply.
+        Starting a stream is an explicit user action, so a superseded lease is
+        reacquired with a fresh incarnation (never silently in the background).
+        """
+        leases = self.udp.stream_leases
+        if any(leases.is_superseded(ip) for ip in targets):
+            leases.renew_incarnation()
+        pending = [ip for ip in targets if leases.begin_format(ip) is None]
+        if pending:
+            for ip in pending:
+                self.udp.send_ping(ip)
+            deadline = time.monotonic() + self.STREAM_DISCOVERY_WAIT_S
+            while time.monotonic() < deadline and any(
+                    leases.begin_format(ip) is None for ip in pending):
+                await asyncio.sleep(0.02)
+        ready = [ip for ip in targets if leases.begin_format(ip) is not None]
+        deferred = [ip for ip in targets if ip not in ready]
+        if deferred:
+            logger.warning("stream deferred (no stream lease/class yet): %s", deferred)
+        return ready, deferred
+
+    def _send_stream_end(self, ip: str, seq: int) -> None:
+        wire = self._stream_wire.pop(ip, None)
+        if wire is None:
+            return
+        mode, identity, _ = wire
+        if mode == stream_session.V2:
+            pkt = protocol.build_stream_end_v2(
+                seq, identity.boot_id, identity.ticket, identity.generation)
+        else:
+            pkt = protocol.build_stream_end(seq=seq)
+            self.udp.stream_leases.note_legacy_end(ip)
+        self.udp.send_raw(pkt, ip)
 
     async def _handle_stream_begin(self, ws, payload: dict) -> None:
         key = self._stream_key(ws, payload)
@@ -1959,6 +2006,13 @@ class HelperServer:
                 "payload": ack_payload,
             }))
             return
+        targets, deferred = await self._prepare_stream_targets(targets)
+        if not targets:
+            ack_payload = {"status": "no_target", "deferred": deferred}
+            if "stream_id" in payload:
+                ack_payload["stream_id"] = key[1]
+            await ws.send(json.dumps({"type": "stream_ack", "payload": ack_payload}))
+            return
         displaced = {
             active for ip in targets
             if (active := self._active_streams.get(ip)) is not None
@@ -1970,18 +2024,35 @@ class HelperServer:
             self._drop_sequence_if_unused(old_key)
 
         self._stream_sequences[key] = 0
-        pkt = protocol.build_stream_begin(
-            seq=0,
-            sample_rate=int(payload.get("sample_rate", 16000)),
-            channels=int(payload.get("channels", 1)),
-            fmt=1 if payload.get("format", "adpcm") == "adpcm" else 0,
-            total_samples=int(payload.get("total_samples", 0)),
-            gain=float(payload.get("gain", 1.0)),
-            target=str(payload.get("target", "")),
-        )
+        begin = {
+            "sample_rate": int(payload.get("sample_rate", 16000)),
+            "channels": int(payload.get("channels", 1)),
+            "fmt": 1 if payload.get("format", "adpcm") == "adpcm" else 0,
+            "total_samples": int(payload.get("total_samples", 0)),
+            "gain": float(payload.get("gain", 1.0)),
+            "target": str(payload.get("target", "")),
+        }
+        leases = self.udp.stream_leases
         for ip in targets:
+            chosen = leases.begin_session(ip)
+            if chosen is None:  # lost its lease while we waited
+                self._active_streams.pop(ip, None)
+                continue
+            mode, identity = chosen
+            if mode == stream_session.V2:
+                pkt = protocol.build_stream_begin_v2(
+                    0, identity.boot_id, identity.ticket, identity.generation, **begin)
+            else:
+                # Pre-v2 firmware cannot reject a late END: keep the guard.
+                remaining = leases.legacy_guard_remaining(ip)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                pkt = protocol.build_stream_begin(seq=0, **begin)
+            self._stream_wire[ip] = [mode, identity, 0]
             self.udp.send_raw(pkt, ip)
         ack_payload = {"status": "ok", "targets": targets}
+        if deferred:
+            ack_payload["deferred"] = deferred
         if "stream_id" in payload:
             ack_payload["stream_id"] = key[1]
         await ws.send(json.dumps({"type": "stream_ack", "payload": ack_payload}))
@@ -1998,10 +2069,26 @@ class HelperServer:
         audio = base64.b64decode(data_b64) if data_b64 else b""
         seq = self._stream_sequences.get(key, 0) + 1
         self._stream_sequences[key] = seq
-        pkt = protocol.build_stream_data(
-            seq=seq, offset=offset, data=audio,
-        )
+        legacy_pkt = None
         for ip in targets:
+            wire = self._stream_wire.get(ip)
+            if wire is None:
+                continue
+            mode, identity, next_offset = wire
+            if mode == stream_session.V2:
+                # v2 firmware rejects backward offsets, but Studio rewinds its
+                # offset on seek. Offsets only order packets (the ring appends),
+                # so send the bytes this session has actually carried.
+                pkt = protocol.build_stream_data_v2(
+                    seq, identity.boot_id, identity.ticket, identity.generation,
+                    next_offset, audio)
+                wire[2] = (next_offset + len(audio)) & 0xFFFFFFFF
+            else:
+                if legacy_pkt is None:
+                    legacy_pkt = protocol.build_stream_data(
+                        seq=seq, offset=offset, data=audio,
+                    )
+                pkt = legacy_pkt
             self.udp.send_raw(pkt, ip)
 
     async def _handle_stream_end(self, ws, payload: dict) -> None:
@@ -2013,9 +2100,8 @@ class HelperServer:
             return
         seq = self._stream_sequences.get(key, 0) + 1
         self._stream_sequences[key] = seq
-        pkt = protocol.build_stream_end(seq=seq)
         for ip in targets:
-            self.udp.send_raw(pkt, ip)
+            self._send_stream_end(ip, seq)
             if self._active_streams.get(ip) == key:
                 self._active_streams.pop(ip, None)
         self._drop_sequence_if_unused(key)

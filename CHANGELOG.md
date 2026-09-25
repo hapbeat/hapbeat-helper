@@ -7,6 +7,14 @@
 
 ### Added
 
+- **Studio からのストリーム再生が stream session v2 のファームに対応した**（DEC-074/075）。
+  PING を 16 バイト（client incarnation 付き）にし、応答の HBS2 tail で機器ごとに判定する。
+  v2 ファームには boot id / lease ticket / generation 付きのパケットを待ちなしで送り、
+  v2 に対応していない旧ファームには従来の v1 形式と 300 ms の END→BEGIN 待ちで送る
+  （旧ファームの利用者に影響しない）。未判定の機器は開始時に PING して最大 0.4 秒待ち、
+  応答が無ければ送らない（`stream_ack` の `deferred`）。別アプリに受信許可を取られた
+  機器は、ユーザーが再生を始めた時だけ新しい incarnation で取り直す。
+
 - **`hapbeat-helper ota <target> <bin>`** を追加した。dev ビルドのファームを Studio を
   開かずに CLI から流せる。`<target>` は IP またはデバイス名（名前の解決には稼働中の
   helper が要る）。helper が動いていれば WS 経由（per-IP ロック・OTA 排他と協調）、
@@ -19,6 +27,9 @@
 
 ### Fixed
 
+- PONG の `volume_wiper` の次のバイトを `volume_steps` として読んでいたのを削除した。
+  そのバイトを送るファームは無く、v2 ファームでは lease tail の先頭 `H`(72) を
+  段数と誤読していた。段数は従来どおり `get_info` から取る。
 - `python -m hapbeat_helper` が終了コードを捨てていたのを修正した（常に 0 を返していた）。
 - Windows の日本語コンソール (cp932) で、`—` を含むメッセージを出力するとコマンドごと
   `UnicodeEncodeError` で落ちていたのを修正した。表示できない文字だけを置換する。

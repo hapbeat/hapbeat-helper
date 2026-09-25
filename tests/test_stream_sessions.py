@@ -12,6 +12,13 @@ class _FakeWebSocket:
         self.messages.append(message)
 
 
+def _classify_legacy(server: HelperServer, ip: str) -> None:
+    """A matched reply without an HBS2 tail: pre-v2 firmware (v1 streams)."""
+    leases = server.udp.stream_leases
+    leases.note_ping(900, 1_000)
+    leases.on_pong(ip, {"seq": 900, "timestamp": 1_000, "stream_tail": {"status": "absent"}})
+
+
 @pytest.mark.asyncio
 async def test_stale_stream_end_cannot_stop_newer_stream_on_same_target(monkeypatch):
     server = HelperServer()
@@ -25,6 +32,7 @@ async def test_stale_stream_end_cannot_stop_newer_stream_on_same_target(monkeypa
 
     monkeypatch.setattr(server.udp, "send_raw", capture)
     target = "192.168.0.7"
+    _classify_legacy(server, target)
 
     await server._handle_stream_begin(
         ws,
@@ -67,6 +75,7 @@ async def test_stale_stream_data_is_ignored_after_newer_begin(monkeypatch):
 
     monkeypatch.setattr(server.udp, "send_raw", capture)
     target = "192.168.0.7"
+    _classify_legacy(server, target)
 
     await server._handle_stream_begin(ws, {"targets": [target], "stream_id": "old"})
     await server._handle_stream_begin(ws, {"targets": [target], "stream_id": "new"})
@@ -90,6 +99,7 @@ async def test_serial_client_without_stream_id_keeps_working(monkeypatch):
         return True
 
     monkeypatch.setattr(server.udp, "send_raw", capture)
+    _classify_legacy(server, "192.168.0.7")
     payload = {"targets": ["192.168.0.7"]}
     await server._handle_stream_begin(ws, payload)
     await server._handle_stream_data(ws, {**payload, "offset": 0, "data": "AA=="})
