@@ -21,6 +21,7 @@ import contextlib
 import io
 import json
 import logging
+import re
 import select
 import shutil
 import socket
@@ -67,6 +68,15 @@ HOST = "localhost"
 # the device on its immediate disconnect path, whereas the device's watchdog is
 # the slower fallback for when helper can't signal at all (killed / unplugged).
 OTA_CHUNK_SEND_TIMEOUT_S = 3.0
+
+# Agent relay (MCP server ⇄ Studio, see README "AI agent integration"). The
+# helper only routes these messages; Studio executes the methods.
+AGENT_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+AGENT_PAYLOAD_MAX_BYTES = 4 * 1024 * 1024
+AGENT_ERR_STUDIO_NOT_READY = (
+    "STUDIO_NOT_READY: Open Hapbeat Studio → Waveform editor and open a folder."
+)
+AGENT_ERR_STUDIO_DISCONNECTED = "STUDIO_DISCONNECTED"
 
 
 def _device_to_dict(ip: str, dev: HapbeatDevice) -> dict:
@@ -214,6 +224,18 @@ class HelperServer:
         # _ota_in_progress). Written from the asyncio loop, read by the log_tail
         # supervisor thread (GIL-atomic dict ops; a one-tick stale read is fine).
         self._cmd_in_progress: dict[str, int] = {}
+
+        # Agent relay state. The endpoint is the Studio tab that registered
+        # last (last-wins). Each pending request remembers who asked and which
+        # endpoint it went to, so a disconnect on either side can be settled
+        # without waiting for the MCP-side timeout.
+        self._agent_endpoint: Any = None
+        # requestId -> (requester ws, endpoint ws the request was forwarded to)
+        self._agent_pending: dict[str, tuple[Any, Any]] = {}
+        # Sockets that have sent agent_request (MCP servers). They are not
+        # Studio tabs, so they must not keep device-side state such as
+        # log_tail threads alive after the last Studio tab closes.
+        self._agent_clients: set[Any] = set()
 
     def _get_tcp_lock(self, ip: str) -> asyncio.Lock:
         lock = self._tcp_locks.get(ip)
@@ -445,6 +467,7 @@ class HelperServer:
             pass
         finally:
             self._end_streams_owned_by(ws)
+            await self._agent_forget(ws)
             self._clients.discard(ws)
             # If this was the last WS client, tear down all log_tail
             # subscribers. Without this, a closed-tab / refreshed Studio
@@ -456,7 +479,7 @@ class HelperServer:
             # stale slot wins and refuses every subsequent SYN until power
             # cycle. (User report 2026-05-08: 「しばらく放置していると
             # TCP handshake failed が連発する」)
-            if not self._clients and self._log_threads:
+            if not (self._clients - self._agent_clients) and self._log_threads:
                 logger.info(
                     "last WS client gone — stopping %d log_tail thread(s)",
                     len(self._log_threads),
@@ -479,6 +502,20 @@ class HelperServer:
 
         elif msg_type == "list_devices":
             await ws.send(json.dumps(self._device_list_msg()))
+
+        # Agent relay — routed here only, never through the device handlers
+        # and never broadcast.
+        elif msg_type == "agent_endpoint_register":
+            await self._handle_agent_endpoint_register(ws, payload)
+
+        elif msg_type == "agent_endpoint_unregister":
+            self._handle_agent_endpoint_unregister(ws)
+
+        elif msg_type == "agent_request":
+            await self._handle_agent_request(ws, payload)
+
+        elif msg_type == "agent_response":
+            await self._handle_agent_response(ws, payload)
 
         elif msg_type == "rescan":
             # Trigger an immediate UDP broadcast PING + push the latest
@@ -2106,6 +2143,111 @@ class HelperServer:
                 self._active_streams.pop(ip, None)
         self._drop_sequence_if_unused(key)
 
+    # ── Agent relay (MCP server ⇄ Studio) ────────────────────
+
+    async def _handle_agent_endpoint_register(self, ws, payload: dict) -> None:
+        """A Studio tab offers to execute agent requests. Last one wins."""
+        if not isinstance(payload, dict):
+            payload = {}
+        self._agent_endpoint = ws
+        logger.info(
+            "agent endpoint registered: studio=%s folder=%s",
+            payload.get("studioVersion"), payload.get("folderName"),
+        )
+        await ws.send(json.dumps({
+            "type": "agent_endpoint_registered",
+            "payload": {},
+        }))
+
+    def _handle_agent_endpoint_unregister(self, ws) -> None:
+        if self._agent_endpoint is ws:
+            self._agent_endpoint = None
+            logger.info("agent endpoint unregistered")
+
+    async def _handle_agent_request(self, ws, payload: dict) -> None:
+        """Forward an MCP-side request to the registered Studio endpoint."""
+        request_id = payload.get("requestId") if isinstance(payload, dict) else None
+        if not isinstance(request_id, str) or not AGENT_REQUEST_ID_RE.fullmatch(request_id):
+            # Without a valid id the requester could not match a reply.
+            await ws.send(json.dumps({
+                "type": "error",
+                "payload": {"message": "agent_request: invalid requestId"},
+            }))
+            return
+        if _json_size(payload) > AGENT_PAYLOAD_MAX_BYTES:
+            await _send_agent_error(ws, request_id, "PAYLOAD_TOO_LARGE")
+            return
+        if request_id in self._agent_pending:
+            await _send_agent_error(ws, request_id, "DUPLICATE_REQUEST_ID")
+            return
+        endpoint = self._agent_endpoint
+        if endpoint is None:
+            await _send_agent_error(ws, request_id, AGENT_ERR_STUDIO_NOT_READY)
+            return
+        self._agent_pending[request_id] = (ws, endpoint)
+        self._agent_clients.add(ws)
+        try:
+            await endpoint.send(json.dumps({
+                "type": "agent_request",
+                "payload": payload,
+            }))
+        except ConnectionClosed:
+            # The endpoint vanished between registration and now; its own
+            # handler's cleanup may not have run yet.
+            self._agent_pending.pop(request_id, None)
+            if self._agent_endpoint is endpoint:
+                self._agent_endpoint = None
+            await _send_agent_error(ws, request_id, AGENT_ERR_STUDIO_DISCONNECTED)
+
+    async def _handle_agent_response(self, ws, payload: dict) -> None:
+        """Return a Studio reply to whoever sent the matching request."""
+        request_id = payload.get("requestId") if isinstance(payload, dict) else None
+        entry = self._agent_pending.get(request_id) if isinstance(request_id, str) else None
+        if entry is None:
+            # Unknown / already settled (requester gone) — nothing to do.
+            logger.debug("agent_response for unknown requestId %r dropped", request_id)
+            return
+        requester, endpoint = entry
+        if endpoint is not ws:
+            # Only the tab the request was forwarded to may answer it.
+            logger.debug("agent_response for %s from a non-target client dropped", request_id)
+            return
+        del self._agent_pending[request_id]
+        if _json_size(payload) > AGENT_PAYLOAD_MAX_BYTES:
+            msg = {
+                "type": "agent_response",
+                "payload": {"requestId": request_id, "ok": False, "error": "PAYLOAD_TOO_LARGE"},
+            }
+        else:
+            msg = {"type": "agent_response", "payload": payload}
+        try:
+            await requester.send(json.dumps(msg))
+        except ConnectionClosed:
+            pass  # requester left; the reply is discarded
+
+    async def _agent_forget(self, ws) -> None:
+        """Settle relay state for a closing socket.
+
+        Requests this socket asked for are dropped (nobody to answer). Requests
+        forwarded to this socket as the endpoint are failed with
+        STUDIO_DISCONNECTED so the requester does not sit out its timeout."""
+        self._agent_clients.discard(ws)
+        if self._agent_endpoint is ws:
+            self._agent_endpoint = None
+            logger.info("agent endpoint disconnected")
+        orphaned: list[tuple[str, Any]] = []
+        for request_id, (requester, endpoint) in list(self._agent_pending.items()):
+            if requester is ws:
+                del self._agent_pending[request_id]
+            elif endpoint is ws:
+                del self._agent_pending[request_id]
+                orphaned.append((request_id, requester))
+        for request_id, requester in orphaned:
+            try:
+                await _send_agent_error(requester, request_id, AGENT_ERR_STUDIO_DISCONNECTED)
+            except ConnectionClosed:
+                pass
+
     # ── Helpers ──────────────────────────────────────────────
 
     def _device_list_msg(self) -> dict:
@@ -2139,6 +2281,18 @@ class HelperServer:
             asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError:
             pass
+
+
+def _json_size(payload: Any) -> int:
+    """UTF-8 size of *payload* as JSON — the relay's 4 MB limit is on this."""
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+async def _send_agent_error(ws, request_id: str, error: str) -> None:
+    await ws.send(json.dumps({
+        "type": "agent_response",
+        "payload": {"requestId": request_id, "ok": False, "error": error},
+    }))
 
 
 # ── Background-thread helpers (no asyncio) ───────────────────

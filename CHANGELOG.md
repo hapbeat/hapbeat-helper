@@ -7,6 +7,14 @@
 
 ### Added
 
+- **`hapbeat-helper mcp`（AI エージェント向け MCP サーバー、stdio）を追加した**（DEC-078）。
+  Claude Code / Codex から Studio の AI 試行（ガイド・知識ベースの参照、試行の投稿、
+  試聴、採用、知見の提案、評価待ち）をツールで操作できる。各ツールは稼働中の daemon
+  経由で、エディタでフォルダを開いている Studio タブへ中継され、処理は Studio が行う。
+  optional extra `hapbeat-helper[mcp]`（`mcp>=1.2`、SDK 1.x / 2.x の両方に対応）が必要。
+  daemon には中継メッセージ `agent_endpoint_register` / `agent_endpoint_unregister` /
+  `agent_request` / `agent_response` を追加した（既存メッセージの挙動は変更なし）。
+
 - **Studio からのストリーム再生が stream session v2 のファームに対応した**（DEC-074/075）。
   PING を 16 バイト（client incarnation 付き）にし、応答の HBS2 tail で機器ごとに判定する。
   v2 ファームには boot id / lease ticket / generation 付きのパケットを待ちなしで送り、

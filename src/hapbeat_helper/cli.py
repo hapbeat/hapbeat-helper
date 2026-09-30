@@ -8,6 +8,7 @@ Subcommands:
 - ``stop``                                stop the auto-started helper
 - ``logs [-f] [-n N]``                    show log file + tail recent lines
 - ``ota <target> <bin>``                  push a firmware app image over Wi-Fi
+- ``mcp [--port 7703]``                   MCP server (stdio) for AI agents, relayed via the daemon
 - ``install-service``                     register as OS auto-start service (Task Scheduler on Windows / launchd on macOS)
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
@@ -320,6 +321,25 @@ def _cmd_ota(args: argparse.Namespace) -> int:
     return ota_client.run_ota_direct(args.target, bin_bytes, args.verbose)
 
 
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    """Serve the MCP tools over stdio. stdout is the protocol channel, so
+    everything human-readable here goes to stderr."""
+    import importlib.util
+
+    if importlib.util.find_spec("mcp") is None:
+        print(
+            "error: the MCP extra is not installed. Install it with:\n"
+            '  pipx install --force "hapbeat-helper[mcp]"\n'
+            '  (from a clone: pipx install --force --editable ".[mcp]")',
+            file=sys.stderr,
+        )
+        return 2
+    _setup_logging(args.verbose)  # basicConfig's default stream is stderr
+    from hapbeat_helper import mcp_server
+
+    return mcp_server.run(args.port)
+
+
 def _cmd_config_show(_args: argparse.Namespace) -> int:
     cfg = _config_dir()
     print(f"config dir: {cfg}")
@@ -361,6 +381,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  version          show installed version\n"
             "  logs             show/follow the auto-start log file\n"
             "  ota              push a firmware app image to one device\n"
+            "  mcp              MCP server (stdio) for AI agents (needs the [mcp] extra)\n"
             "  install-service  register & start at OS login\n"
             "  uninstall-service  remove registration and stop\n"
             "  service-status   show registration state\n"
@@ -430,6 +451,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"WebSocket port of the running helper (default: {WS_PORT})",
     )
     p_ota.set_defaults(func=_cmd_ota)
+
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="run the MCP server (stdio) that lets AI agents drive Studio's AI trials",
+        description=(
+            "Serve MCP tools over stdio for a local AI agent (Claude Code, "
+            "Codex). Requests are relayed through the running helper daemon to "
+            "the Hapbeat Studio tab that has the Waveform editor open on a "
+            "folder. Register it with your agent rather than running it by hand."
+        ),
+    )
+    _add_verbose(p_mcp)
+    p_mcp.add_argument(
+        "--port", type=int, default=WS_PORT,
+        help=f"WebSocket port of the running helper (default: {WS_PORT})",
+    )
+    p_mcp.set_defaults(func=_cmd_mcp)
 
     p_install = sub.add_parser(
         "install-service",

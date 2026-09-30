@@ -46,6 +46,9 @@ dev = [
 ]
 # Pack/Kit normalization (ffmpeg subprocess needed at runtime)
 normalize = []
+# `hapbeat-helper mcp` (MCP server for AI agents). 1.2 is the first release
+# with FastMCP; 2.x (FastMCP renamed to MCPServer) is supported as well.
+mcp = ["mcp>=1.2"]
 
 [project.scripts]
 hapbeat-helper = "hapbeat_helper.cli:main"
