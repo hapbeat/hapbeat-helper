@@ -7,6 +7,16 @@
 
 ### Added
 
+- **素材台帳（`hapbeat-helper materials`）を追加した**。フリー素材サイトからダウンロードした
+  音声ファイルの出典（配布サイト・元ページ URL・ライセンス）を、ファイル内容の SHA-256 で
+  紐づけて記録する。`materials ingest` は Downloads（既定、`--dir` で変更）の音声と zip 内の
+  音声を `~/HapbeatMaterials/store/` へコピーし（元ファイルは残す）、Windows の
+  `Zone.Identifier` から元ページを読む。ライセンスは `sites.json`（サイト規則）と個別上書きから
+  毎回解決する。`list` / `show` / `set-license` / `credits`（CREDITS.md 生成）/ `where` を追加。
+  daemon に WS `material_lookup` / `material_register_derived` / `material_credits` を追加した
+  （既存メッセージの挙動は変更なし）。config `materials_watch_downloads = true` の時だけ daemon が
+  Downloads を 10 秒ごとに見て新規ファイルを自動取り込みする（既定 off）。
+
 - **`hapbeat-helper mcp`（AI エージェント向け MCP サーバー、stdio）を追加した**（DEC-078）。
   Claude Code / Codex から Studio の AI 試行（ガイド・知識ベースの参照、試行の投稿、
   試聴、採用、知見の提案、評価待ち）をツールで操作できる。各ツールは稼働中の daemon

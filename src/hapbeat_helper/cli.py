@@ -9,6 +9,7 @@ Subcommands:
 - ``logs [-f] [-n N]``                    show log file + tail recent lines
 - ``ota <target> <bin>``                  push a firmware app image over Wi-Fi
 - ``mcp [--port 7703]``                   MCP server (stdio) for AI agents, relayed via the daemon
+- ``materials <ingest|list|show|set-license|credits|where>``  material ledger (sound sources + licenses)
 - ``install-service``                     register as OS auto-start service (Task Scheduler on Windows / launchd on macOS)
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
@@ -25,6 +26,8 @@ import signal
 import socket
 import sys
 import threading
+import time
+from pathlib import Path
 
 from hapbeat_helper import __version__
 from hapbeat_helper.server import HelperServer, WS_PORT
@@ -102,7 +105,19 @@ def _apply_update_check_flag(args: argparse.Namespace) -> None:
 def _cmd_start(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
     _apply_update_check_flag(args)
-    server = HelperServer(port=args.port)
+    from hapbeat_helper import materials
+
+    config = materials.load_config()
+    # Downloads watcher is opt-in (config materials_watch_downloads = true).
+    watch_dir = (
+        materials.default_downloads_dir()
+        if materials.watch_downloads_enabled(config) else None
+    )
+    server = HelperServer(
+        port=args.port,
+        materials_dir=materials.default_materials_dir(config),
+        materials_watch_dir=watch_dir,
+    )
     print(f"hapbeat-helper {__version__} starting on ws://localhost:{args.port}")
     print("Press Ctrl+C to stop.")
     # 起動をブロックせずに release feed を見に行き、新しい版があれば 1 行だけ
@@ -351,6 +366,134 @@ def _cmd_config_show(_args: argparse.Namespace) -> int:
     return 0
 
 
+# ── materials ────────────────────────────────────────────────
+
+
+def _material_store():
+    from hapbeat_helper import materials
+
+    return materials.MaterialStore(materials.default_materials_dir())
+
+
+def _license_brief(entry: dict) -> str:
+    lic = entry["license"]
+    flag = "  [要確認]" if entry["needsReview"] else ""
+    return f"{entry['site']} · {lic['id']}{flag}"
+
+
+def _cmd_materials_ingest(args: argparse.Namespace) -> int:
+    from hapbeat_helper import materials
+
+    store = _material_store()
+    directory = Path(args.dir).expanduser() if args.dir else materials.default_downloads_dir()
+    if not directory.is_dir():
+        print(f"error: not a directory: {directory}", file=sys.stderr)
+        return 2
+    since_ts = None if args.since is None else time.time() - args.since * 86400
+    result = store.ingest_dir(directory, since_ts=since_ts, dry_run=args.dry_run)
+    prefix = "(dry run) " if args.dry_run else ""
+    print(
+        f"{prefix}{directory}: new {len(result.new)} / duplicate "
+        f"{len(result.duplicates)} / needs review {len(result.needs_review)}"
+    )
+    review = {r["sha256"] for r in result.needs_review}
+    for rec in result.new:
+        src = rec["originalName"]
+        if rec["archive"]:
+            src = f"{rec['archive']['originalName']}:{rec['archive']['member']}"
+        flag = "  [要確認]" if rec["sha256"] in review else ""
+        print(f"  + {src} -> {rec['storePath']}  ({rec['site']}){flag}")
+    for dup in result.duplicates:
+        src = Path(dup["path"]).name + (f":{dup['member']}" if dup["member"] else "")
+        print(f"  = {src} (already {dup['storePath']})")
+    for err in result.errors:
+        print(f"  ! {err['path']}: {err['error']}", file=sys.stderr)
+    if not args.dry_run:
+        print(f"materials dir: {store.root}")
+    return 1 if result.errors else 0
+
+
+def _cmd_materials_list(args: argparse.Namespace) -> int:
+    entries = _material_store().list_materials(
+        needs_review=args.needs_review, site=args.site,
+    )
+    for e in entries:
+        print(f"{e['storePath']}  {_license_brief(e)}")
+    print(f"({len(entries)} materials)")
+    return 0
+
+
+def _cmd_materials_show(args: argparse.Namespace) -> int:
+    from hapbeat_helper import materials
+
+    target = args.target
+    if materials.is_sha256(target.lower()):
+        sha = target.lower()
+    else:
+        path = Path(target).expanduser()
+        if not path.is_file():
+            print(f"error: not a file or sha256: {target}", file=sys.stderr)
+            return 2
+        sha = materials.sha256_file(path)
+    result = _material_store().resolve(sha)
+    print(json.dumps({"sha256": sha, **result}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_materials_set_license(args: argparse.Namespace) -> int:
+    from hapbeat_helper import materials
+
+    attribution = args.attribution
+    if attribution is None:
+        attribution = args.license_id.upper().startswith("CC-BY")
+    lic = {
+        "id": args.license_id,
+        "name": args.name or args.license_id,
+        "url": args.url,
+        "creditText": args.credit,
+        "attributionRequired": attribution,
+        "verified": args.verified,
+    }
+    store = _material_store()
+    if args.site:
+        store.set_site_license(args.site.lower(), lic)
+        print(f"sites.json: {args.site.lower()} -> {args.license_id}")
+    else:
+        sha = args.sha.lower()
+        if not materials.is_sha256(sha):
+            print(f"error: not a sha256: {args.sha}", file=sys.stderr)
+            return 2
+        store.set_override(sha, lic)
+        print(f"override: {sha} -> {args.license_id}")
+    return 0
+
+
+def _cmd_materials_credits(args: argparse.Namespace) -> int:
+    from hapbeat_helper import materials
+
+    items: list[tuple[str, str]] = []
+    for raw in args.paths:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            files = sorted(
+                f for f in path.rglob("*")
+                if f.is_file() and f.suffix.lower() in materials.AUDIO_EXTS
+            )
+        elif path.is_file():
+            files = [path]
+        else:
+            print(f"error: no such file or directory: {raw}", file=sys.stderr)
+            return 2
+        items += [(f.name, materials.sha256_file(f)) for f in files]
+    sys.stdout.write(_material_store().credits_markdown(items, "hapbeat-helper"))
+    return 0
+
+
+def _cmd_materials_where(_args: argparse.Namespace) -> int:
+    print(_material_store().root)
+    return 0
+
+
 def _add_verbose(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="debug logging",
@@ -382,6 +525,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  logs             show/follow the auto-start log file\n"
             "  ota              push a firmware app image to one device\n"
             "  mcp              MCP server (stdio) for AI agents (needs the [mcp] extra)\n"
+            "  materials        material ledger: where sound files came from + licenses\n"
             "  install-service  register & start at OS login\n"
             "  uninstall-service  remove registration and stop\n"
             "  service-status   show registration state\n"
@@ -468,6 +612,74 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"WebSocket port of the running helper (default: {WS_PORT})",
     )
     p_mcp.set_defaults(func=_cmd_mcp)
+
+    p_mat = sub.add_parser(
+        "materials",
+        help="material ledger: record where downloaded sounds came from and their licenses",
+        description=(
+            "Keep a ledger of downloaded sound files (source site, page URL, "
+            "license), linked by SHA-256 so renames do not lose it. Files are "
+            "copied into the materials dir; the originals stay where they are."
+        ),
+    )
+    sub_mat = p_mat.add_subparsers(dest="materials_cmd")
+
+    p_ingest = sub_mat.add_parser(
+        "ingest", help="copy new audio / zip downloads into the ledger",
+    )
+    p_ingest.add_argument(
+        "--dir", help="folder to scan (default: ~/Downloads, top level only)",
+    )
+    p_ingest.add_argument(
+        "--since", type=float, metavar="DAYS",
+        help="only files modified in the last DAYS days "
+             "(default: since the last ingest; first run 30)",
+    )
+    p_ingest.add_argument(
+        "--dry-run", action="store_true", help="show what would be ingested; write nothing",
+    )
+    p_ingest.set_defaults(func=_cmd_materials_ingest)
+
+    p_list = sub_mat.add_parser("list", help="list ingested materials")
+    p_list.add_argument("--needs-review", action="store_true", help="only those needing review")
+    p_list.add_argument("--site", metavar="DOMAIN", help="only this site")
+    p_list.set_defaults(func=_cmd_materials_list)
+
+    p_mshow = sub_mat.add_parser("show", help="resolve the source of a file or sha256")
+    p_mshow.add_argument("target", metavar="FILE_OR_SHA")
+    p_mshow.set_defaults(func=_cmd_materials_show)
+
+    p_setlic = sub_mat.add_parser(
+        "set-license",
+        help="set a site's license rule (sites.json) or one file's license (override)",
+    )
+    which = p_setlic.add_mutually_exclusive_group(required=True)
+    which.add_argument("--site", metavar="DOMAIN")
+    which.add_argument("--sha", metavar="SHA256")
+    p_setlic.add_argument(
+        "--license-id", required=True, metavar="ID",
+        help="e.g. CC-BY-4.0 / CC0-1.0 / site-terms / unknown",
+    )
+    p_setlic.add_argument("--name", help="license name (default: the id)")
+    p_setlic.add_argument("--url", help="terms URL")
+    p_setlic.add_argument("--credit", metavar="TEXT", help="credit text, e.g. OtoLogic")
+    p_setlic.add_argument(
+        "--attribution", action=argparse.BooleanOptionalAction, default=None,
+        help="attribution required (default: yes for CC-BY*, no otherwise)",
+    )
+    p_setlic.add_argument(
+        "--verified", action="store_true", help="checked against the site's own terms",
+    )
+    p_setlic.set_defaults(func=_cmd_materials_set_license)
+
+    p_credits = sub_mat.add_parser(
+        "credits", help="print CREDITS.md for audio files / folders",
+    )
+    p_credits.add_argument("paths", nargs="+", metavar="PATH")
+    p_credits.set_defaults(func=_cmd_materials_credits)
+
+    p_where = sub_mat.add_parser("where", help="print the materials dir")
+    p_where.set_defaults(func=_cmd_materials_where)
 
     p_install = sub.add_parser(
         "install-service",

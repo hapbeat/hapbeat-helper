@@ -277,6 +277,86 @@ never broadcast, never passed to the device handlers.
   answered with `DUPLICATE_REQUEST_ID`; a payload over 4 MB (JSON, UTF-8) with
   `PAYLOAD_TOO_LARGE`.
 
+## 素材台帳（materials）
+
+Free sound-effect sites get downloaded from in bulk, and a month later nobody
+remembers where a file came from. The material ledger records it at download
+time — site, source page, license — and ties it to the **SHA-256 of the file
+content**, so renaming or moving a file never loses it. Studio registers the
+files it exports from those originals, and a Kit's `CREDITS.md` is generated
+from the ledger.
+
+### Commands
+
+```bash
+hapbeat-helper materials ingest --dry-run      # what would be taken from ~/Downloads
+hapbeat-helper materials ingest                # copy new audio / zip downloads into the ledger
+hapbeat-helper materials ingest --dir D:\sfx --since 90
+hapbeat-helper materials list --needs-review   # materials whose license is unknown
+hapbeat-helper materials list --site maou.audio
+hapbeat-helper materials show path\to\gunshot.wav   # or a sha256
+hapbeat-helper materials set-license --site otologic.jp --license-id CC-BY-4.0 \
+    --name "OtoLogic (CC BY 4.0)" --url https://otologic.jp/free/license.html \
+    --credit OtoLogic --verified
+hapbeat-helper materials set-license --sha <sha256> --license-id CC0-1.0
+hapbeat-helper materials credits MyKit/        # CREDITS.md to stdout
+hapbeat-helper materials where                 # print the materials dir
+```
+
+- `ingest` scans the top level of the folder (default `~/Downloads`) for
+  `.wav .mp3 .ogg .flac .m4a .aif .aiff .opus` and `.zip` (audio members are
+  extracted). Files are **copied**; the downloads stay where they are. Content
+  already in the ledger is reported as a duplicate and skipped. `--since DAYS`
+  defaults to "since the last ingest" (30 days on the first run).
+- The source is read from the Windows download mark (`Zone.Identifier`:
+  `ReferrerUrl` / `HostUrl`). Without it (other OS, file not from a browser) the
+  site is `_unknown`.
+- `set-license --site` edits `sites.json`; `--sha` appends a per-file override.
+  `--attribution / --no-attribution` defaults to yes for `CC-BY*` ids.
+
+### Materials dir
+
+Default `~/HapbeatMaterials/`; change it with `materials_dir` in the config
+file (`hapbeat-helper config show` prints its path):
+
+```toml
+materials_dir = "D:/HapbeatMaterials"
+materials_watch_downloads = false   # true: the daemon ingests new downloads by itself
+```
+
+```
+HapbeatMaterials/
+  store/<site>/<YYYY-MM>/<name>   read-only copy of each original (name collisions get " (2)")
+  ledger.jsonl                    append-only records: hapbeat-material@1 / hapbeat-derived@1 / hapbeat-license-override@1
+  sites.json                      domain → license rules (yours to edit; seeded on first use)
+  MATERIALS.md                    overview by site and month, regenerated on every change
+  state.json                      internal (last ingest time)
+```
+
+Licenses are resolved on every lookup — per-file override, then the site rule
+in `sites.json` (a `perAsset` site such as freesound.org resolves to unknown
+and *needs review*), then unknown — so fixing a rule later applies to every
+material already ingested. `CREDITS.md` in a Kit is described in
+hapbeat-contracts `specs/kit-format.md`.
+
+With `materials_watch_downloads = true` the daemon polls `~/Downloads` every
+10 s and ingests a new file once its size is unchanged across two polls
+(download finished). Off by default.
+
+### WS messages
+
+Answered to the sender only; `requestId` in the payload is echoed back when
+present. Invalid payloads get the same reply type with an `error` string.
+
+| type | payload | reply |
+|---|---|---|
+| `material_lookup` | `{ requestId?, sha256s: string[] (≤ 500) }` | `material_lookup_result { requestId?, results: { <sha>: { kind: "material" \| "derived" \| "unknown", originals: [{ sha256, site, referrerUrl, hostUrl, originalName, storePath, license, needsReview }] } } }` |
+| `material_register_derived` | `{ requestId?, sha256, parents: string[] (1–64), tool, name?, note? }` | `material_register_derived_result { requestId?, ok }` — an identical sha256 + parents record is not appended twice |
+| `material_credits` | `{ requestId?, sha256s: string[] (≤ 500), toolName }` | `material_credits_result { requestId?, markdown }` |
+
+A derived file resolves to the originals reached through its parents
+(cycles and chains deeper than 32 are cut).
+
 ## Verify
 
 Quick smoke test using `websocat`:

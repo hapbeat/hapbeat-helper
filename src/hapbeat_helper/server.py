@@ -35,7 +35,7 @@ from typing import Any, Optional
 
 from websockets.exceptions import ConnectionClosed
 
-from hapbeat_helper import protocol, stream_session
+from hapbeat_helper import materials, protocol, stream_session
 from hapbeat_helper.device_registry import DeviceRegistry, HapbeatDevice
 from hapbeat_helper.mdns_scanner import MdnsScanner
 from hapbeat_helper.pack_normalize import normalize_pack
@@ -77,6 +77,11 @@ AGENT_ERR_STUDIO_NOT_READY = (
     "STUDIO_NOT_READY: Open Hapbeat Studio → Waveform editor and open a folder."
 )
 AGENT_ERR_STUDIO_DISCONNECTED = "STUDIO_DISCONNECTED"
+
+# Material ledger (README "素材台帳（materials）"). Limits keep one request cheap.
+MATERIAL_LOOKUP_MAX = 500
+MATERIAL_PARENTS_MAX = 64
+MATERIALS_WATCH_INTERVAL_S = 10.0
 
 
 def _device_to_dict(ip: str, dev: HapbeatDevice) -> dict:
@@ -168,9 +173,22 @@ class HelperServer:
     Lifecycle: ``await server.run()`` blocks until cancelled.
     """
 
-    def __init__(self, port: int = WS_PORT, host: str = HOST) -> None:
+    def __init__(
+        self,
+        port: int = WS_PORT,
+        host: str = HOST,
+        materials_dir: Optional[Path] = None,
+        materials_watch_dir: Optional[Path] = None,
+    ) -> None:
         self.port = port
         self.host = host
+        # Material ledger. The store is created on first use so a daemon that
+        # never gets a material_* message does not touch the materials dir.
+        # materials_watch_dir: the Downloads folder to poll, or None = off.
+        self._materials_dir = materials_dir
+        self._materials_store: Optional[materials.MaterialStore] = None
+        self._materials_watch_dir = materials_watch_dir
+        self._materials_task: Optional[asyncio.Task] = None
         self.registry = DeviceRegistry()
         self.udp = UdpListener()
         self.mdns = MdnsScanner()
@@ -289,6 +307,9 @@ class HelperServer:
         # devices that lack mDNS (e.g. SoftAP).
         self._scan_task = asyncio.create_task(self._scan_loop())
 
+        if self._materials_watch_dir is not None:
+            self._materials_task = asyncio.create_task(self._materials_watch_loop())
+
         async with websockets.serve(
             self._handler, self.host, self.port,
             # Default is 1 MB; firmware images are several MB. Bump
@@ -306,6 +327,8 @@ class HelperServer:
             finally:
                 if self._scan_task is not None:
                     self._scan_task.cancel()
+                if self._materials_task is not None:
+                    self._materials_task.cancel()
                 self.mdns.stop()
                 self.udp.stop()
                 server.close()
@@ -516,6 +539,16 @@ class HelperServer:
 
         elif msg_type == "agent_response":
             await self._handle_agent_response(ws, payload)
+
+        # Material ledger — local files only, never reaches a device.
+        elif msg_type == "material_lookup":
+            await self._handle_material_lookup(ws, payload)
+
+        elif msg_type == "material_register_derived":
+            await self._handle_material_register_derived(ws, payload)
+
+        elif msg_type == "material_credits":
+            await self._handle_material_credits(ws, payload)
 
         elif msg_type == "rescan":
             # Trigger an immediate UDP broadcast PING + push the latest
@@ -2247,6 +2280,119 @@ class HelperServer:
                 await _send_agent_error(requester, request_id, AGENT_ERR_STUDIO_DISCONNECTED)
             except ConnectionClosed:
                 pass
+
+    # ── Material ledger ──────────────────────────────────────
+
+    def _materials(self) -> materials.MaterialStore:
+        if self._materials_store is None:
+            root = self._materials_dir or materials.default_materials_dir()
+            self._materials_store = materials.MaterialStore(root)
+        return self._materials_store
+
+    @staticmethod
+    def _sha_list(value: Any, limit: int) -> Optional[list[str]]:
+        """Lower-cased hashes, or None unless *value* is a list of <= limit sha256s."""
+        if not isinstance(value, list) or len(value) > limit:
+            return None
+        out = [v.lower() for v in value if isinstance(v, str)]
+        if len(out) != len(value) or not all(materials.is_sha256(v) for v in out):
+            return None
+        return out
+
+    @staticmethod
+    async def _send_material_reply(ws, msg_type: str, payload: Any, body: dict) -> None:
+        """Send *body*, echoing the request's ``requestId`` when it had one."""
+        if isinstance(payload, dict) and "requestId" in payload:
+            body = {"requestId": payload["requestId"], **body}
+        await ws.send(json.dumps({"type": msg_type, "payload": body}))
+
+    async def _handle_material_lookup(self, ws, payload: dict) -> None:
+        p = payload if isinstance(payload, dict) else {}
+        shas = self._sha_list(p.get("sha256s"), MATERIAL_LOOKUP_MAX)
+        if shas is None:
+            await self._send_material_reply(ws, "material_lookup_result", payload, {
+                "results": {},
+                "error": (
+                    f"sha256s must be a list of at most {MATERIAL_LOOKUP_MAX} "
+                    "sha256 hex strings"
+                ),
+            })
+            return
+        results = await asyncio.to_thread(self._materials().resolve_many, shas)
+        await self._send_material_reply(
+            ws, "material_lookup_result", payload, {"results": results},
+        )
+
+    async def _handle_material_register_derived(self, ws, payload: dict) -> None:
+        p = payload if isinstance(payload, dict) else {}
+        sha = p.get("sha256")
+        sha = sha.lower() if isinstance(sha, str) else None
+        parents = self._sha_list(p.get("parents"), MATERIAL_PARENTS_MAX)
+        tool = p.get("tool")
+        name, note = p.get("name"), p.get("note")
+        error = None
+        if not materials.is_sha256(sha):
+            error = "sha256 must be a sha256 hex string"
+        elif not parents:
+            error = f"parents must be 1-{MATERIAL_PARENTS_MAX} sha256 hex strings"
+        elif not isinstance(tool, str) or not tool:
+            error = "tool is required"
+        elif (name is not None and not isinstance(name, str)) or (
+            note is not None and not isinstance(note, str)
+        ):
+            error = "name / note must be strings"
+        if error:
+            await self._send_material_reply(
+                ws, "material_register_derived_result", payload,
+                {"ok": False, "error": error},
+            )
+            return
+        await asyncio.to_thread(
+            self._materials().register_derived, sha, parents, tool, name, note,
+        )
+        await self._send_material_reply(
+            ws, "material_register_derived_result", payload, {"ok": True},
+        )
+
+    async def _handle_material_credits(self, ws, payload: dict) -> None:
+        p = payload if isinstance(payload, dict) else {}
+        shas = self._sha_list(p.get("sha256s"), MATERIAL_LOOKUP_MAX)
+        tool_name = p.get("toolName")
+        if shas is None or not isinstance(tool_name, str) or not tool_name:
+            await self._send_material_reply(ws, "material_credits_result", payload, {
+                "markdown": "",
+                "error": (
+                    f"sha256s (at most {MATERIAL_LOOKUP_MAX} sha256 hex strings) "
+                    "and toolName are required"
+                ),
+            })
+            return
+        markdown = await asyncio.to_thread(
+            self._materials().credits_markdown, [(None, s) for s in shas], tool_name,
+        )
+        await self._send_material_reply(
+            ws, "material_credits_result", payload, {"markdown": markdown},
+        )
+
+    async def _materials_watch_loop(self) -> None:
+        """Opt-in (config ``materials_watch_downloads``): auto-ingest downloads."""
+        watcher = materials.DownloadsWatcher(self._materials(), self._materials_watch_dir)
+        logger.info("materials: watching %s", self._materials_watch_dir)
+        try:
+            while True:
+                await asyncio.sleep(MATERIALS_WATCH_INTERVAL_S)
+                try:
+                    result = await asyncio.to_thread(watcher.poll)
+                except Exception:  # noqa: BLE001 — one bad file must not stop the watcher
+                    logger.exception("materials watcher poll failed")
+                    continue
+                if result is not None:
+                    logger.info(
+                        "materials: ingested %d new, %d duplicate, %d need review",
+                        len(result.new), len(result.duplicates), len(result.needs_review),
+                    )
+        except asyncio.CancelledError:
+            pass
 
     # ── Helpers ──────────────────────────────────────────────
 
