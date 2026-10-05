@@ -197,3 +197,143 @@ def test_ping_reports_failure_only_when_nothing_gets_out(listener):
 
     listener._sock = Dead()
     assert listener.send_broadcast_ping() == -1
+
+
+# ── Releasing the lock (contracts message-format.md §2.1) ───────────
+# The lock used to last until the socket was restarted. After the PC moved to
+# another Wi-Fi network every PING still went to the old subnet, Studio never
+# saw the devices on the new network, and only a helper restart recovered.
+SUBNETS = [("192.168.0.205", 24), ("172.17.192.1", 16)]
+
+
+class FakeClock:
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr(mod.time, "monotonic", fake)
+    return fake
+
+
+def make_listener(monkeypatch, subnets):
+    """A started listener as of the (fake) current time, on a fake socket."""
+    fake_ifaddr(monkeypatch, subnets)
+    u = UdpListener(port=7700)
+    u._routes = enumerate_broadcast_routes()
+    u._routes_enumerated_at = mod.time.monotonic()
+    u._sock = FakeSocket()
+    return u
+
+
+def count_enumerations(monkeypatch):
+    calls = []
+    real = mod.enumerate_broadcast_routes
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(mod, "enumerate_broadcast_routes", counting)
+    return calls
+
+
+def test_lock_is_released_when_its_network_is_gone(monkeypatch, clock):
+    u = make_listener(monkeypatch, [("192.168.0.205", 24)])
+    u._lock_route_for("192.168.0.42")
+    assert u.broadcast_destination() == "192.168.0.255"
+
+    # Wi-Fi moves to another network: the old subnet disappears.
+    fake_ifaddr(monkeypatch, [("192.168.11.7", 24)])
+    clock.now += 2.0
+    u.send_broadcast_ping()
+    assert u._sock.sent == ["192.168.11.255", LIMITED_BROADCAST]
+    assert u.broadcast_destination() == LIMITED_BROADCAST
+
+    # The first device on the new network locks again.
+    u._lock_route_for("192.168.11.30")
+    assert u.broadcast_destination() == "192.168.11.255"
+
+
+def test_lock_is_released_when_nobody_answers_for_route_ttl(monkeypatch, clock):
+    # The interface list cannot show a switch to a network that reuses the old
+    # subnet number, or devices that all went away: silence has to do it.
+    u = make_listener(monkeypatch, SUBNETS)
+    u._lock_route_for("192.168.0.42")
+
+    clock.now += mod.ROUTE_TTL_S + 0.5
+    u.send_broadcast_ping()
+    assert u._sock.sent == ["192.168.0.255", "172.17.255.255", LIMITED_BROADCAST]
+    assert u.broadcast_destination() == LIMITED_BROADCAST
+
+
+def test_route_ttl_is_the_device_ttl():
+    # contracts §2.1: route_ttl is the window that retires a known device.
+    from hapbeat_helper.device_registry import _OFFLINE_THRESHOLD
+    assert UdpListener(port=7700).route_ttl == _OFFLINE_THRESHOLD
+
+
+def test_pongs_from_the_locked_subnet_keep_the_lock(monkeypatch, clock):
+    u = make_listener(monkeypatch, SUBNETS)
+    u._lock_route_for("192.168.0.42")
+    for _ in range(5):
+        clock.now += mod.ROUTE_TTL_S - 1.0
+        u._lock_route_for("192.168.0.42")  # liveness PONG
+        u._sock.sent.clear()
+        u.send_broadcast_ping()
+        assert u._sock.sent == ["192.168.0.255"]
+
+
+def test_pongs_from_another_subnet_do_not_keep_the_lock(monkeypatch, clock):
+    u = make_listener(monkeypatch, SUBNETS)
+    u._lock_route_for("192.168.0.42")
+    clock.now += mod.ROUTE_TTL_S - 1.0
+    u._lock_route_for("172.17.0.9")
+    clock.now += 2.0
+    u.send_broadcast_ping()
+    assert u.broadcast_destination() == LIMITED_BROADCAST
+    assert len(u._sock.sent) == 3
+
+
+def test_fan_out_follows_a_network_change_before_any_lock(monkeypatch, clock):
+    u = make_listener(monkeypatch, [("192.168.0.205", 24)])
+    fake_ifaddr(monkeypatch, [("10.0.0.5", 24)])
+    clock.now += 2.0
+    u.send_broadcast_ping()
+    assert u._sock.sent == ["10.0.0.255", LIMITED_BROADCAST]
+
+
+def test_new_interface_keeps_a_live_lock(monkeypatch, clock):
+    # Docking Ethernet while the devices are still on Wi-Fi changes nothing.
+    u = make_listener(monkeypatch, [("192.168.0.205", 24)])
+    u._lock_route_for("192.168.0.42")
+    fake_ifaddr(monkeypatch, [("192.168.0.205", 24), ("172.17.192.1", 16)])
+    clock.now += 2.0
+    u.send_broadcast_ping()
+    assert u._sock.sent == ["192.168.0.255"]
+
+
+def test_enumeration_is_rate_limited_and_off_the_playback_path(monkeypatch, clock):
+    u = make_listener(monkeypatch, SUBNETS)
+    calls = count_enumerations(monkeypatch)
+
+    for _ in range(50):
+        u.send_raw(b"play", "<broadcast>")
+        u.send_raw(b"play", "192.168.0.42")
+        u.send_ping("192.168.0.42")
+    clock.now += 5.0
+    u.send_raw(b"stop", "<broadcast>")
+    assert calls == []
+
+    clock.now -= 4.5   # 0.5 s after the last enumeration
+    u.send_broadcast_ping()
+    assert calls == []
+    clock.now += 0.6
+    u.send_broadcast_ping()
+    u.send_broadcast_ping()
+    assert len(calls) == 1
