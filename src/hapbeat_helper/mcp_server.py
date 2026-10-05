@@ -242,8 +242,9 @@ SERVER_INSTRUCTIONS = """\
 Design haptic (vibration) clips together with a human in Hapbeat Studio.
 Call get_guide first and follow it. Typical loop: get_guide -> get_knowledge
 -> submit_trial -> audition (optional) -> wait_for_rating -> learn from the
-rating and submit the next trial. Only the human rates candidates; you never
-write ratings. Requires the hapbeat-helper daemon running and Hapbeat Studio's
+rating and submit the next trial. With several trials waiting at once, watch
+the folder for saved ratings instead (see the guide's "Receiving ratings").
+Only the human rates candidates; you never write ratings. Requires the hapbeat-helper daemon running and Hapbeat Studio's
 Waveform editor open on a folder."""
 
 _DESCRIPTIONS = {
