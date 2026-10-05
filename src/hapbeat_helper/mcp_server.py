@@ -289,10 +289,8 @@ _DESCRIPTIONS = {
     ),
     "audition": (
         "Open the AI-trials tab in Studio's editor with the given trial and "
-        "candidate selected so the human can try it. play=true also starts "
-        "playback on the human's selected haptic targets (PC audio follows "
-        "Studio's own mute setting); leave it false unless the human asked you "
-        "to play it."
+        "candidate selected so the human can try it. Studio never starts "
+        "playback by itself: play=true is ignored and the human presses play."
     ),
     "adopt": (
         "Adopt a candidate into the folder as a normal clip (same as the human "
