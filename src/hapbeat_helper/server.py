@@ -83,6 +83,16 @@ MATERIAL_LOOKUP_MAX = 500
 MATERIAL_PARENTS_MAX = 64
 MATERIALS_WATCH_INTERVAL_S = 10.0
 
+# Health log. Playback that degrades after hours of uptime and recovers only on
+# a helper restart has to be diagnosed from the log of the run that degraded,
+# so the daemon records its own state: one line every HEALTH_LOG_INTERVAL_S,
+# and a warning as soon as the event loop (which sends every stream packet)
+# falls behind by LOOP_STALL_WARN_S.
+HEALTH_LOG_INTERVAL_S = 600.0
+LOOP_LAG_TICK_S = 0.25
+LOOP_STALL_WARN_S = 0.25
+LOOP_STALL_WARN_EVERY_S = 60.0
+
 
 def _device_to_dict(ip: str, dev: HapbeatDevice) -> dict:
     return {
@@ -189,6 +199,11 @@ class HelperServer:
         self._materials_store: Optional[materials.MaterialStore] = None
         self._materials_watch_dir = materials_watch_dir
         self._materials_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
+        self._started_at = time.monotonic()
+        # PONGs since the last health line. Bumped on the UDP thread; a lost
+        # increment only skews a diagnostic count.
+        self._pongs_since_health = 0
         self.registry = DeviceRegistry()
         self.udp = UdpListener()
         self.mdns = MdnsScanner()
@@ -310,6 +325,8 @@ class HelperServer:
         if self._materials_watch_dir is not None:
             self._materials_task = asyncio.create_task(self._materials_watch_loop())
 
+        self._health_task = asyncio.create_task(self._health_loop())
+
         async with websockets.serve(
             self._handler, self.host, self.port,
             # Default is 1 MB; firmware images are several MB. Bump
@@ -329,6 +346,8 @@ class HelperServer:
                     self._scan_task.cancel()
                 if self._materials_task is not None:
                     self._materials_task.cancel()
+                if self._health_task is not None:
+                    self._health_task.cancel()
                 self.mdns.stop()
                 self.udp.stop()
                 server.close()
@@ -366,9 +385,70 @@ class HelperServer:
         except asyncio.CancelledError:
             pass
 
+    async def _health_loop(self) -> None:
+        """Measure event-loop lag continuously; log a health line periodically.
+
+        Lag = how late a short sleep wakes up. Everything the helper sends to a
+        device goes out from this loop, so a lag shows up as late or bunched
+        haptics. A suspended PC also reads as one long stall."""
+        loop = asyncio.get_running_loop()
+        window_start = loop.time()
+        lag_max = 0.0
+        stalls = 0
+        last_warn = -LOOP_STALL_WARN_EVERY_S
+        suppressed = 0
+        try:
+            while True:
+                t0 = loop.time()
+                await asyncio.sleep(LOOP_LAG_TICK_S)
+                now = loop.time()
+                lag = now - t0 - LOOP_LAG_TICK_S
+                lag_max = max(lag_max, lag)
+                if lag >= LOOP_STALL_WARN_S:
+                    stalls += 1
+                    if now - last_warn >= LOOP_STALL_WARN_EVERY_S:
+                        logger.warning(
+                            "event loop stalled %.0f ms (or the PC was suspended)%s",
+                            lag * 1000,
+                            f"; {suppressed} more since the last warning" if suppressed else "",
+                        )
+                        last_warn = now
+                        suppressed = 0
+                    else:
+                        suppressed += 1
+                if now - window_start >= HEALTH_LOG_INTERVAL_S:
+                    logger.info("health: %s", self._health_line(lag_max, stalls))
+                    window_start = now
+                    lag_max = 0.0
+                    stalls = 0
+        except asyncio.CancelledError:
+            pass
+
+    def _health_line(self, lag_max: float, stalls: int) -> str:
+        up = int(time.monotonic() - self._started_at)
+        devices = self.registry.get_all_devices()
+        online = sum(1 for d in devices.values() if d.is_online)
+        leases = self.udp.stream_leases
+        modes = ",".join(f"{ip}:{leases.kind(ip)}" for ip in sorted(devices)) or "-"
+        threads = threading.enumerate()
+        # Thread count, not dict size: a tail missing from _log_threads still
+        # holds the device's TCP slot.
+        tails = sum(1 for t in threads if t.name.startswith("log-tail-sup-"))
+        pongs, self._pongs_since_health = self._pongs_since_health, 0
+        return (
+            f"up={up // 3600}h{up % 3600 // 60:02d}m "
+            f"clients={len(self._clients)} (agent={len(self._agent_clients)}) "
+            f"streams={len(self._active_streams)} "
+            f"devices={online}/{len(devices)} online pongs={pongs} modes={modes} "
+            f"log_tails={len(self._log_threads)} (threads={tails}) "
+            f"threads={len(threads)} tasks={len(asyncio.all_tasks())} "
+            f"loop_lag_max={lag_max * 1000:.0f}ms stalls={stalls}"
+        )
+
     # ── Subsystem callbacks (run on background threads) ──────
 
     def _on_pong(self, pong: dict, ip: str) -> None:
+        self._pongs_since_health += 1
         info = {
             "ip": ip,
             "name": pong.get("device_name", ""),
@@ -507,14 +587,15 @@ class HelperServer:
                     "last WS client gone — stopping %d log_tail thread(s)",
                     len(self._log_threads),
                 )
-                # Snapshot before mutating
-                ips_to_stop = list(self._log_threads.keys())
-                for ip in ips_to_stop:
-                    stop = self._log_stop_flags.pop(ip, None)
-                    self._log_threads.pop(ip, None)
-                    if stop:
-                        stop.set()
+                self._stop_all_log_tails()
             logger.info("Studio disconnected: %s", remote)
+
+    def _stop_all_log_tails(self) -> None:
+        for ip in list(self._log_threads.keys()):
+            stop = self._log_stop_flags.pop(ip, None)
+            self._log_threads.pop(ip, None)
+            if stop:
+                stop.set()
 
     async def _dispatch(self, ws, msg: dict) -> None:
         msg_type = msg.get("type", "")
@@ -1781,25 +1862,31 @@ class HelperServer:
                 def _busy() -> bool:
                     return (target in self._ota_in_progress
                             or self._cmd_in_progress.get(target, 0) > 0)
+                # Waits use stop.wait() so an unsubscribe ends this thread now
+                # rather than after the backoff.
                 if _busy():
                     while not stop.is_set() and _busy():
-                        time.sleep(0.3)
+                        stop.wait(0.3)
                     if not stop.is_set():
                         logger.debug("log tail (%s) busy 解消 — 再接続", target)
                     backoff = 0.3
                 else:
                     # Short backoff before reconnecting; longer if firmware
                     # is busy (give the displacing command time to finish).
-                    time.sleep(backoff)
+                    stop.wait(backoff)
                     backoff = min(backoff * 1.5, 4.0)
                     if not stop.is_set():
                         # debug, not info: displacement-driven restarts are
                         # routine churn, not something the user needs to watch.
                         logger.debug("log tail (%s) auto-restart", target)
-            # Natural exit — clean up dict entries so subsequent
-            # subscribe_logs requests can re-create the thread.
-            self._log_stop_flags.pop(target, None)
-            self._log_threads.pop(target, None)
+            # Drop the dict entries only if they are still ours. An
+            # unsubscribe + subscribe while this thread was winding down has
+            # already put a new thread there; removing its entries left it
+            # running with no way to stop it, fighting every later tail for
+            # the device's single TCP slot until the helper restarted.
+            if self._log_stop_flags.get(target) is stop:
+                self._log_stop_flags.pop(target, None)
+                self._log_threads.pop(target, None)
 
         t = threading.Thread(
             target=_supervised_worker,
