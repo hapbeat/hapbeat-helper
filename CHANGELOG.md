@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-07
+
 ### Added
 
 - 長時間稼働の診断用に、10 分ごとの `health:` 行（接続数・ストリーム数・デバイス数・
@@ -47,9 +49,18 @@
 - **PLAY (0x01) に `pan` を追加した**（DEC-055、-1.0 左 / 0.0 中央 / +1.0 右）。
   `preview_event` の payload に任意フィールド `pan`（既定 0.0）を受け、送信時は
   `[-1, 1]` にクランプして常に付与する。STOP / STOP_ALL は変更なし。
+- BandWL v4 PWM 実験ファーム向けに `set_pwm_bias` / `pwm_tone` / `set_volume` /
+  `pwm_status` / `pwm_probe` を中継し、`get_info` の `haptic_pwm` を透過するようにした。
 
 ### Fixed
 
+- **旧ファームの機器でループ再生すると、2 周目以降が半分ほど欠ける問題**を修正した
+  （この版の stream v2 対応で入った退行）。旧ファーム向けの 300 ms の END→BEGIN 待ちを
+  WS の受信処理ごと止めて実装していたため、待ちの間は同じ接続のメッセージ（v2 機器宛ての
+  DATA も含む）がすべて止まり、明けた瞬間に溜まった DATA を一斉に送っていた。旧ファーム
+  （0.4.0）はこれを取りこぼし、END 直後に再開した 2 本目は 32 パケット中 16〜17 しか
+  届かなかった。待ちの間はその旧ファーム機器宛てのパケットだけを溜め、BEGIN 後に到着間隔
+  どおり送る（その機器は最大 0.3 秒遅れて鳴る）。v2 機器と他の機器は待たない。
 - **ログ購読（`subscribe_logs`）の解除直後に再購読すると、止められない log_tail スレッドが
   残る問題**を修正した。止めた側のスレッドが終了時に、後から作られたスレッドの登録まで
   消していた。残ったスレッドは Studio を再読み込みしても止まらず、デバイスの単一 TCP 枠を
@@ -99,11 +110,16 @@
 
 ### 検証
 
-- pytest 100 件通過（STREAM_BEGIN address target layout を含む）。実機未検証。
-- **Hapbeat 実機（duo_wl_v3 / fw 0.3.1）で確認済み**: PING が全サブネット宛てに
-  ファンアウトし、実機の PONG でそのサブネットに確定、`send_raw` の `<broadcast>` は
-  単一宛先のまま。稼働中のデーモンでも
-  `broadcasting to 192.168.0.255 (a device answered from 192.168.0.142)` を確認した。
+- pytest 196 件通過。
+- Hapbeat 実機（duo_wl_v3 fw 0.5.0d10 = stream v2、duo_wl_v3 fw 0.4.0 = 旧ファーム）で、
+  単独・同時・同一ストリームへの両方宛て・END 直後の再開のいずれも、送信した 32 パケットが
+  両機器に届くこと（`get_stream_debug` の packets / session_v2）を確認した。v2 機器へは
+  60 秒ごとの試聴を約 3.5 時間続け、欠落・拒否・アンダーラン 0。`hapbeat-helper ota` で
+  fw 0.5.0d10 を書き込めることを確認した。
+- duo_wl_v3 / fw 0.3.1 で、PING が全サブネット宛てにファンアウトし、実機の PONG でその
+  サブネットに確定、`send_raw` の `<broadcast>` は単一宛先のままであることを確認した。
+
+## [0.4.0] - 2026-08-03
 
 ### Added
 
@@ -112,8 +128,6 @@
   `hapbeat-helper version` でもいつでも確認できる。
   無効化は `--no-update-check` または `HAPBEAT_NO_UPDATE_CHECK=1`。
   取得は 3 秒でタイムアウトし、失敗しても何も出さない（オフライン運用のため）。
-- BandWL v4 PWM 実験ファーム向けに `set_pwm_bias` / `pwm_tone` / `set_volume` /
-  `pwm_status` / `pwm_probe` を中継し、`get_info` の `haptic_pwm` を透過するようにした。
 
 ### Changed
 
@@ -172,7 +186,9 @@
 
 [GitHub Releases](https://github.com/Hapbeat/hapbeat-helper/releases) を参照。
 
-[Unreleased]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.1.4...v0.2.0
