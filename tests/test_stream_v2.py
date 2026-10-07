@@ -2,6 +2,7 @@
 
 No sockets: packets are captured from send_raw, PONGs are fed to the lease table.
 """
+import asyncio
 import struct
 import time
 
@@ -166,25 +167,69 @@ async def test_v2_and_legacy_targets_stream_in_their_own_formats(server):
     assert legacy[-1]["payload"] == b""
 
 
-@pytest.mark.asyncio
-async def test_v2_restarts_immediately_but_legacy_waits_300ms(server):
+def _timed_server(monkeypatch):
+    server = HelperServer()
+    server.sent = []
+    monkeypatch.setattr(
+        server.udp, "send_raw",
+        lambda pkt, ip: server.sent.append((time.monotonic(), ip, _decode(pkt))) or True)
     leases = server.udp.stream_leases
     _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
     _reply(leases, LEGACY_IP, 2, 101, {"status": "absent"})
+    return server
+
+
+@pytest.mark.asyncio
+async def test_restart_after_end_v2_immediately_legacy_after_guard_without_stalling(monkeypatch):
+    """Loop playback: END then BEGIN at once to a v2 and a legacy device in one
+    stream. v2 restarts at once; the legacy device gets its BEGIN only after
+    the 300 ms guard, and neither the handler nor the v2 device waits for it."""
+    server = _timed_server(monkeypatch)
     ws = _FakeWebSocket()
-    for ip in (V2_IP, LEGACY_IP):
-        payload = {"targets": [ip], "stream_id": "a"}
-        await server._handle_stream_begin(ws, payload)
-        await server._handle_stream_end(ws, payload)
-        started = time.monotonic()
-        await server._handle_stream_begin(ws, {"targets": [ip], "stream_id": "b"})
-        elapsed = time.monotonic() - started
-        if ip == V2_IP:
-            assert elapsed < 0.1
-            gens = [struct.unpack("<QII", p["payload"][:16])[2] for p in _packets(server, ip)]
-            assert gens == [1, 1, 2]
-        else:
-            assert elapsed >= 0.28
+    both = {"targets": [V2_IP, LEGACY_IP]}
+    await server._handle_stream_begin(ws, {**both, "stream_id": "a"})
+    await server._handle_stream_end(ws, {**both, "stream_id": "a"})
+    t_end = time.monotonic()
+    await server._handle_stream_begin(ws, {**both, "stream_id": "b"})
+    assert time.monotonic() - t_end < 0.05, "BEGIN must not hold up the WS handler"
+    for i in range(10):  # real-time paced DATA, 16 ms apart
+        await server._handle_stream_data(ws, {**both, "stream_id": "b", "offset": i * 4, "data": "AAAAAA=="})
+        await asyncio.sleep(0.016)
+    await server._handle_stream_end(ws, {**both, "stream_id": "b"})
+    await asyncio.sleep(0.4)
+
+    def stream_b(ip):
+        rows = [(t, p) for t, sip, p in server.sent if sip == ip]
+        begins = [k for k, (_, p) in enumerate(rows) if p["command"] == protocol.CMD_STREAM_BEGIN]
+        return rows[begins[1]:]
+
+    v2 = stream_b(V2_IP)
+    assert v2[0][0] - t_end < 0.05
+    assert [p["command"] for _, p in v2] == [protocol.CMD_STREAM_BEGIN] + [protocol.CMD_STREAM_DATA] * 10 + [protocol.CMD_STREAM_END]
+
+    legacy = stream_b(LEGACY_IP)
+    assert [p["command"] for _, p in legacy] == [protocol.CMD_STREAM_BEGIN] + [protocol.CMD_STREAM_DATA] * 10 + [protocol.CMD_STREAM_END]
+    assert legacy[0][0] - t_end >= 0.28, "legacy BEGIN waits out the END->BEGIN guard"
+    # Real-time pace kept: no burst of the DATA that arrived during the guard.
+    gaps = [b[0] - a[0] for a, b in zip(legacy[1:], legacy[2:-1])]
+    assert min(gaps) > 0.008, gaps
+
+
+@pytest.mark.asyncio
+async def test_new_begin_replaces_a_guarded_start(monkeypatch):
+    server = _timed_server(monkeypatch)
+    ws = _FakeWebSocket()
+    one = {"targets": [LEGACY_IP]}
+    await server._handle_stream_begin(ws, {**one, "stream_id": "a"})
+    await server._handle_stream_end(ws, {**one, "stream_id": "a"})
+    await server._handle_stream_begin(ws, {**one, "stream_id": "b"})  # guarded
+    await server._handle_stream_data(ws, {**one, "stream_id": "b", "offset": 0, "data": "AAAA"})
+    await server._handle_stream_begin(ws, {**one, "stream_id": "c"})  # replaces b before it went out
+    await asyncio.sleep(0.4)
+    cmds = [p["command"] for _, ip, p in server.sent if ip == LEGACY_IP]
+    # a: BEGIN END, then c's BEGIN only (still guarded: no END since a's).
+    assert cmds == [protocol.CMD_STREAM_BEGIN, protocol.CMD_STREAM_END, protocol.CMD_STREAM_BEGIN]
+    server._legacy_delayed.pop(LEGACY_IP).task.cancel()  # c still streaming (no END)
 
 
 @pytest.mark.asyncio

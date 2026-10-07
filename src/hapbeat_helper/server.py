@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import contextlib
 import io
 import json
@@ -172,6 +173,18 @@ def _address_routed_ips(target: str, registry: DeviceRegistry) -> list[str]:
     return ips
 
 
+class _DelayedLegacyStart:
+    """A legacy (pre-v2) stream session whose BEGIN waits out the guard."""
+
+    def __init__(self, begin_pkt: bytes, delay: float) -> None:
+        self.begin_pkt = begin_pkt
+        self.delay = delay
+        # (arrival monotonic time, packet, is a legacy END)
+        self.queue: collections.deque[tuple[float, bytes, bool]] = collections.deque()
+        self.wake = asyncio.Event()
+        self.task: Optional[asyncio.Task] = None
+
+
 class HelperServer:
     """The WebSocket server + the subsystems it relays to.
 
@@ -219,6 +232,8 @@ class HelperServer:
         # ip -> wire format fixed at STREAM_BEGIN for the session that owns
         # the ip: [mode, StreamIdentity|None, next v2 byte offset].
         self._stream_wire: dict[str, list] = {}
+        # ip -> legacy session whose BEGIN waits out the END->BEGIN guard.
+        self._legacy_delayed: dict[str, _DelayedLegacyStart] = {}
         self._scan_task: Optional[asyncio.Task] = None
         # ip -> background log-tail thread state. One subscriber per
         # device is enough for the MVP; if a second client subscribes
@@ -2139,8 +2154,49 @@ class HelperServer:
                 seq, identity.boot_id, identity.ticket, identity.generation)
         else:
             pkt = protocol.build_stream_end(seq=seq)
-            self.udp.stream_leases.note_legacy_end(ip)
+        self._stream_send(ip, pkt, legacy_end=mode != stream_session.V2)
+
+    def _stream_send(self, ip: str, pkt: bytes, legacy_end: bool = False) -> None:
+        """Send a stream packet now, or queue it behind a legacy guard."""
+        delayed = self._legacy_delayed.get(ip)
+        if delayed is not None:
+            delayed.queue.append((time.monotonic(), pkt, legacy_end))
+            delayed.wake.set()
+            return
         self.udp.send_raw(pkt, ip)
+        if legacy_end:
+            self.udp.stream_leases.note_legacy_end(ip)
+
+    async def _run_delayed_legacy(self, ip: str, delayed: _DelayedLegacyStart) -> None:
+        """Send a guarded legacy BEGIN, then the packets queued behind it.
+
+        Each queued packet goes out ``delay`` after it arrived, so the device
+        gets the stream at its real-time pace, just that much later. Waiting in
+        the WS handler instead stalled every message on the connection (other
+        devices' DATA too) and then sent the backlog in one burst, which old
+        firmware dropped about half of (2026-10-07, fw 0.4.0: 16/32 packets
+        when a stream restarted right after END)."""
+        try:
+            await asyncio.sleep(delayed.delay)
+            self.udp.send_raw(delayed.begin_pkt, ip)
+            while True:
+                if not delayed.queue:
+                    delayed.wake.clear()
+                    await delayed.wake.wait()
+                    continue
+                arrived, pkt, legacy_end = delayed.queue[0]
+                wait = arrived + delayed.delay - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    continue
+                delayed.queue.popleft()
+                self.udp.send_raw(pkt, ip)
+                if legacy_end:
+                    self.udp.stream_leases.note_legacy_end(ip)
+                    return
+        finally:
+            if self._legacy_delayed.get(ip) is delayed:
+                del self._legacy_delayed[ip]
 
     async def _handle_stream_begin(self, ws, payload: dict) -> None:
         key = self._stream_key(ws, payload)
@@ -2196,16 +2252,24 @@ class HelperServer:
                 self._active_streams.pop(ip, None)
                 continue
             mode, identity = chosen
+            # A guarded start still waiting is replaced, unsent packets and all.
+            replaced = self._legacy_delayed.pop(ip, None)
+            if replaced is not None:
+                replaced.task.cancel()
+            self._stream_wire[ip] = [mode, identity, 0]
             if mode == stream_session.V2:
                 pkt = protocol.build_stream_begin_v2(
                     0, identity.boot_id, identity.ticket, identity.generation, **begin)
             else:
-                # Pre-v2 firmware cannot reject a late END: keep the guard.
+                pkt = protocol.build_stream_begin(seq=0, **begin)
+                # Pre-v2 firmware cannot reject a late END: keep the guard,
+                # for this device only and without holding up the handler.
                 remaining = leases.legacy_guard_remaining(ip)
                 if remaining > 0:
-                    await asyncio.sleep(remaining)
-                pkt = protocol.build_stream_begin(seq=0, **begin)
-            self._stream_wire[ip] = [mode, identity, 0]
+                    delayed = _DelayedLegacyStart(pkt, remaining)
+                    self._legacy_delayed[ip] = delayed
+                    delayed.task = asyncio.create_task(self._run_delayed_legacy(ip, delayed))
+                    continue
             self.udp.send_raw(pkt, ip)
         ack_payload = {"status": "ok", "targets": targets}
         if deferred:
@@ -2246,7 +2310,7 @@ class HelperServer:
                         seq=seq, offset=offset, data=audio,
                     )
                 pkt = legacy_pkt
-            self.udp.send_raw(pkt, ip)
+            self._stream_send(ip, pkt)
 
     async def _handle_stream_end(self, ws, payload: dict) -> None:
         key = self._stream_key(ws, payload)
