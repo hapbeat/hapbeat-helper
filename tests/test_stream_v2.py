@@ -3,13 +3,14 @@
 No sockets: packets are captured from send_raw, PONGs are fed to the lease table.
 """
 import asyncio
+import json
 import struct
 import time
 
 import pytest
 
 from hapbeat_helper import protocol, stream_session
-from hapbeat_helper.server import HelperServer
+from hapbeat_helper.server import STREAM_END_REPEATS, HelperServer
 from hapbeat_helper.stream_session import StreamLeaseTable
 
 BOOT = 0x0102030405060708
@@ -205,7 +206,14 @@ async def test_restart_after_end_v2_immediately_legacy_after_guard_without_stall
 
     v2 = stream_b(V2_IP)
     assert v2[0][0] - t_end < 0.05
-    assert [p["command"] for _, p in v2] == [protocol.CMD_STREAM_BEGIN] + [protocol.CMD_STREAM_DATA] * 10 + [protocol.CMD_STREAM_END]
+    # Stream a's repeated END interleaves here; it carries the older generation.
+    generation_b = struct.unpack("<I", v2[0][1]["payload"][12:16])[0]
+    v2_b = [p for _, p in v2 if struct.unpack("<I", p["payload"][12:16])[0] == generation_b]
+    assert [p["command"] for p in v2_b] == (
+        [protocol.CMD_STREAM_BEGIN] + [protocol.CMD_STREAM_DATA] * 10
+        + [protocol.CMD_STREAM_END] * (1 + STREAM_END_REPEATS))
+    assert all(struct.unpack("<I", p["payload"][12:16])[0] < generation_b
+               for _, p in v2 if p not in v2_b)
 
     legacy = stream_b(LEGACY_IP)
     assert [p["command"] for _, p in legacy] == [protocol.CMD_STREAM_BEGIN] + [protocol.CMD_STREAM_DATA] * 10 + [protocol.CMD_STREAM_END]
@@ -270,3 +278,62 @@ async def test_superseded_lease_is_reacquired_on_explicit_start(server, monkeypa
     assert leases.incarnation != old
     begin = _packets(server, V2_IP)[0]
     assert struct.unpack("<QII", begin["payload"][:16]) == (BOOT, 10, 1)
+
+
+# ── stream reliability (2026-10-09) ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_v2_end_is_repeated_and_legacy_end_is_not(server):
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, LEGACY_IP, 2, 101, {"status": "absent"})
+    ws = _FakeWebSocket()
+    both = {"targets": [V2_IP, LEGACY_IP], "stream_id": "s"}
+    await server._handle_stream_begin(ws, both)
+    await server._handle_stream_end(ws, both)
+    await asyncio.sleep(0.35)
+    ends = lambda ip: [p for p in _packets(server, ip) if p["command"] == protocol.CMD_STREAM_END]
+    assert len(ends(V2_IP)) == 1 + STREAM_END_REPEATS
+    assert len({p["payload"] for p in ends(V2_IP)}) == 1, "repeats are the same END"
+    assert len(ends(LEGACY_IP)) == 1
+
+
+@pytest.mark.asyncio
+async def test_displaced_owner_is_told_and_its_data_gets_no_session_once(server):
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    old_ws, new_ws = _FakeWebSocket(), _FakeWebSocket()
+    server._clients.update({old_ws, new_ws})
+    await server._handle_stream_begin(old_ws, {"targets": [V2_IP], "stream_id": "old"})
+    await server._handle_stream_begin(new_ws, {"targets": [V2_IP], "stream_id": "new"})
+    msgs = [json.loads(m) for m in old_ws.messages]
+    assert msgs[-1] == {"type": "stream_displaced", "payload": {
+        "stream_id": "old", "targets": [V2_IP], "by": "new", "same_client": False}}
+    for _ in range(3):
+        await server._handle_stream_data(old_ws, {"targets": [V2_IP], "stream_id": "old", "data": "AAAA"})
+    acks = [json.loads(m)["payload"] for m in old_ws.messages[len(msgs):]]
+    assert acks == [{"status": "no_session", "stream_id": "old"}]
+    assert server._stream_orphans_since_health == 3
+
+
+@pytest.mark.asyncio
+async def test_end_without_targets_reaches_every_device_the_stream_owns(server):
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    ws = _FakeWebSocket()
+    await server._handle_stream_begin(ws, {"targets": [V2_IP], "stream_id": "s"})
+    # No targets and an address-filter "target": not an IP, must not matter.
+    await server._handle_stream_end(ws, {"stream_id": "s", "target": "player_1"})
+    assert protocol.CMD_STREAM_END in [p["command"] for p in _packets(server, V2_IP)]
+    assert server._active_streams == {}
+
+
+@pytest.mark.asyncio
+async def test_device_that_loses_its_lease_is_reported_deferred_not_started(server, monkeypatch):
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    monkeypatch.setattr(leases, "begin_session", lambda ip: None)
+    ws = _FakeWebSocket()
+    await server._handle_stream_begin(ws, {"targets": [V2_IP], "stream_id": "s"})
+    ack = json.loads(ws.messages[-1])["payload"]
+    assert ack == {"status": "no_target", "targets": [], "deferred": [V2_IP], "stream_id": "s"}

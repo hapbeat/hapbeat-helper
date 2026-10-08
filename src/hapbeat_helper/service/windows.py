@@ -121,7 +121,10 @@ def _try_create_scheduled_task(exe: str, log: Path) -> bool:
         '$arg = "-WindowStyle Hidden -NoProfile -Command `"& \'$exe\' start *>> \'$log\'`""\n'
         '$action    = New-ScheduledTaskAction -Execute \'powershell.exe\' -Argument $arg\n'
         '$trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME\n'
-        '$settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew\n'
+        # -Priority 4 = normal. The default (7) is below normal, which starves
+        # the daemon for seconds on a busy PC. The restart covers a crash.
+        '$settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew '
+        '-Priority 4 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)\n'
         '$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited\n'
         'Register-ScheduledTask -TaskName \'' + TASK_NAME + '\' '
         '-Action $action -Trigger $trigger -Settings $settings '

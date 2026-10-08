@@ -102,9 +102,35 @@ def _apply_update_check_flag(args: argparse.Namespace) -> None:
         os.environ["HAPBEAT_NO_UPDATE_CHECK"] = "1"
 
 
+def _raise_priority_if_lowered() -> None:
+    """Run at normal CPU priority even when started below it.
+
+    Windows starts Task Scheduler tasks below normal priority unless the task
+    says otherwise, and the auto-start task registered before 0.5.1 did not. A
+    below-normal daemon on a busy PC goes unscheduled for seconds at a time: the
+    event loop stalls with no CPU use of its own, PONGs go unanswered, devices
+    drop offline and stream packets arrive late or not at all (2026-10-09 log:
+    stalls up to 23.9 s while the helper itself was idle).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        normal = 0x00000020  # NORMAL_PRIORITY_CLASS
+        lowered = (0x00004000, 0x00000040)  # BELOW_NORMAL / IDLE
+        handle = kernel32.GetCurrentProcess()
+        if kernel32.GetPriorityClass(handle) in lowered and kernel32.SetPriorityClass(handle, normal):
+            logger.info("raised process priority to normal (it was started below normal)")
+    except Exception:  # noqa: BLE001 — never block startup on this
+        pass
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
     _apply_update_check_flag(args)
+    _raise_priority_if_lowered()
     from hapbeat_helper import materials
 
     config = materials.load_config()

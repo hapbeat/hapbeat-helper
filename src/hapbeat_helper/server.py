@@ -27,9 +27,11 @@ import select
 import shutil
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 from pathlib import Path
 from typing import Any, Optional
@@ -93,6 +95,18 @@ HEALTH_LOG_INTERVAL_S = 600.0
 LOOP_LAG_TICK_S = 0.25
 LOOP_STALL_WARN_S = 0.25
 LOOP_STALL_WARN_EVERY_S = 60.0
+# A loop stuck this long gets its current stack logged from a watchdog thread,
+# so a blocking call on the loop can be told apart from a PC that did not
+# schedule the process at all (the stack then shows the loop idle in select).
+LOOP_STUCK_DUMP_S = 2.0
+LOOP_STUCK_DUMP_EVERY_S = 60.0
+
+# STREAM_END is one UDP packet; if it is lost the device keeps the stream open.
+# v2 firmware ignores an END for a generation that already ended, so the END is
+# sent again this many times, this far apart. Legacy firmware cannot reject a
+# late END (it would stop the next stream), so it gets the single END only.
+STREAM_END_REPEATS = 2
+STREAM_END_REPEAT_INTERVAL_S = 0.1
 
 
 def _device_to_dict(ip: str, dev: HapbeatDevice) -> dict:
@@ -217,6 +231,12 @@ class HelperServer:
         # PONGs since the last health line. Bumped on the UDP thread; a lost
         # increment only skews a diagnostic count.
         self._pongs_since_health = 0
+        # Stream DATA/END that matched no session of its sender, since the last
+        # health line (the sender was displaced, deferred or never began).
+        self._stream_orphans_since_health = 0
+        # Updated by _health_loop every tick; read by the stuck-loop watchdog.
+        self._loop_heartbeat = time.monotonic()
+        self._loop_thread_id: Optional[int] = None
         self.registry = DeviceRegistry()
         self.udp = UdpListener()
         self.mdns = MdnsScanner()
@@ -229,6 +249,8 @@ class HelperServer:
         # an aborted preview cannot stop or corrupt its replacement.
         self._active_streams: dict[str, tuple[int, str]] = {}
         self._stream_sequences: dict[tuple[int, str], int] = {}
+        # Streams already told they have no session (see _note_stream_orphan).
+        self._orphan_notified: set[tuple[int, str]] = set()
         # ip -> wire format fixed at STREAM_BEGIN for the session that owns
         # the ip: [mode, StreamIdentity|None, next v2 byte offset].
         self._stream_wire: dict[str, list] = {}
@@ -341,6 +363,10 @@ class HelperServer:
             self._materials_task = asyncio.create_task(self._materials_watch_loop())
 
         self._health_task = asyncio.create_task(self._health_loop())
+        self._loop_thread_id = threading.get_ident()
+        self._loop_heartbeat = time.monotonic()
+        threading.Thread(target=self._stuck_loop_watchdog, daemon=True,
+                         name="loop-watchdog").start()
 
         async with websockets.serve(
             self._handler, self.host, self.port,
@@ -377,18 +403,10 @@ class HelperServer:
         try:
             last_online_state: dict[str, bool] = {}
             while True:
-                self.udp.send_broadcast_ping()
-                # Also unicast-PING every known device. Wi-Fi APs deliver
-                # broadcasts on the DTIM beacon at the lowest rate and many
-                # power-saving stations drop them — that intermittent loss is
-                # what made cards flap offline for a moment (user report
-                # 2026-06-13). Unicast frames are buffered/retried by the AP,
-                # so a sleepy ESP32 still gets them reliably.
-                for ip in self.registry.get_all_ips():
-                    try:
-                        self.udp.send_ping(ip)
-                    except OSError:
-                        pass  # interface change mid-scan — next tick recovers
+                # Off the loop: the broadcast refreshes the route list through
+                # ifaddr.get_adapters(), 10-100 ms here and longer while Windows
+                # reconfigures an adapter, and the loop also carries stream DATA.
+                await asyncio.to_thread(self._send_scan_pings)
                 await asyncio.sleep(2.0)
                 # Detect liveness transitions and push if anything flipped.
                 current = {
@@ -399,6 +417,43 @@ class HelperServer:
                     self._post_to_loop(self._broadcast(self._device_list_msg()))
         except asyncio.CancelledError:
             pass
+
+    def _send_scan_pings(self) -> None:
+        self.udp.send_broadcast_ping()
+        # Also unicast-PING every known device. Wi-Fi APs deliver broadcasts
+        # on the DTIM beacon at the lowest rate and many power-saving stations
+        # drop them — that intermittent loss is what made cards flap offline
+        # for a moment (user report 2026-06-13). Unicast frames are
+        # buffered/retried by the AP, so a sleepy ESP32 still gets them.
+        for ip in self.registry.get_all_ips():
+            try:
+                self.udp.send_ping(ip)
+            except OSError:
+                pass  # interface change mid-scan — next tick recovers
+
+    def _stuck_loop_watchdog(self) -> None:
+        """Log where the event loop is while it is stuck (runs on a thread).
+
+        The stall warning alone cannot say whether a call on the loop blocked
+        or the process was not scheduled; the loop thread's stack can: a
+        blocking call shows up by name, a starved or suspended process shows
+        the loop idle in its selector."""
+        last_dump = -LOOP_STUCK_DUMP_EVERY_S
+        dumped_for = 0.0
+        while True:
+            time.sleep(0.5)
+            beat = self._loop_heartbeat
+            now = time.monotonic()
+            if (now - beat < LOOP_STUCK_DUMP_S or beat == dumped_for
+                    or now - last_dump < LOOP_STUCK_DUMP_EVERY_S):
+                continue
+            frame = sys._current_frames().get(self._loop_thread_id or 0)
+            if frame is None:
+                continue
+            dumped_for, last_dump = beat, now
+            stack = "".join(traceback.format_stack(frame)[-8:])
+            logger.warning("event loop stuck for %.1f s; it is at:\n%s",
+                           now - beat, stack.rstrip())
 
     async def _health_loop(self) -> None:
         """Measure event-loop lag continuously; log a health line periodically.
@@ -417,6 +472,7 @@ class HelperServer:
                 t0 = loop.time()
                 await asyncio.sleep(LOOP_LAG_TICK_S)
                 now = loop.time()
+                self._loop_heartbeat = time.monotonic()
                 lag = now - t0 - LOOP_LAG_TICK_S
                 lag_max = max(lag_max, lag)
                 if lag >= LOOP_STALL_WARN_S:
@@ -450,10 +506,11 @@ class HelperServer:
         # holds the device's TCP slot.
         tails = sum(1 for t in threads if t.name.startswith("log-tail-sup-"))
         pongs, self._pongs_since_health = self._pongs_since_health, 0
+        orphans, self._stream_orphans_since_health = self._stream_orphans_since_health, 0
         return (
             f"up={up // 3600}h{up % 3600 // 60:02d}m "
             f"clients={len(self._clients)} (agent={len(self._agent_clients)}) "
-            f"streams={len(self._active_streams)} "
+            f"streams={len(self._active_streams)} stream_orphans={orphans} "
             f"devices={online}/{len(devices)} online pongs={pongs} modes={modes} "
             f"log_tails={len(self._log_threads)} (threads={tails}) "
             f"threads={len(threads)} tasks={len(asyncio.all_tasks())} "
@@ -2087,9 +2144,14 @@ class HelperServer:
         key: tuple[int, str],
         payload: dict,
     ) -> list[str]:
+        """The devices this stream still owns, narrowed to the payload's
+        explicit ``targets`` / ``ip`` when it names any. Ownership alone decides
+        otherwise, so an END reaches every device its BEGIN started even when
+        the device has since dropped out of the registry."""
+        explicit = set(_explicit_ips(payload))
         return [
-            ip for ip in _resolve_targets(payload, self.registry)
-            if self._active_streams.get(ip) == key
+            ip for ip, owner in self._active_streams.items()
+            if owner == key and (not explicit or ip in explicit)
         ]
 
     def _end_streams_owned_by(self, ws) -> None:
@@ -2099,6 +2161,7 @@ class HelperServer:
         longer matches this owner and is deliberately left untouched.
         """
         client_id = id(ws)
+        self._orphan_notified = {k for k in self._orphan_notified if k[0] != client_id}
         by_key: dict[tuple[int, str], list[str]] = {}
         for ip, key in self._active_streams.items():
             if key[0] == client_id:
@@ -2152,9 +2215,42 @@ class HelperServer:
         if mode == stream_session.V2:
             pkt = protocol.build_stream_end_v2(
                 seq, identity.boot_id, identity.ticket, identity.generation)
+            self._stream_send(ip, pkt)
+            asyncio.get_running_loop().create_task(self._repeat_stream_end(ip, pkt))
         else:
             pkt = protocol.build_stream_end(seq=seq)
-        self._stream_send(ip, pkt, legacy_end=mode != stream_session.V2)
+            self._stream_send(ip, pkt, legacy_end=True)
+
+    async def _repeat_stream_end(self, ip: str, pkt: bytes) -> None:
+        """Resend a v2 END (see STREAM_END_REPEATS). A newer session on the
+        same device is unaffected: its generation is greater, and v2 firmware
+        ignores a lower END."""
+        for _ in range(STREAM_END_REPEATS):
+            await asyncio.sleep(STREAM_END_REPEAT_INTERVAL_S)
+            self.udp.send_raw(pkt, ip)
+
+    async def _notify_stream_displaced(
+        self, displaced: dict[tuple[int, str], list[str]], by: tuple[int, str],
+    ) -> None:
+        """Tell each client whose stream lost devices to a newer BEGIN.
+
+        ``same_client`` is true when the newer stream came from the same
+        connection, i.e. the client replaced its own stream on purpose and
+        should not take the devices back."""
+        for (client_id, stream_id), ips in displaced.items():
+            ws = next((c for c in self._clients if id(c) == client_id), None)
+            if ws is None or stream_id == "<implicit>":
+                continue
+            msg = {"type": "stream_displaced", "payload": {
+                "stream_id": stream_id,
+                "targets": ips,
+                "by": by[1],
+                "same_client": client_id == by[0],
+            }}
+            try:
+                await ws.send(json.dumps(msg))
+            except ConnectionClosed:
+                pass
 
     def _stream_send(self, ip: str, pkt: bytes, legacy_end: bool = False) -> None:
         """Send a stream packet now, or queue it behind a legacy guard."""
@@ -2226,15 +2322,17 @@ class HelperServer:
                 ack_payload["stream_id"] = key[1]
             await ws.send(json.dumps({"type": "stream_ack", "payload": ack_payload}))
             return
-        displaced = {
-            active for ip in targets
-            if (active := self._active_streams.get(ip)) is not None
-            and active != key
-        }
+        displaced: dict[tuple[int, str], list[str]] = {}
+        for ip in targets:
+            active = self._active_streams.get(ip)
+            if active is not None and active != key:
+                displaced.setdefault(active, []).append(ip)
         for ip in targets:
             self._active_streams[ip] = key
-        for old_key in displaced:
+        for old_key, ips in displaced.items():
             self._drop_sequence_if_unused(old_key)
+            logger.info("stream %s displaced by %s on %s", old_key[1], key[1], ips)
+        self._orphan_notified.discard(key)
 
         self._stream_sequences[key] = 0
         begin = {
@@ -2246,11 +2344,14 @@ class HelperServer:
             "target": str(payload.get("target", "")),
         }
         leases = self.udp.stream_leases
+        started: list[str] = []
         for ip in targets:
             chosen = leases.begin_session(ip)
             if chosen is None:  # lost its lease while we waited
                 self._active_streams.pop(ip, None)
+                deferred.append(ip)
                 continue
+            started.append(ip)
             mode, identity = chosen
             # A guarded start still waiting is replaced, unsent packets and all.
             replaced = self._legacy_delayed.pop(ip, None)
@@ -2271,12 +2372,31 @@ class HelperServer:
                     delayed.task = asyncio.create_task(self._run_delayed_legacy(ip, delayed))
                     continue
             self.udp.send_raw(pkt, ip)
-        ack_payload = {"status": "ok", "targets": targets}
+        logger.info("stream %s begin on %s%s", key[1], started,
+                    f" (deferred {deferred})" if deferred else "")
+        ack_payload = {"status": "ok" if started else "no_target", "targets": started}
         if deferred:
             ack_payload["deferred"] = deferred
         if "stream_id" in payload:
             ack_payload["stream_id"] = key[1]
         await ws.send(json.dumps({"type": "stream_ack", "payload": ack_payload}))
+        if displaced:
+            await self._notify_stream_displaced(displaced, key)
+
+    async def _note_stream_orphan(self, ws, key: tuple[int, str], kind: str) -> None:
+        """DATA/END from a stream that owns no device (displaced, deferred or
+        never begun). Counted for the health line; the client is told once per
+        stream with ``stream_ack`` status ``no_session`` so it can BEGIN again."""
+        self._stream_orphans_since_health += 1
+        if key in self._orphan_notified or key[1] == "<implicit>":
+            return
+        self._orphan_notified.add(key)
+        logger.info("stream %s: %s with no session (displaced or never begun)", key[1], kind)
+        try:
+            await ws.send(json.dumps({"type": "stream_ack", "payload": {
+                "status": "no_session", "stream_id": key[1]}}))
+        except ConnectionClosed:
+            pass
 
     async def _handle_stream_data(self, ws, payload: dict) -> None:
         key = self._stream_key(ws, payload)
@@ -2284,6 +2404,7 @@ class HelperServer:
             return
         targets = self._matching_stream_targets(key, payload)
         if not targets:
+            await self._note_stream_orphan(ws, key, "DATA")
             return
         offset = int(payload.get("offset", 0))
         data_b64 = payload.get("data", "")
@@ -2318,6 +2439,7 @@ class HelperServer:
             return
         targets = self._matching_stream_targets(key, payload)
         if not targets:
+            await self._note_stream_orphan(ws, key, "END")
             return
         seq = self._stream_sequences.get(key, 0) + 1
         self._stream_sequences[key] = seq
@@ -2326,6 +2448,7 @@ class HelperServer:
             if self._active_streams.get(ip) == key:
                 self._active_streams.pop(ip, None)
         self._drop_sequence_if_unused(key)
+        logger.info("stream %s end on %s", key[1], targets)
 
     # ── Agent relay (MCP server ⇄ Studio) ────────────────────
 
