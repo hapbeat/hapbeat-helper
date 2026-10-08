@@ -116,8 +116,16 @@ def _raise_priority_if_lowered() -> None:
         return
     try:
         import ctypes
+        from ctypes import wintypes
 
         kernel32 = ctypes.windll.kernel32
+        # Without these, the -1 pseudo-handle goes out as a 32-bit int and
+        # every call fails on 64-bit Python.
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+        kernel32.GetPriorityClass.restype = wintypes.DWORD
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
         normal = 0x00000020  # NORMAL_PRIORITY_CLASS
         lowered = (0x00004000, 0x00000040)  # BELOW_NORMAL / IDLE
         handle = kernel32.GetCurrentProcess()
