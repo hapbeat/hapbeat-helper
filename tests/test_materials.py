@@ -321,6 +321,107 @@ def test_cli_ingest_list_show_credits(tmp_path, downloads, zones, monkeypatch, c
     assert capsys.readouterr().out.strip() == str(root)
 
 
+FS_PAGE = "https://freesound.org/people/kyles/sounds/637252/"
+FS_HQ = "https://cdn.freesound.org/previews/637/637252_1-hq.mp3"
+
+
+def test_ingest_given_source_overrides_zone(store, downloads, zones):
+    src = _write(downloads / "freesound-637252.mp3", b"fs")
+    zones["freesound-637252.mp3"] = _zone(MAOU_PAGE)  # given source wins over the mark
+    source = materials.IngestSource(
+        url=FS_HQ, page=FS_PAGE, original_name="boxing gloves small hits.flac", note="HQ preview",
+    )
+
+    result = store.ingest_paths([src], source=source)
+
+    rec = result.new[0]
+    assert rec["site"] == "freesound.org"
+    assert rec["referrerUrl"] == FS_PAGE and rec["hostUrl"] == FS_HQ
+    assert rec["originalName"] == "boxing gloves small hits.flac"
+    assert rec["note"] == "HQ preview"
+    assert rec["storePath"].endswith("/freesound-637252.mp3")  # local name kept in store
+    entry = store.resolve(_sha(b"fs"))["originals"][0]
+    assert entry["note"] == "HQ preview" and entry["needsReview"]  # perAsset
+
+
+def test_ingest_given_url_only_decides_site_and_zip_name(store, downloads, zones):
+    zpath = downloads / "k.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("Audio/hit.ogg", b"hit")
+    source = materials.IngestSource(
+        url="https://kenney.nl/media/pages/assets/impact-sounds/x.zip",
+        original_name="kenney_impact-sounds.zip",
+    )
+    rec = store.ingest_paths([zpath], source=source).new[0]
+    assert rec["site"] == "kenney.nl" and rec["referrerUrl"] is None
+    assert rec["originalName"] == "hit.ogg"
+    assert rec["archive"]["originalName"] == "kenney_impact-sounds.zip"
+
+
+def test_ingest_note_only_keeps_zone(store, downloads, zones):
+    src = _write(downloads / "a.wav", b"a")
+    zones["a.wav"] = _zone(MAOU_PAGE)
+    rec = store.ingest_paths([src], source=materials.IngestSource(note="n")).new[0]
+    assert rec["site"] == "maou.audio" and rec["note"] == "n"
+
+
+def test_credits_shows_redistribution_note(store, downloads, zones):
+    a, _ = _ingest_two(store, downloads, zones)
+    md = store.credits_markdown([("x.wav", a)], "t")
+    assert "クレジット: 魔王魂\n注意: 素材単品のままの再配布は不可" in md
+
+
+def test_cli_ingest_files_derive_show(tmp_path, downloads, zones, monkeypatch, capsys):
+    root = tmp_path / "HapbeatMaterials"
+    monkeypatch.setattr(materials, "default_materials_dir", lambda config=None: root)
+    raw = _write(downloads / "freesound-637252.mp3", b"raw")
+    cut = _write(downloads / "punch_glove-cut.wav", b"cut")
+
+    # Source flags need FILES; --original-name needs exactly one.
+    assert cli.main(["materials", "ingest", "--page", FS_PAGE]) == 2
+    assert cli.main(["materials", "ingest", str(raw), str(cut), "--original-name", "x"]) == 2
+    assert cli.main(["materials", "ingest", str(raw), "--page", "freesound.org/x"]) == 2
+    capsys.readouterr()
+
+    assert cli.main([
+        "materials", "ingest", str(raw), "--page", FS_PAGE, "--url", FS_HQ,
+        "--original-name", "boxing gloves small hits slides.flac", "--note", "HQ preview mp3",
+    ]) == 0
+    assert "new 1" in capsys.readouterr().out
+    assert cli.main([
+        "materials", "set-license", "--sha", _sha(b"raw"), "--license-id", "CC0-1.0",
+        "--url", FS_PAGE, "--verified",
+    ]) == 0
+    capsys.readouterr()
+
+    # Unknown parent -> refused, nothing written.
+    assert cli.main(["materials", "derive", str(cut), "--from", "a" * 64, "--tool", "t"]) == 2
+    args = ["materials", "derive", str(cut), "--from", str(raw),
+            "--tool", "ffmpeg+numpy (agent)", "--note", "cut at 1.968 s"]
+    assert cli.main(args) == 0
+    assert capsys.readouterr().out.startswith("derived: punch_glove-cut.wav")
+    assert cli.main(args) == 0  # same file + parents -> not recorded twice
+    assert capsys.readouterr().out.startswith("already registered")
+    assert sum(r["format"] == "hapbeat-derived@1" for r in MaterialStore(root).read_ledger()) == 1
+
+    assert cli.main(["materials", "show", str(cut)]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["kind"] == "derived"
+    orig = shown["originals"][0]
+    assert orig["referrerUrl"] == FS_PAGE and orig["hostUrl"] == FS_HQ
+    assert orig["originalName"] == "boxing gloves small hits slides.flac"
+    assert orig["license"]["id"] == "CC0-1.0" and not orig["needsReview"]
+    assert shown["derivedFrom"][0]["parents"] == [_sha(b"raw")]
+    assert shown["derivedFrom"][0]["note"] == "cut at 1.968 s"
+
+    assert cli.main([
+        "materials", "set-license", "--site", "elevenlabs.io", "--license-id", "ElevenLabs-paid",
+        "--redistribution-note", "素材単体の公開不可", "--no-attribution", "--verified",
+    ]) == 0
+    lic = MaterialStore(root).load_sites()["elevenlabs.io"]["license"]
+    assert lic["redistributionNote"] == "素材単体の公開不可" and lic["verified"] is True
+
+
 def test_config_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(materials.update_check, "config_dir", lambda: tmp_path)
     assert materials.watch_downloads_enabled() is False

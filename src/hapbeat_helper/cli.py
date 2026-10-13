@@ -9,7 +9,7 @@ Subcommands:
 - ``logs [-f] [-n N]``                    show log file + tail recent lines
 - ``ota <target> <bin>``                  push a firmware app image over Wi-Fi
 - ``mcp [--port 7703]``                   MCP server (stdio) for AI agents, relayed via the daemon
-- ``materials <ingest|list|show|set-license|credits|where>``  material ledger (sound sources + licenses)
+- ``materials <ingest|derive|list|show|set-license|credits|where>``  material ledger (sound sources + licenses)
 - ``install-service``                     register as OS auto-start service (Task Scheduler on Windows / launchd on macOS)
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
@@ -415,19 +415,56 @@ def _license_brief(entry: dict) -> str:
     return f"{entry['site']} · {lic['id']}{flag}"
 
 
+def _is_http_url(value: str) -> bool:
+    return value.lower().startswith(("http://", "https://"))
+
+
 def _cmd_materials_ingest(args: argparse.Namespace) -> int:
     from hapbeat_helper import materials
 
     store = _material_store()
-    directory = Path(args.dir).expanduser() if args.dir else materials.default_downloads_dir()
-    if not directory.is_dir():
-        print(f"error: not a directory: {directory}", file=sys.stderr)
-        return 2
-    since_ts = None if args.since is None else time.time() - args.since * 86400
-    result = store.ingest_dir(directory, since_ts=since_ts, dry_run=args.dry_run)
+    given = any(v is not None for v in (args.url, args.page, args.original_name, args.note))
+    if args.files:
+        if args.dir or args.since is not None:
+            print("error: FILES cannot be combined with --dir / --since", file=sys.stderr)
+            return 2
+        if args.original_name is not None and len(args.files) != 1:
+            print("error: --original-name needs exactly one FILE", file=sys.stderr)
+            return 2
+        for flag, value in (("--url", args.url), ("--page", args.page)):
+            if value is not None and not _is_http_url(value):
+                print(f"error: {flag} must be an http(s) URL: {value}", file=sys.stderr)
+                return 2
+        paths = [Path(f).expanduser() for f in args.files]
+        for path in paths:
+            ext = path.suffix.lower()
+            if not path.is_file() or (
+                ext not in materials.AUDIO_EXTS and ext not in materials.ARCHIVE_EXTS
+            ):
+                print(f"error: not an audio or zip file: {path}", file=sys.stderr)
+                return 2
+        source = materials.IngestSource(
+            url=args.url, page=args.page, original_name=args.original_name, note=args.note,
+        )
+        result = store.ingest_paths(paths, dry_run=args.dry_run, source=source)
+        label = paths[0].name if len(paths) == 1 else f"{len(paths)} files"
+    else:
+        if given:
+            print(
+                "error: --url / --page / --original-name / --note need FILES",
+                file=sys.stderr,
+            )
+            return 2
+        directory = Path(args.dir).expanduser() if args.dir else materials.default_downloads_dir()
+        if not directory.is_dir():
+            print(f"error: not a directory: {directory}", file=sys.stderr)
+            return 2
+        since_ts = None if args.since is None else time.time() - args.since * 86400
+        result = store.ingest_dir(directory, since_ts=since_ts, dry_run=args.dry_run)
+        label = str(directory)
     prefix = "(dry run) " if args.dry_run else ""
     print(
-        f"{prefix}{directory}: new {len(result.new)} / duplicate "
+        f"{prefix}{label}: new {len(result.new)} / duplicate "
         f"{len(result.duplicates)} / needs review {len(result.needs_review)}"
     )
     review = {r["sha256"] for r in result.needs_review}
@@ -447,6 +484,49 @@ def _cmd_materials_ingest(args: argparse.Namespace) -> int:
     return 1 if result.errors else 0
 
 
+def _sha_of(target: str) -> str | None:
+    """sha256 given directly, or of the file at *target* (None when neither)."""
+    from hapbeat_helper import materials
+
+    if materials.is_sha256(target.lower()):
+        return target.lower()
+    path = Path(target).expanduser()
+    if not path.is_file():
+        return None
+    return materials.sha256_file(path)
+
+
+def _cmd_materials_derive(args: argparse.Namespace) -> int:
+    path = Path(args.file).expanduser()
+    if not path.is_file():
+        print(f"error: not a file: {args.file}", file=sys.stderr)
+        return 2
+    store = _material_store()
+    sha = _sha_of(str(path))
+    parents: list[str] = []
+    for raw in args.parents:
+        parent = _sha_of(raw)
+        if parent is None:
+            print(f"error: --from is not a file or sha256: {raw}", file=sys.stderr)
+            return 2
+        if parent == sha:
+            print(f"error: --from is the file itself: {raw}", file=sys.stderr)
+            return 2
+        # A parent the ledger does not know would leave the lineage dangling.
+        if store.resolve(parent)["kind"] == "unknown":
+            print(
+                f"error: --from is not in the ledger (ingest or derive it first): {raw}",
+                file=sys.stderr,
+            )
+            return 2
+        if parent not in parents:
+            parents.append(parent)
+    added = store.register_derived(sha, parents, args.tool, name=path.name, note=args.note)
+    state = "derived" if added else "already registered"
+    print(f"{state}: {path.name} ({sha[:12]}) <- " + ", ".join(p[:12] for p in parents))
+    return 0
+
+
 def _cmd_materials_list(args: argparse.Namespace) -> int:
     entries = _material_store().list_materials(
         needs_review=args.needs_review, site=args.site,
@@ -458,19 +538,21 @@ def _cmd_materials_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_materials_show(args: argparse.Namespace) -> int:
-    from hapbeat_helper import materials
-
     target = args.target
-    if materials.is_sha256(target.lower()):
-        sha = target.lower()
-    else:
-        path = Path(target).expanduser()
-        if not path.is_file():
-            print(f"error: not a file or sha256: {target}", file=sys.stderr)
-            return 2
-        sha = materials.sha256_file(path)
-    result = _material_store().resolve(sha)
-    print(json.dumps({"sha256": sha, **result}, ensure_ascii=False, indent=2))
+    sha = _sha_of(target)
+    if sha is None:
+        print(f"error: not a file or sha256: {target}", file=sys.stderr)
+        return 2
+    store = _material_store()
+    result = store.resolve(sha)
+    out = {"sha256": sha, **result}
+    if result["kind"] == "derived":
+        # How this file was made (its own records; the originals are resolved above).
+        out["derivedFrom"] = [
+            {k: rec.get(k) for k in ("parents", "tool", "name", "note", "createdAt")}
+            for rec in store.derivations(sha)
+        ]
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -486,6 +568,7 @@ def _cmd_materials_set_license(args: argparse.Namespace) -> int:
         "url": args.url,
         "creditText": args.credit,
         "attributionRequired": attribution,
+        "redistributionNote": args.redistribution_note,
         "verified": args.verified,
     }
     store = _material_store()
@@ -659,11 +742,31 @@ def _build_parser() -> argparse.ArgumentParser:
     sub_mat = p_mat.add_subparsers(dest="materials_cmd")
 
     p_ingest = sub_mat.add_parser(
-        "ingest", help="copy new audio / zip downloads into the ledger",
+        "ingest", help="copy new audio / zip downloads (or the given FILES) into the ledger",
+        description=(
+            "Without FILES, scan a folder and read the source from the browser's "
+            "download mark (Zone.Identifier). With FILES (audio or zip), register "
+            "exactly those; --url / --page / --original-name / --note give the "
+            "source for files fetched without a browser (curl, scripts) and take "
+            "precedence over the download mark. The site is the domain of --page "
+            "(else --url)."
+        ),
+    )
+    p_ingest.add_argument(
+        "files", nargs="*", metavar="FILES", help="audio / zip files to register",
     )
     p_ingest.add_argument(
         "--dir", help="folder to scan (default: ~/Downloads, top level only)",
     )
+    p_ingest.add_argument("--url", help="download URL of FILES (recorded as hostUrl)")
+    p_ingest.add_argument(
+        "--page", help="material page URL of FILES (recorded as referrerUrl; decides the site)",
+    )
+    p_ingest.add_argument(
+        "--original-name", metavar="NAME",
+        help="file name / title at the source (one FILE only; the store keeps the local name)",
+    )
+    p_ingest.add_argument("--note", metavar="TEXT", help="free text kept with each record")
     p_ingest.add_argument(
         "--since", type=float, metavar="DAYS",
         help="only files modified in the last DAYS days "
@@ -673,6 +776,25 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="show what would be ingested; write nothing",
     )
     p_ingest.set_defaults(func=_cmd_materials_ingest)
+
+    p_derive = sub_mat.add_parser(
+        "derive",
+        help="record that FILE was made from other files (cut, normalized, mixed...)",
+        description=(
+            "Register FILE as derived from each --from (a file or sha256 already in "
+            "the ledger). The same FILE + parents is not recorded twice."
+        ),
+    )
+    p_derive.add_argument("file", metavar="FILE")
+    p_derive.add_argument(
+        "--from", dest="parents", action="append", required=True, metavar="FILE_OR_SHA",
+        help="source file or sha256 (repeat for several)",
+    )
+    p_derive.add_argument(
+        "--tool", required=True, help="what made it, e.g. 'ffmpeg+numpy (agent)'",
+    )
+    p_derive.add_argument("--note", metavar="TEXT", help="what was done")
+    p_derive.set_defaults(func=_cmd_materials_derive)
 
     p_list = sub_mat.add_parser("list", help="list ingested materials")
     p_list.add_argument("--needs-review", action="store_true", help="only those needing review")
@@ -700,6 +822,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_setlic.add_argument(
         "--attribution", action=argparse.BooleanOptionalAction, default=None,
         help="attribution required (default: yes for CC-BY*, no otherwise)",
+    )
+    p_setlic.add_argument(
+        "--redistribution-note", metavar="TEXT",
+        help="limits on redistribution, shown in CREDITS.md",
     )
     p_setlic.add_argument(
         "--verified", action="store_true", help="checked against the site's own terms",

@@ -320,6 +320,21 @@ class _Candidate:
     zone: dict[str, Optional[str]]
     data: Optional[bytes] = None  # zip member bytes; None = copy *source*
     archive: Optional[dict[str, Any]] = None
+    store_name: Optional[str] = None  # file name in store/; None = original_name
+
+
+@dataclass
+class IngestSource:
+    """Source given by the caller (CLI) instead of the browser's download mark.
+
+    Used for files an agent fetched with curl / a script, which carry no
+    ``Zone.Identifier``. When *url* or *page* is set, both replace the mark.
+    """
+
+    url: Optional[str] = None  # the download URL -> hostUrl
+    page: Optional[str] = None  # the material's page -> referrerUrl (decides the site)
+    original_name: Optional[str] = None  # name / title at the source (one file only)
+    note: Optional[str] = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -477,6 +492,7 @@ class MaterialStore:
             "hostUrl": rec.get("hostUrl"),
             "originalName": rec.get("originalName"),
             "storePath": rec.get("storePath"),
+            "note": rec.get("note"),
             "license": lic,
             "needsReview": needs_review,
         }
@@ -522,6 +538,11 @@ class MaterialStore:
 
         walk(sha, 0)
         return {"kind": "derived", "originals": originals}
+
+    def derivations(self, sha: str) -> list[dict[str, Any]]:
+        """Derived records of *sha* (how it was made), ledger order."""
+        _, derived, _ = self._index()
+        return list(derived.get(sha, []))
 
     def display_name(self, sha: str) -> str:
         """Best label for a bare hash: derived name, original name, short hash."""
@@ -612,9 +633,15 @@ class MaterialStore:
             out.append(p)
         return out
 
-    def _candidates_for(self, path: Path) -> list[_Candidate]:
+    def _candidates_for(
+        self, path: Path, source: Optional[IngestSource] = None,
+    ) -> list[_Candidate]:
         st = path.stat()
-        zone = read_zone_identifier(path)
+        if source is not None and (source.url or source.page):
+            zone: dict[str, Optional[str]] = {"hostUrl": source.url, "referrerUrl": source.page}
+        else:
+            zone = read_zone_identifier(path)
+        given_name = source.original_name if source is not None else None
         if path.suffix.lower() in ARCHIVE_EXTS:
             archive_sha = sha256_file(path)
             out: list[_Candidate] = []
@@ -639,7 +666,7 @@ class MaterialStore:
                         data=data,
                         archive={
                             "sha256": archive_sha,
-                            "originalName": path.name,
+                            "originalName": given_name or path.name,
                             "member": info.filename,
                         },
                     ))
@@ -648,13 +675,23 @@ class MaterialStore:
             source=path,
             sha256=sha256_file(path),
             size=st.st_size,
-            original_name=path.name,
+            original_name=given_name or path.name,
             mtime=st.st_mtime,
             zone=zone,
+            store_name=path.name,
         )]
 
-    def ingest_paths(self, paths: Iterable[Path], dry_run: bool = False) -> IngestResult:
-        """Register *paths* (audio files or zips) as originals. Copies, never moves."""
+    def ingest_paths(
+        self,
+        paths: Iterable[Path],
+        dry_run: bool = False,
+        source: Optional[IngestSource] = None,
+    ) -> IngestResult:
+        """Register *paths* (audio files or zips) as originals. Copies, never moves.
+
+        *source* (url / page / original name / note) replaces the download mark
+        for every path; ``original_name`` is meant for a single path.
+        """
         result = IngestResult()
         with self._lock:
             materials, _, overrides = self._index()
@@ -666,7 +703,7 @@ class MaterialStore:
             for path in paths:
                 path = Path(path)
                 try:
-                    candidates = self._candidates_for(path)
+                    candidates = self._candidates_for(path, source)
                 except (OSError, zipfile.BadZipFile) as exc:
                     result.errors.append({"path": str(path), "error": str(exc)})
                     continue
@@ -680,7 +717,7 @@ class MaterialStore:
                         continue
                     host = _host_of(cand.zone["referrerUrl"]) or _host_of(cand.zone["hostUrl"])
                     site = canonical_site(host, sites)
-                    rel = Path("store") / site / month / cand.original_name
+                    rel = Path("store") / site / month / (cand.store_name or cand.original_name)
                     if not dry_run:
                         try:
                             dest = _unique_path(self.root / rel)
@@ -707,6 +744,7 @@ class MaterialStore:
                         "referrerUrl": cand.zone["referrerUrl"],
                         "archive": cand.archive,
                         "site": site,
+                        "note": source.note if source is not None else None,
                     }
                     if not dry_run:
                         self._append(record)
@@ -851,6 +889,8 @@ class MaterialStore:
             lines.append(heading)
             if lic.get("creditText"):
                 lines.append(f"クレジット: {lic['creditText']}")
+            if lic.get("redistributionNote"):
+                lines.append(f"注意: {lic['redistributionNote']}")
             lines += group["lines"]
             lines.append("")
         if unknown:

@@ -292,6 +292,11 @@ from the ledger.
 hapbeat-helper materials ingest --dry-run      # what would be taken from ~/Downloads
 hapbeat-helper materials ingest                # copy new audio / zip downloads into the ledger
 hapbeat-helper materials ingest --dir D:\sfx --since 90
+hapbeat-helper materials ingest raw\fs-637252.mp3 --page https://freesound.org/people/kyles/sounds/637252/ \
+    --url https://cdn.freesound.org/previews/637/637252_...-hq.mp3 \
+    --original-name "boxing gloves small hits slides.flac" --note "HQ preview mp3"
+hapbeat-helper materials derive punch-cut.wav --from raw\fs-637252.mp3 \
+    --tool "ffmpeg+numpy" --note "1 hit cut at 1.968 s, -1 dBFS"
 hapbeat-helper materials list --needs-review   # materials whose license is unknown
 hapbeat-helper materials list --site maou.audio
 hapbeat-helper materials show path\to\gunshot.wav   # or a sha256
@@ -311,8 +316,22 @@ hapbeat-helper materials where                 # print the materials dir
 - The source is read from the Windows download mark (`Zone.Identifier`:
   `ReferrerUrl` / `HostUrl`). Without it (other OS, file not from a browser) the
   site is `_unknown`.
+- `ingest FILES...` registers exactly those audio / zip files (no folder scan).
+  For files fetched without a browser (curl, scripts, AI agents) give the source:
+  `--page` (material page, stored as `referrerUrl`) and `--url` (download URL,
+  stored as `hostUrl`) replace the download mark, and the site is the domain of
+  `--page` (else `--url`). `--original-name` (one file only) is the name or
+  title at the source — the store copy keeps the local file name; for a zip it
+  names the archive. `--note` is kept with each record.
+- `derive FILE --from FILE_OR_SHA [--from ...] --tool TOOL [--note TEXT]` records
+  a file made from ledger entries (cut, normalized, mixed). Every `--from` must
+  already be in the ledger; the same FILE + parents is recorded once.
+- `show` on a derived file lists the originals reached through its parents
+  (page, download URL, original name, note, license) plus its own
+  `derivedFrom` records.
 - `set-license --site` edits `sites.json`; `--sha` appends a per-file override.
   `--attribution / --no-attribution` defaults to yes for `CC-BY*` ids.
+  `--redistribution-note` is printed as `注意:` under the license in `CREDITS.md`.
 
 ### Materials dir
 
@@ -350,7 +369,7 @@ present. Invalid payloads get the same reply type with an `error` string.
 
 | type | payload | reply |
 |---|---|---|
-| `material_lookup` | `{ requestId?, sha256s: string[] (≤ 500) }` | `material_lookup_result { requestId?, results: { <sha>: { kind: "material" \| "derived" \| "unknown", originals: [{ sha256, site, referrerUrl, hostUrl, originalName, storePath, license, needsReview }] } } }` |
+| `material_lookup` | `{ requestId?, sha256s: string[] (≤ 500) }` | `material_lookup_result { requestId?, results: { <sha>: { kind: "material" \| "derived" \| "unknown", originals: [{ sha256, site, referrerUrl, hostUrl, originalName, storePath, note, license, needsReview }] } } }` |
 | `material_register_derived` | `{ requestId?, sha256, parents: string[] (1–64), tool, name?, note? }` | `material_register_derived_result { requestId?, ok }` — an identical sha256 + parents record is not appended twice |
 | `material_credits` | `{ requestId?, sha256s: string[] (≤ 500), toolName }` | `material_credits_result { requestId?, markdown }` |
 
