@@ -7,6 +7,13 @@
 
 ### Added
 
+- `scene build`: ゲームの録画（`session.json` と PNG 連番か動画）から
+  `<プロジェクト>/Saved/HapticViewer/` に `full_replay.mp4`・`viewer-data.json`・
+  `viewer-lib.json` を書く（hapbeat-contracts `specs/scene-recording.md`）。
+  同じフォルダの `studio-scene-ui.json` などは残す。ffmpeg（libx264）が必要。
+- `cues validate`: cue 表を schema と `specs/cue-table.md` §6 の規則で検証する
+  （標準ライブラリのみ）。WAV の有無は viewer-lib の `paths` が分かる時だけ確かめる。
+
 - ストリームを別のストリームに奪われたクライアントへ `stream_displaced`
   （`{"stream_id", "targets": [ip…], "by": <新しい stream_id>, "same_client": bool}`）を送る。
   どのデバイスも持っていないストリームの DATA / END には、そのストリームにつき 1 回だけ

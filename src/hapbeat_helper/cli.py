@@ -10,6 +10,8 @@ Subcommands:
 - ``ota <target> <bin>``                  push a firmware app image over Wi-Fi
 - ``mcp [--port 7703]``                   MCP server (stdio) for AI agents, relayed via the daemon
 - ``materials <ingest|derive|list|show|set-license|credits|where>``  material ledger (sound sources + licenses)
+- ``scene build --session <session.json>``  recording -> Saved/HapticViewer/ for Studio's Scene tab
+- ``cues validate <cue-table.json>``      check a cue table (schema + cue-table spec section 6)
 - ``install-service``                     register as OS auto-start service (Task Scheduler on Windows / launchd on macOS)
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
@@ -611,6 +613,70 @@ def _cmd_materials_where(_args: argparse.Namespace) -> int:
     return 0
 
 
+# ── scene / cues ─────────────────────────────────────────────
+
+
+def _cmd_scene_build(args: argparse.Namespace) -> int:
+    """Exit codes: 0 built / 1 bad session, missing input or ffmpeg failure / 2 bad argument."""
+    from hapbeat_helper import scene_build
+
+    session = Path(args.session).expanduser()
+    root = Path(args.project_root).expanduser() if args.project_root else Path.cwd()
+    if not session.is_file():
+        print(f"error: not a file: {args.session}", file=sys.stderr)
+        return 2
+    if not root.is_dir():
+        print(f"error: not a directory: {root}", file=sys.stderr)
+        return 2
+    try:
+        result = scene_build.build(session, root, ffmpeg=args.ffmpeg, keep_frames=args.keep_frames)
+    except scene_build.SceneBuildError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for warning in result.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    print(f"built {result.out_dir}: {result.frames} frames, {result.events} events")
+    return 0
+
+
+def _cmd_cues_validate(args: argparse.Namespace) -> int:
+    """Exit codes: 0 valid / 1 problems found / 2 unreadable input."""
+    from hapbeat_helper import cue_table
+
+    path = Path(args.table).expanduser()
+    try:
+        table = cue_table.load_json(path)
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read {args.table}: {exc}", file=sys.stderr)
+        return 2
+    root = Path(args.project_root).expanduser() if args.project_root else Path.cwd()
+    lib_path = None
+    if args.viewer_lib:
+        lib_path = Path(args.viewer_lib).expanduser()
+    elif args.project_root:
+        candidate = root / "Saved" / "HapticViewer" / "viewer-lib.json"
+        if candidate.is_file():
+            lib_path = candidate
+    clips_dir = sounds_dir = None
+    if lib_path is not None:
+        try:
+            paths = cue_table.load_json(lib_path).get("paths")
+            clips_dir, sounds_dir = root / paths["clips"], root / paths["sounds"]
+        except (OSError, ValueError, AttributeError, KeyError, TypeError) as exc:
+            print(f"error: cannot read paths.clips / paths.sounds from {lib_path}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        print("note: WAV checks skipped (no --viewer-lib, no viewer-lib.json under --project-root)")
+    problems = cue_table.validate_cue_table(table, clips_dir, sounds_dir)
+    for problem in problems:
+        print(problem)
+    if problems:
+        return 1
+    cues = table.get("cues", {}) if isinstance(table, dict) else {}
+    print(f"OK ({len(cues)} cues)")
+    return 0
+
+
 def _add_verbose(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="debug logging",
@@ -840,6 +906,55 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_where = sub_mat.add_parser("where", help="print the materials dir")
     p_where.set_defaults(func=_cmd_materials_where)
+
+    p_scene = sub.add_parser(
+        "scene",
+        help="Scene recordings for Hapbeat Studio's Scene tab (try: scene build)",
+    )
+    sub_scene = p_scene.add_subparsers(dest="scene_cmd")
+    p_sbuild = sub_scene.add_parser(
+        "build",
+        help="session.json + screen -> <project>/Saved/HapticViewer/",
+        description=(
+            "Read a recording's session.json (hapbeat-contracts "
+            "specs/scene-recording.md section 2), check it, and write "
+            "full_replay.mp4, viewer-data.json and viewer-lib.json to "
+            "<project-root>/Saved/HapticViewer/. Other files there are kept. "
+            "Paths in session.json are relative to the project root. "
+            "The frames folder is deleted after a successful build unless "
+            "--keep-frames."
+        ),
+    )
+    p_sbuild.add_argument("--session", required=True, help="the recording's session.json")
+    p_sbuild.add_argument(
+        "--project-root", metavar="DIR", help="game project root (default: the current directory)",
+    )
+    p_sbuild.add_argument(
+        "--ffmpeg", metavar="PATH", help="ffmpeg executable with libx264 (default: ffmpeg on PATH)",
+    )
+    p_sbuild.add_argument(
+        "--keep-frames", action="store_true", help="keep the PNG frames folder after the build",
+    )
+    p_sbuild.set_defaults(func=_cmd_scene_build)
+
+    p_cues = sub.add_parser("cues", help="cue table tools (try: cues validate)")
+    sub_cues = p_cues.add_subparsers(dest="cues_cmd")
+    p_cvalidate = sub_cues.add_parser(
+        "validate",
+        help="check a cue table (schema + hapbeat-contracts specs/cue-table.md section 6)",
+        description=(
+            "Print each problem on its own line (exit 1), or 'OK (<n> cues)' (exit 0). "
+            "The WAV checks run only when the clip / sound folders are known: "
+            "from --viewer-lib, or <project-root>/Saved/HapticViewer/viewer-lib.json. "
+            "Its paths are relative to the project root (default: the current directory)."
+        ),
+    )
+    p_cvalidate.add_argument("table", metavar="CUE_TABLE", help="the cue table JSON")
+    p_cvalidate.add_argument("--project-root", metavar="DIR", help="game project root")
+    p_cvalidate.add_argument(
+        "--viewer-lib", metavar="PATH", help="viewer-lib.json whose paths.clips / paths.sounds hold the WAVs",
+    )
+    p_cvalidate.set_defaults(func=_cmd_cues_validate)
 
     p_install = sub.add_parser(
         "install-service",

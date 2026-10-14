@@ -1,0 +1,56 @@
+{
+  "session": {
+    "schema_version": 1,
+    "project": "sample-scene",
+    "fps": 30,
+    "frames": "Saved/HapticRecord/frames",
+    "events": [
+      { "frame": 30, "cue": "footstep:approach", "dist": 1800 },
+      { "frame": 75, "cue": "footstep:approach", "dist": 1200 },
+      { "frame": 120, "cue": "roar", "dist": 900 },
+      { "frame": 180, "cue": "grab", "hand": "right", "gain": 0.9, "note": "right hand on the bone" },
+      { "frame": 200, "cue": "purr" }
+    ],
+    "levels": {
+      "columns": ["rub:level:left", "rub:level:right"],
+      "rows": [[0, 0], [0, 0.4], [0, 0.9], [0, 1.2]]
+    },
+    "lib": {
+      "schema_version": 1,
+      "title": "Sample scene",
+      "project_name": "sample-scene",
+      "paths": { "cues": "Content/Hapbeat/sample-cues.json", "clips": "Content/Hapbeat/stream-clips", "sounds": "Content/Hapbeat/sounds" },
+      "families": [{ "label": "Dinosaur", "color": "#ff8a3d", "cues": ["footstep", "roar"] }],
+      "ticks": ["footstep"],
+      "moment_rules": { "max": { "footstep": 3 }, "min_gap_s": { "footstep": 2 }, "default_max": null },
+      "import_command": "hapbeat import"
+    }
+  },
+  "viewer_lib_minimal": {
+    "schema_version": 1,
+    "title": "Minimal",
+    "project_name": "minimal",
+    "paths": { "cues": "Assets/Haptics/cues.json", "clips": "Assets/Haptics/clips", "sounds": "Assets/Haptics/sounds" }
+  },
+  "viewer_lib_layers": {
+    "schema_version": 1,
+    "title": "Explicit layers",
+    "project_name": "explicit-layers",
+    "paths": { "cues": "cues.json", "clips": "clips", "sounds": "sounds" },
+    "at": ["hand", "pos_neck"],
+    "loop_at": ["hand"],
+    "layers": [{ "cue": "feed_loop", "level": [0, 1], "rate": [2, 3], "colors": ["#4ea1ff", "#ff8a3d"] }, { "cue": "cut_loop", "level": [4, 4], "rate": null, "colors": ["#aaaaaa"] }]
+  },
+  "viewer_data": {
+    "schema_version": 1,
+    "fps": 30,
+    "frames": 240,
+    "video": "full_replay.mp4",
+    "events": [
+      { "t": 1.0, "name": "footstep:approach", "dist": 1800 },
+      { "t": 4.0, "name": "roar", "dist": 900 },
+      { "t": 6.0, "name": "grab", "hand": "right", "gain": 0.9, "note": "right hand on the bone" }
+    ],
+    "levels": { "columns": ["rub:level:left", "rub:level:right"], "rows": [[0, 0], [0, 0.4]] }
+  }
+}

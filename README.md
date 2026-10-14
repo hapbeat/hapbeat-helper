@@ -376,6 +376,27 @@ present. Invalid payloads get the same reply type with an `error` string.
 A derived file resolves to the originals reached through its parents
 (cycles and chains deeper than 32 are cut).
 
+## Scene recordings and cue tables
+
+For Hapbeat Studio's Scene tab (beta). The formats are hapbeat-contracts
+[`specs/scene-recording.md`](https://github.com/hapbeat/hapbeat-contracts/blob/master/specs/scene-recording.md)
+and [`specs/cue-table.md`](https://github.com/hapbeat/hapbeat-contracts/blob/master/specs/cue-table.md).
+
+```bash
+# session.json + PNG frames / video -> <project>/Saved/HapticViewer/
+#   full_replay.mp4, viewer-data.json, viewer-lib.json (other files there are kept)
+hapbeat-helper scene build --session Saved/HapticRecord/session.json     [--project-root <dir>] [--ffmpeg <path>] [--keep-frames]
+
+# check a cue table: one problem per line (exit 1), or "OK (<n> cues)" (exit 0)
+hapbeat-helper cues validate Content/Hapbeat/cues.json [--project-root <dir>] [--viewer-lib <path>]
+```
+
+- `scene build` needs ffmpeg with libx264. Paths in `session.json` are relative
+  to the project root (default: the current directory). The frames folder is
+  deleted after a successful build unless `--keep-frames`.
+- `cues validate` checks the WAVs only when it knows the clip / sound folders:
+  from `--viewer-lib`, or `<project-root>/Saved/HapticViewer/viewer-lib.json`.
+
 ## Verify
 
 Quick smoke test using `websocat`:

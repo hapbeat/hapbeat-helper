@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "kit": "sample-scene-kit",
+  "clips": {
+    "footstep": { "intensity": 0.8, "loop": false, "description": "heavy step", "syncMs": 12 },
+    "roar": { "intensity": 1, "loop": false },
+    "roar_b": { "intensity": 0.9, "loop": false },
+    "grab": { "intensity": 0.6, "loop": false },
+    "purr": { "intensity": 0.4, "loop": false },
+    "rub_loop": { "intensity": 0.5, "loop": true }
+  },
+  "sounds": {
+    "Footstep_A": { "intensity": 0.9, "syncMs": 30 },
+    "Footstep_B": { "intensity": 0.85 },
+    "Roar_A": { "intensity": 1 },
+    "Roar_B": { "intensity": 0.8 },
+    "Rub": { "intensity": 0.5 }
+  },
+  "cues": {
+    "footstep": {
+      "description": "the dinosaur's step",
+      "sfx": { "sounds": ["Footstep_A", "Footstep_B"], "volume": 1 },
+      "haptics": [{ "clip": "footstep", "at": "both", "gain": 1 }],
+      "variation": { "gainJitterDb": 2, "pitchJitterSt": 1, "pick": "random" },
+      "distanceFalloff": { "nearCm": 560, "farCm": 2000, "farGain": 0.15, "curve": "easeOut" },
+      "variants": {
+        "approach": { "description": "walking in", "sfxVolume": 0.6, "hapticsGain": 0.5, "rampTo": 1, "rampCurve": "easeIn" },
+        "leave": { "rampSteps": [1, 0.8, 0.6, 0.4] }
+      },
+      "review": { "sfx": "approved", "haptics": "tentative" }
+    },
+    "roar": {
+      "sfx": { "sounds": ["Roar_A", "Roar_B"], "volume": 1.2 },
+      "haptics": [{ "clips": ["roar", "roar_b"], "at": "pos_neck", "gain": 1 }],
+      "variation": { "paired": true }
+    },
+    "grab": {
+      "sfx": null,
+      "haptics": [{ "clip": "grab", "at": "hand", "gain": 0.8, "alternates": ["purr"] }]
+    },
+    "rub": {
+      "loop": true,
+      "sfx": { "sound": "Rub", "volume": 1, "levelMap": { "points": [[0.5, 0.4], [1.5, 1]], "curve": "easeInOut" } },
+      "haptics": [{ "clip": "rub_loop", "at": "hand", "gain": 1, "levelMap": { "points": [[1, 1]], "intercept": 0.1 } }]
+    },
+    "purr": {
+      "haptics": [{ "at": "pos_neck", "gain": 1, "alternates": ["purr"] }],
+      "emit": { "during": "rub", "intervalSec": 1.5, "jitterPct": 30 }
+    },
+    "bite": {
+      "description": "not decided yet"
+    }
+  }
+}
