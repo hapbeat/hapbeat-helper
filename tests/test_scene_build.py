@@ -176,3 +176,28 @@ def test_build_without_ffmpeg(tmp_path, capsys):
     assert rc == 1
     assert "ffmpeg not found" in capsys.readouterr().err
     assert folder.is_dir()
+
+
+def test_viewer_lib_accepts_variant_names_in_ticks_and_rules():
+    lib = _sample()["viewer_lib_minimal"]
+    lib["ticks"] = ["footstep", "footstep:approach"]
+    lib["moment_rules"] = {"max": {"footstep:approach": 2}, "min_gap_s": {"roar": 1.5}}
+    assert validate_viewer_lib(lib) == []
+    lib["ticks"] = ["footstep:Approach"]
+    assert validate_viewer_lib(lib)
+
+
+def test_remove_frames_leaves_other_files(tmp_path):
+    folder = tmp_path / "frames"
+    folder.mkdir()
+    for n in (0, 1, 12):
+        _png(folder / f"f{n}.png")
+    (folder / "notes.txt").write_text("keep", encoding="utf-8")
+    (folder / "fx.png").write_bytes(b"not a frame")
+    scene_build.remove_frames(folder)
+    assert sorted(p.name for p in folder.iterdir()) == ["fx.png", "notes.txt"]
+    for p in folder.iterdir():
+        p.unlink()
+    _png(folder / "f0.png")
+    scene_build.remove_frames(folder)
+    assert not folder.exists()

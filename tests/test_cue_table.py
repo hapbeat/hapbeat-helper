@@ -266,3 +266,10 @@ def test_cli_with_viewer_lib(capsys, table, tmp_path):
     assert cli.main(["cues", "validate", str(path), "--project-root", str(tmp_path)]) == 1
     lines = capsys.readouterr().out.strip().splitlines()
     assert lines == ["clip grab: " + (tmp_path / "clips").as_posix() + "/grab.wav missing"]
+
+
+def test_variant_cannot_hold_cue_fields(table):
+    for key, value in (("loop", True), ("emit", {"during": "rub", "intervalSec": 1}), ("variants", {})):
+        t = copy.deepcopy(table)
+        t["cues"]["footstep"]["variants"]["approach"][key] = value
+        _one(t, f"a variant cannot have {key}")

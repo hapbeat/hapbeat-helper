@@ -104,8 +104,8 @@ def validate_viewer_lib(lib: Any, label: str = "lib") -> list[str]:
                     err.append(
                         f"{label}.families[{i}] must be {{label, color: #rrggbb, cues: [<cue>[:<variant>]...]}}"
                     )
-    if "ticks" in lib and not _string_list(lib["ticks"], CUE_NAME):
-        err.append(f"{label}.ticks must be a list of cue names")
+    if "ticks" in lib and not _string_list(lib["ticks"], CUE_REF):
+        err.append(f"{label}.ticks must be a list of <cue>[:<variant>]")
     if "layers" in lib:
         layers = lib["layers"]
         if not isinstance(layers, list):
@@ -125,10 +125,12 @@ def validate_viewer_lib(lib: Any, label: str = "lib") -> list[str]:
         rules = lib["moment_rules"]
         ok = _is_record(rules)
         if ok and "max" in rules:
-            ok = _is_record(rules["max"]) and all(_is_int(v) and v >= 1 for v in rules["max"].values())
+            ok = _is_record(rules["max"]) and all(
+                CUE_REF.match(k) and _is_int(v) and v >= 1 for k, v in rules["max"].items()
+            )
         if ok and "min_gap_s" in rules:
             ok = _is_record(rules["min_gap_s"]) and all(
-                is_number(v) and v >= 0 for v in rules["min_gap_s"].values()
+                CUE_REF.match(k) and is_number(v) and v >= 0 for k, v in rules["min_gap_s"].items()
             )
         if ok and "default_max" in rules:
             ok = rules["default_max"] is None or (_is_int(rules["default_max"]) and rules["default_max"] >= 1)
@@ -245,6 +247,21 @@ def build_viewer_data(session: dict, frame_count: int) -> dict:
     if "levels" in session:
         data["levels"] = pad_levels(session["levels"], frame_count)
     return data
+
+
+def remove_frames(frames_dir: Path) -> None:
+    """Delete the recording's f<frame>.png files only, then the folder if that left it empty.
+
+    The folder is meant to hold nothing else (specs/scene-recording.md section 4); anything else in it
+    (or a mistyped ``frames`` such as the project's Saved folder) is left alone.
+    """
+    for png in frames_dir.glob("f*.png"):
+        if FRAME_FILE.fullmatch(png.name):
+            png.unlink()
+    try:
+        frames_dir.rmdir()
+    except OSError:
+        pass  # not empty: other files stay
 
 
 def write_json(path: Path, obj: Any) -> None:
@@ -414,5 +431,5 @@ def build(
     write_json(out_dir / "viewer-data.json", build_viewer_data(session, count))
     write_json(out_dir / "viewer-lib.json", session["lib"])
     if frames_dir is not None and not keep_frames:
-        shutil.rmtree(frames_dir)
+        remove_frames(frames_dir)
     return BuildResult(out_dir=out_dir, frames=count, events=len(session["events"]), warnings=warnings)

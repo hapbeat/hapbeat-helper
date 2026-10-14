@@ -243,6 +243,9 @@ class _Checker:
                 if not _is_record(variant):
                     self.add(f"{label} must be an object")
                     continue
+                for key in ("loop", "emit", "variants"):
+                    if key in variant:
+                        self.add(f"{label}: a variant cannot have {key} (it belongs to the cue)")
                 self.check_fields(name, label, variant)
                 self.check_variant_scale(label, variant)
 
