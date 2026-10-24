@@ -5,7 +5,37 @@
 
 ## [Unreleased]
 
+全製品を 1.0.0 にそろえる版（DEC-096）。通信の規則は hapbeat-contracts の 1.0.0 予定の版
+（`46f246e`。`specs/stream-session.md`・`specs/helper-streaming.md`・`specs/helper-ws.md`・
+`specs/message-format.md` §0xFF・`specs/serial-config.md` §4.1 / §4.23）に従う。
+
+### Changed
+
+- PONG の stream tail を 1.x の規則で分類する。volume_wiper の後に 1 byte も無いものだけを
+  Stream Gen 1 とし、`HBS2` で始まり extension_version 1 の 32 byte 以上の tail を Stream Gen 2
+  とする（33 byte 目以降・reserved・未知の flag は無視）。それ以外は無視して分類を変えない。
+- 探索の broadcast と生存確認の unicast の PING を 8 byte にした。lease を取る 16 byte の
+  拡張 PING は、stream 中の機体と、stream を終えてから 15 秒以内の機体へ unicast でだけ送る。
+- client incarnation を機体ごとに持つ。他のアプリに奪われた（superseded）機体は、
+  `lease_reissued` 付きの応答か、`stream_begin` の `takeover: true` があるまで保留する。
+  `takeover` の無い `stream_begin` では取り返さず、`stream_ack` の `deferred` に入れる。
+- Stream Gen 2 の BEGIN を、最初の 3 回の DATA の前と、以後 500 ms ごとに再送する。
+  client の DATA が 3 秒以上途切れたら、新しい世代で始め直す。
+
 ### Added
+
+- `stream_lost`（`{"stream_id", "targets", "reason"}`）。機体の再起動・lease の変化・
+  奪取・STOP_ALL・target の不一致・応答なしで stream が終わったときに送る。古い識別のまま
+  DATA を送り続けない。
+- 機体の ERROR（0xFF）を受ける。lease 切れ・timeout・BEGIN 未着・世代の不一致は helper が
+  自分で回復し、回復できなければ `stream_lost`（`unreachable`）を送る。`health:` 行に
+  `device_errors` と `stream_lost` の数を加えた。
+- `helper_hello` に `generation`・`types`（扱う request の type の一覧）・`features` を加えた。
+- `get_info_result` に機体の `caps`・`stream_formats`・`stream_protocol`・
+  `storage_incompatible` をそのまま載せる。
+- `reset_storage`（`{"ip", "area"}`）を機体の TCP コマンドへ中継する。
+- Kit を書き込む前に、manifest の `schema_version` と `install-clips` の形式を機体の
+  `caps.kit_schema`・`caps.kit_clip_formats` と照合し、合わなければ書き込まない。
 
 - `scene build`: ゲームの録画（`session.json` と PNG 連番か動画）から
   `<プロジェクト>/Saved/HapticViewer/` に `full_replay.mp4`・`viewer-data.json`・
