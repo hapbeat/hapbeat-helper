@@ -34,7 +34,7 @@ import time
 import traceback
 import zipfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from websockets.exceptions import ConnectionClosed
 
@@ -306,6 +306,9 @@ class HelperServer:
         # Studio tabs, so they must not keep device-side state such as
         # log_tail threads alive after the last Studio tab closes.
         self._agent_clients: set[Any] = set()
+
+        # WebSocket request type -> handler (see _build_handlers).
+        self._handlers = self._build_handlers()
 
     def _get_tcp_lock(self, ip: str) -> asyncio.Lock:
         lock = self._tcp_locks.get(ip)
@@ -672,38 +675,70 @@ class HelperServer:
     async def _dispatch(self, ws, msg: dict) -> None:
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {})
+        handler = self._handlers.get(msg_type)
+        if handler is None:
+            await ws.send(json.dumps({
+                "type": "error",
+                "payload": {"message": f"unknown type: {msg_type}"},
+            }))
+            return
+        await handler(ws, payload)
 
-        if msg_type == "ping":
+    def _build_handlers(self) -> dict[str, Callable[[Any, dict], Awaitable[None]]]:
+        """Every WebSocket request type and its handler.
+
+        helper_hello announces this table's keys as ``types`` (contracts
+        helper-ws.md), so a request type is defined here and nowhere else.
+        """
+        handlers: dict[str, Callable[[Any, dict], Awaitable[None]]] = {}
+
+        def on(msg_type: str):
+            def register(fn):
+                handlers[msg_type] = fn
+                return fn
+            return register
+
+        @on("ping")
+        async def _(ws, payload: dict) -> None:
             await ws.send(json.dumps({"type": "pong", "payload": {}}))
 
-        elif msg_type == "list_devices":
+        @on("list_devices")
+        async def _(ws, payload: dict) -> None:
             await ws.send(json.dumps(self._device_list_msg()))
 
         # Agent relay — routed here only, never through the device handlers
         # and never broadcast.
-        elif msg_type == "agent_endpoint_register":
+        @on("agent_endpoint_register")
+        async def _(ws, payload: dict) -> None:
             await self._handle_agent_endpoint_register(ws, payload)
 
-        elif msg_type == "agent_endpoint_unregister":
+        @on("agent_endpoint_unregister")
+        async def _(ws, payload: dict) -> None:
             self._handle_agent_endpoint_unregister(ws)
 
-        elif msg_type == "agent_request":
+        @on("agent_request")
+        async def _(ws, payload: dict) -> None:
             await self._handle_agent_request(ws, payload)
 
-        elif msg_type == "agent_response":
+        @on("agent_response")
+        async def _(ws, payload: dict) -> None:
             await self._handle_agent_response(ws, payload)
 
         # Material ledger — local files only, never reaches a device.
-        elif msg_type == "material_lookup":
+        @on("material_lookup")
+        async def _(ws, payload: dict) -> None:
             await self._handle_material_lookup(ws, payload)
 
-        elif msg_type == "material_register_derived":
+        @on("material_register_derived")
+        async def _(ws, payload: dict) -> None:
             await self._handle_material_register_derived(ws, payload)
 
-        elif msg_type == "material_credits":
+        @on("material_credits")
+        async def _(ws, payload: dict) -> None:
             await self._handle_material_credits(ws, payload)
 
-        elif msg_type == "rescan":
+        @on("rescan")
+        async def _(ws, payload: dict) -> None:
             # Trigger an immediate UDP broadcast PING + push the latest
             # device_list so the requester sees a fresh snapshot without
             # waiting for the next 2s scan tick.
@@ -715,7 +750,8 @@ class HelperServer:
             await asyncio.sleep(0.25)
             await self._broadcast(self._device_list_msg())
 
-        elif msg_type == "reset_discovery":
+        @on("reset_discovery")
+        async def _(ws, payload: dict) -> None:
             # In-process recovery: rebuild the UDP socket + recv thread and the
             # mDNS browser without restarting the daemon. This is the Studio-
             # triggered equivalent of `hapbeat-helper stop && start` for a
@@ -723,19 +759,23 @@ class HelperServer:
             # SIO_UDP_CONNRESET, but kept as a manual escape hatch).
             await self._handle_reset_discovery(ws)
 
-        elif msg_type == "preview_event":
+        @on("preview_event")
+        async def _(ws, payload: dict) -> None:
             await self._handle_preview_event(ws, payload)
 
-        elif msg_type == "stop_event":
+        @on("stop_event")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stop_event(ws, payload)
 
-        elif msg_type == "write_ui_config":
+        @on("write_ui_config")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "write_ui_config",
                               "config": payload.get("config")},
             )
 
-        elif msg_type == "set_wifi":
+        @on("set_wifi")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_wifi",
@@ -743,27 +783,31 @@ class HelperServer:
                  "pass": payload.get("password", payload.get("pass", ""))},
             )
 
-        elif msg_type == "set_name":
+        @on("set_name")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_name", "name": payload.get("name", "")},
             )
 
-        elif msg_type == "set_address":
+        @on("set_address")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_address",
                  "address": payload.get("address", "")},
             )
 
-        elif msg_type == "set_oled_brightness":
+        @on("set_oled_brightness")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_oled_brightness",
                  "level": int(payload.get("level", 2))},
             )
 
-        elif msg_type == "get_oled_brightness":
+        @on("get_oled_brightness")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_oled_brightness", "oled_brightness_result",
                 lambda r: {"level": r.get("level", 2)},
@@ -776,7 +820,8 @@ class HelperServer:
         # so only include a field in the outgoing cmd dict if the caller
         # actually sent it — do NOT backfill with defaults here, that
         # would defeat the firmware's "omitted = leave unchanged" contract.
-        elif msg_type == "set_haptic_gain":
+        @on("set_haptic_gain")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_haptic_gain"}
             if "pam_db" in payload:
                 cmd["pam_db"] = int(payload["pam_db"])
@@ -786,7 +831,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_dac_boost":
+        @on("set_dac_boost")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_dac_boost"}
             if "boost_db" in payload:
                 cmd["boost_db"] = int(payload["boost_db"])
@@ -794,7 +840,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_headphone_volume":
+        @on("set_headphone_volume")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_headphone_volume"}
             if "hp_db" in payload:
                 cmd["hp_db"] = int(payload["hp_db"])
@@ -802,7 +849,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_stream_buffer":
+        @on("set_stream_buffer")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_stream_buffer"}
             if "buffer_ms" in payload:
                 cmd["buffer_ms"] = int(payload["buffer_ms"])
@@ -810,7 +858,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_input_mode":
+        @on("set_input_mode")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_input_mode"}
             if "mode" in payload:
                 cmd["mode"] = str(payload["mode"])
@@ -818,7 +867,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_eq_band":
+        @on("set_eq_band")
+        async def _(ws, payload: dict) -> None:
             # DuoWL v4 in-codec EQ (audio-dsp-config.md §2). Partial-update
             # forwarding like the other DuoWL v4 audio setters.
             cmd = {"cmd": "set_eq_band"}
@@ -834,7 +884,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_av_delay":
+        @on("set_av_delay")
+        async def _(ws, payload: dict) -> None:
             # DuoWL v4 audio-vs-haptic delay (audio-dsp-config.md §3). Signed
             # ms (-100..+100): negative delays haptic, positive delays HP.
             cmd = {"cmd": "set_av_delay"}
@@ -848,7 +899,8 @@ class HelperServer:
         # Processing-block profile + the blocks it unlocks (6-band EQ, 1st-order
         # IIR, DRC compressor, 3D, beep test-tone, line-in AGC). All partial-
         # update forwards, same style as the DEC-041 audio setters above.
-        elif msg_type == "set_dsp_profile":
+        @on("set_dsp_profile")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_dsp_profile"}
             if "codec" in payload:
                 cmd["codec"] = str(payload["codec"])
@@ -858,7 +910,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_eq_iir":
+        @on("set_eq_iir")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_eq_iir"}
             if "codec" in payload:
                 cmd["codec"] = str(payload["codec"])
@@ -868,7 +921,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_drc":
+        @on("set_drc")
+        async def _(ws, payload: dict) -> None:
             # hold/attack/decay are RAW hardware codes (0..15), not dB/ms.
             cmd = {"cmd": "set_drc"}
             if "codec" in payload:
@@ -883,7 +937,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_beep":
+        @on("set_beep")
+        async def _(ws, payload: dict) -> None:
             # One-shot test tone (profile "full" only). enable=false stops it.
             cmd = {"cmd": "set_beep"}
             if "codec" in payload:
@@ -895,7 +950,8 @@ class HelperServer:
                 cmd["enable"] = bool(payload["enable"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_3d":
+        @on("set_3d")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_3d"}
             if "codec" in payload:
                 cmd["codec"] = str(payload["codec"])
@@ -905,7 +961,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_agc":
+        @on("set_agc")
+        async def _(ws, payload: dict) -> None:
             # Line-in (HP codec) AGC — no `codec` field by design.
             cmd = {"cmd": "set_agc"}
             if "enable" in payload:
@@ -922,7 +979,8 @@ class HelperServer:
         # Only the `band_v4_pwm` build implements these; every other build
         # replies "unknown cmd", so the helper relays board-agnostically
         # (same policy as the DEC-041 audio setters above).
-        elif msg_type == "set_pwm_bias":
+        @on("set_pwm_bias")
+        async def _(ws, payload: dict) -> None:
             # Standing DC bias. Keep accepting legacy `duty`, but preserve the
             # explicit idle_duty field so callers cannot confuse it with the
             # profile used while audio is actually playing.
@@ -935,13 +993,15 @@ class HelperServer:
                 cmd["ma"] = int(payload["ma"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_play_bias":
+        @on("set_pwm_play_bias")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_pwm_play_bias"}
             if "duty" in payload:
                 cmd["duty"] = float(payload["duty"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_bias_enabled":
+        @on("set_pwm_bias_enabled")
+        async def _(ws, payload: dict) -> None:
             # Device-owned persistent gate for the two saved DC profiles.
             # Keep false explicit; a truthiness fallback would turn OFF into ON.
             cmd = {"cmd": "set_pwm_bias_enabled"}
@@ -949,19 +1009,22 @@ class HelperServer:
                 cmd["enabled"] = bool(payload["enabled"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_playback_gain":
+        @on("set_pwm_playback_gain")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_pwm_playback_gain"}
             if "db" in payload:
                 cmd["db"] = int(payload["db"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_post_play_hold":
+        @on("set_pwm_post_play_hold")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_pwm_post_play_hold"}
             if "ms" in payload:
                 cmd["ms"] = int(payload["ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_post_play_return":
+        @on("set_pwm_post_play_return")
+        async def _(ws, payload: dict) -> None:
             # The device owns this timer and persists it with the two bias
             # profiles. Helper only relays the explicit duration.
             cmd = {"cmd": "set_pwm_post_play_return"}
@@ -969,7 +1032,8 @@ class HelperServer:
                 cmd["ms"] = int(payload["ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_haptic_output_mode":
+        @on("set_haptic_output_mode")
+        async def _(ws, payload: dict) -> None:
             # Runtime A/B switch inside the hybrid band_v4_pwm firmware. The
             # device owns persistence and the safety-critical PAM/GPIO handoff;
             # Helper only preserves the explicit mode string.
@@ -978,7 +1042,8 @@ class HelperServer:
                 cmd["mode"] = str(payload["mode"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_bias_test":
+        @on("pwm_bias_test")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "pwm_bias_test"}
             if "enabled" in payload:
                 cmd["enabled"] = bool(payload["enabled"])
@@ -988,7 +1053,8 @@ class HelperServer:
                 cmd["profile"] = str(payload["profile"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_rewind":
+        @on("pwm_rewind")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "pwm_rewind"}
             if "duty" in payload:
                 cmd["duty"] = float(payload["duty"])
@@ -996,10 +1062,12 @@ class HelperServer:
                 cmd["ms"] = int(payload["ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_bias_off":
+        @on("pwm_bias_off")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(ws, payload, {"cmd": "pwm_bias_off"})
 
-        elif msg_type == "pwm_tone":
+        @on("pwm_tone")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "pwm_tone"}
             if "hz" in payload:
                 cmd["hz"] = int(payload["hz"])
@@ -1011,20 +1079,23 @@ class HelperServer:
                 cmd["wave"] = str(payload["wave"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_volume":
+        @on("set_volume")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_volume"}
             if "level" in payload:
                 cmd["level"] = int(payload["level"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_status":
+        @on("pwm_status")
+        async def _(ws, payload: dict) -> None:
             # Rich status dict (state / carrier / bias / underruns / clips) —
             # pass through verbatim, the helper has no business filtering it.
             await self._handle_passthrough_query(
                 ws, payload, {"cmd": "pwm_status"}, "pwm_status_result",
             )
 
-        elif msg_type == "pwm_probe":
+        @on("pwm_probe")
+        async def _(ws, payload: dict) -> None:
             # The device BLOCKS for up to 3 s driving the gates directly.
             # _send_tcp_passthrough reads with timeout=10 s, so the reply
             # still lands well inside the window — no special-casing needed.
@@ -1037,12 +1108,14 @@ class HelperServer:
                 ws, payload, cmd, "pwm_probe_result",
             )
 
-        elif msg_type == "reboot":
+        @on("reboot")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "reboot"},
             )
 
-        elif msg_type == "clear_wifi":
+        @on("clear_wifi")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "clear_wifi"},
             )
@@ -1053,7 +1126,8 @@ class HelperServer:
         # spammed `ERROR: unknown type: get_ap_status` toasts every time.
         # The firmware (tcp_server.cpp) already implements all five — we
         # just need to relay them.
-        elif msg_type == "get_ap_status":
+        @on("get_ap_status")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_ap_status", "ap_status_result",
                 lambda r: {
@@ -1065,29 +1139,34 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "enter_ap_mode":
+        @on("enter_ap_mode")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "enter_ap_mode"},
             )
 
-        elif msg_type == "enter_sta_mode":
+        @on("enter_sta_mode")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "enter_sta_mode"},
             )
 
-        elif msg_type == "set_ap_pass":
+        @on("set_ap_pass")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_ap_pass",
                  "pass": payload.get("password", payload.get("pass", ""))},
             )
 
-        elif msg_type == "clear_ap_pass":
+        @on("clear_ap_pass")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "clear_ap_pass"},
             )
 
-        elif msg_type == "get_info":
+        @on("get_info")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_info", "get_info_result",
                 lambda r: {
@@ -1157,7 +1236,8 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "get_wifi_status":
+        @on("get_wifi_status")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_wifi_status", "wifi_status_result",
                 lambda r: {
@@ -1169,7 +1249,8 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "list_wifi_profiles":
+        @on("list_wifi_profiles")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "list_wifi_profiles", "wifi_profiles_result",
                 lambda r: {
@@ -1179,21 +1260,24 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "connect_wifi_profile":
+        @on("connect_wifi_profile")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "connect_wifi_profile",
                  "index": int(payload.get("index", 0))},
             )
 
-        elif msg_type == "remove_wifi_profile":
+        @on("remove_wifi_profile")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "remove_wifi_profile",
                  "index": int(payload.get("index", 0))},
             )
 
-        elif msg_type == "get_debug_dump":
+        @on("get_debug_dump")
+        async def _(ws, payload: dict) -> None:
             # The debug dump response is a fat dict — pass it through
             # verbatim so the UI can render every field without the
             # helper having to know the schema.
@@ -1202,12 +1286,14 @@ class HelperServer:
                 "debug_dump_result",
             )
 
-        elif msg_type == "kit_list":
+        @on("kit_list")
+        async def _(ws, payload: dict) -> None:
             await self._handle_passthrough_query(
                 ws, payload, {"cmd": "kit_list"}, "kit_list_result",
             )
 
-        elif msg_type == "kit_delete":
+        @on("kit_delete")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "kit_delete",
@@ -1219,7 +1305,8 @@ class HelperServer:
         # 7701 config handler. The firmware ignores commands that don't
         # apply to its role (returns an error the UI surfaces). Studio's
         # serial transport drives the identical JSON over Web Serial.
-        elif msg_type == "set_broker_host":
+        @on("set_broker_host")
+        async def _(ws, payload: dict) -> None:
             cmd: dict = {"cmd": "set_broker_host",
                          "host": payload.get("host", "auto")}
             # Optional client-side MQTT knobs (mqtt-transport.md §7) —
@@ -1233,28 +1320,32 @@ class HelperServer:
                 cmd["qos"] = payload["qos"]
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_espnow_channel":
+        @on("set_espnow_channel")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_espnow_channel",
                  "channel": int(payload.get("channel", 1))},
             )
 
-        elif msg_type == "set_gain":
+        @on("set_gain")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_gain",
                  "gain": float(payload.get("gain", 0.8))},
             )
 
-        elif msg_type == "set_input_level":
+        @on("set_input_level")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_input_level",
                  "level": int(payload.get("level", 50))},
             )
 
-        elif msg_type == "set_broker_config":
+        @on("set_broker_config")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_broker_config",
@@ -1262,14 +1353,16 @@ class HelperServer:
                  "port": int(payload.get("port", 1883))},
             )
 
-        elif msg_type == "set_sensor_mapping":
+        @on("set_sensor_mapping")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_sensor_mapping",
                  "mappings": payload.get("mappings", [])},
             )
 
-        elif msg_type == "set_alert_mode":
+        @on("set_alert_mode")
+        async def _(ws, payload: dict) -> None:
             # MQTT receiver alert behaviour. `loop` (bool) and `ack_hold_ms`
             # (deliberate-hold ms, §6.1) are INDEPENDENTLY optional
             # (serial-config.md §4.15) — forward ONLY what Studio sent. Defaulting
@@ -1282,7 +1375,8 @@ class HelperServer:
                 cmd["ack_hold_ms"] = int(payload["ack_hold_ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_recv_topics":
+        @on("set_recv_topics")
+        async def _(ws, payload: dict) -> None:
             # MQTT receiver subscribe topic roots (item 8). Relay the list;
             # the firmware persists it (effective on reconnect/reboot).
             await self._handle_tcp_command(
@@ -1291,13 +1385,15 @@ class HelperServer:
                  "topics": payload.get("topics", [])},
             )
 
-        elif msg_type == "get_sensor_mapping":
+        @on("get_sensor_mapping")
+        async def _(ws, payload: dict) -> None:
             await self._handle_passthrough_query(
                 ws, payload, {"cmd": "get_sensor_mapping"},
                 "sensor_mapping_result",
             )
 
-        elif msg_type == "get_sensor_reading":
+        @on("get_sensor_reading")
+        async def _(ws, payload: dict) -> None:
             # Live sensor value for Studio's threshold-tuning view
             # (polled ~1 Hz while the mapping tab is open).
             await self._handle_passthrough_query(
@@ -1305,20 +1401,25 @@ class HelperServer:
                 "sensor_reading_result",
             )
 
-        elif msg_type == "play_event":
+        @on("play_event")
+        async def _(ws, payload: dict) -> None:
             # Alias of preview_event, kept for parity with manager test page.
             await self._handle_preview_event(ws, payload)
 
-        elif msg_type == "ping_device":
+        @on("ping_device")
+        async def _(ws, payload: dict) -> None:
             await self._handle_ping_device(ws, payload)
 
-        elif msg_type == "subscribe_logs":
+        @on("subscribe_logs")
+        async def _(ws, payload: dict) -> None:
             await self._handle_subscribe_logs(ws, payload)
 
-        elif msg_type == "unsubscribe_logs":
+        @on("unsubscribe_logs")
+        async def _(ws, payload: dict) -> None:
             await self._handle_unsubscribe_logs(ws, payload)
 
-        elif msg_type == "ota_data":
+        @on("ota_data")
+        async def _(ws, payload: dict) -> None:
             # Spawn as a background task instead of awaiting inline, so the OTA
             # stream does NOT block this connection's receive loop. The user can
             # then switch devices and start another device's OTA without waiting
@@ -1327,7 +1428,8 @@ class HelperServer:
             # serialize traffic to one IP; different IPs run concurrently.
             asyncio.create_task(self._ota_data_bg(ws, payload))
 
-        elif msg_type == "scan_wifi":
+        @on("scan_wifi")
+        async def _(ws, payload: dict) -> None:
             # PC-side Wi-Fi scan. Studio's onboarding assumes
             # PC + Hapbeat are on the same LAN, so the PC's own
             # neighborhood is the same set the Hapbeat will see —
@@ -1336,7 +1438,8 @@ class HelperServer:
             # it works while the Hapbeat is offline being onboarded).
             await self._handle_local_wifi_scan(ws, payload)
 
-        elif msg_type == "query_space":
+        @on("query_space")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "space_query", "space_result",
                 lambda r: {
@@ -1346,26 +1449,27 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "query_volume":
+        @on("query_volume")
+        async def _(ws, payload: dict) -> None:
             await self._handle_volume_query(ws, payload)
 
-        elif msg_type == "deploy_kit_data":
+        @on("deploy_kit_data")
+        async def _(ws, payload: dict) -> None:
             await self._handle_deploy_kit_data(ws, payload)
 
-        elif msg_type == "stream_begin":
+        @on("stream_begin")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stream_begin(ws, payload)
 
-        elif msg_type == "stream_data":
+        @on("stream_data")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stream_data(ws, payload)
 
-        elif msg_type == "stream_end":
+        @on("stream_end")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stream_end(ws, payload)
 
-        else:
-            await ws.send(json.dumps({
-                "type": "error",
-                "payload": {"message": f"unknown type: {msg_type}"},
-            }))
+        return handlers
 
     # ── Message handlers ─────────────────────────────────────
 
