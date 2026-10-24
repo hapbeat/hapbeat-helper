@@ -27,7 +27,7 @@ from typing import Callable, List, Optional
 
 from hapbeat_helper import protocol
 from hapbeat_helper.device_registry import _OFFLINE_THRESHOLD
-from hapbeat_helper.stream_session import StreamLeaseTable
+from hapbeat_helper.stream_session import CLASS_CHANGED, LeaseChange, StreamLeaseTable
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,8 @@ PENDING_PING_TTL_S = 5.0
 
 PongCallback = Callable[[dict, str], None]
 RttCallback = Callable[[str, float], None]
+LeaseChangeCallback = Callable[[str, LeaseChange], None]
+ErrorCallback = Callable[[str, dict], None]
 
 
 class UdpListener:
@@ -191,8 +193,10 @@ class UdpListener:
 
         self._pong_callbacks: list[PongCallback] = []
         self._rtt_callbacks: list[RttCallback] = []
-        # Stream-v2 leases and the per-device v2/legacy class, fed by matched
-        # replies to our own (always 16-byte) PINGs. Survives restart().
+        self._lease_change_callbacks: list[LeaseChangeCallback] = []
+        self._error_callbacks: list[ErrorCallback] = []
+        # Stream Gen 2 leases and the per-device Gen 1 / Gen 2 class, fed by
+        # matched replies to our own extended PINGs. Survives restart().
         self.stream_leases = StreamLeaseTable()
 
     # ── Listener API ─────────────────────────────────────────
@@ -202,6 +206,17 @@ class UdpListener:
 
     def add_rtt_listener(self, cb: RttCallback) -> None:
         self._rtt_callbacks.append(cb)
+
+    def add_lease_change_listener(self, cb: LeaseChangeCallback) -> None:
+        """``cb(ip, change)`` when a matched reply changes a device's stream
+        class, boot, ticket or supersession (called on the recv thread)."""
+        self._lease_change_callbacks.append(cb)
+
+    def add_error_listener(self, cb: ErrorCallback) -> None:
+        """``cb(ip, error)`` for each ERROR (0xFF) from UDP port 7700 (called on
+        the recv thread). Whether it is about one of our sessions is the
+        listener's call (contracts message-format.md §0xFF)."""
+        self._error_callbacks.append(cb)
 
     def remove_rtt_listener(self, cb: RttCallback) -> None:
         """Best-effort: silently no-op if the callback wasn't registered."""
@@ -296,12 +311,21 @@ class UdpListener:
             self._seq = (self._seq + 1) & 0xFFFF
             return self._seq
 
-    def _build_ping(self) -> tuple[int, bytes]:
-        """A 16-byte stream-v2 PING. Pre-v2 firmware reads only the timestamp
-        (it rejects only payloads shorter than 8 bytes) and replies as before."""
+    def _build_ping(self, lease_ip: Optional[str] = None) -> tuple[int, bytes]:
+        """An 8-byte discovery PING, or with ``lease_ip`` the 16-byte extended
+        PING that requests (and refreshes) a Stream Gen 2 lease on that device.
+
+        Extended PINGs are unicast only (stream-session.md Discovery lease):
+        broadcasting them would make every device keep a lease for the helper
+        for as long as it runs, so another application could never get a
+        device back after Studio played on it once (the re-issue rule 2).
+        Stream Gen 1 firmware reads only the timestamp of either.
+        """
         seq = self._next_seq()
         ts_us = int(time.time() * 1_000_000)
-        incarnation = self.stream_leases.note_ping(seq, ts_us)
+        if lease_ip is None:
+            return seq, protocol.build_ping(seq, ts_us)
+        incarnation = self.stream_leases.note_ping(lease_ip, seq, ts_us)
         return seq, protocol.build_ping(seq, ts_us, incarnation)
 
     def _reap_pending(self, now: float) -> None:
@@ -314,8 +338,10 @@ class UdpListener:
         ]:
             self._pending_pings.pop(s, None)
 
-    def send_ping(self, target_ip: str, *, track_rtt: bool = False) -> int:
-        """Send a PING. `track_rtt` records the seq for RTT correlation.
+    def send_ping(self, target_ip: str, *, track_rtt: bool = False,
+                  lease: bool = False) -> int:
+        """Send a PING. `track_rtt` records the seq for RTT correlation;
+        `lease` makes it the extended PING that requests a stream lease.
 
         The ~1 Hz liveness pings from the scan loop pass `track_rtt=False`:
         liveness comes from the PONG callback (`_dispatch_pong`), independent
@@ -328,7 +354,7 @@ class UdpListener:
         sock = self._sock
         if sock is None:
             return -1
-        seq, pkt = self._build_ping()
+        seq, pkt = self._build_ping(target_ip if lease else None)
         if track_rtt:
             now = time.perf_counter()
             with self._lock:
@@ -415,7 +441,7 @@ class UdpListener:
                     "local network again", locked.addr, reason)
 
     def send_broadcast_ping(self) -> int:
-        """PING every candidate broadcast destination.
+        """PING (8 bytes, discovery only) every candidate broadcast destination.
 
         Idempotent, so a device reachable on two of them simply answers twice
         with no visible effect — whereas duplicating PLAY would fire the haptic
@@ -501,6 +527,14 @@ class UdpListener:
                 continue
 
             ip = addr[0]
+            header = protocol.parse_header(data)
+            if header is not None and header["command_type"] == protocol.CMD_ERROR:
+                # Devices send ERROR from their UDP port 7700 only; anything
+                # else is not a device speaking (message-format.md §0xFF).
+                error = protocol.parse_error(data)
+                if error is not None and addr[1] == HAPBEAT_UDP_PORT:
+                    self._dispatch_error(ip, error)
+                continue
             pong = protocol.parse_pong(data)
             if pong is None:
                 continue
@@ -514,9 +548,13 @@ class UdpListener:
                     rtt_ms = (time.perf_counter() - t0) * 1000
                     self._dispatch_rtt(ip, rtt_ms)
 
-            changed = self.stream_leases.on_pong(ip, pong)
-            if changed is not None:
-                logger.info("stream mode %s at %s", changed, ip)
+            change = self.stream_leases.on_pong(ip, pong)
+            if change is not None:
+                if change.reason == CLASS_CHANGED:
+                    logger.info("stream %s at %s", change.kind, ip)
+                else:
+                    logger.info("stream lease at %s: %s", ip, change.reason)
+                self._dispatch_lease_change(ip, change)
             self._dispatch_pong(pong, ip)
 
     def _dispatch_pong(self, pong: dict, ip: str) -> None:
@@ -529,6 +567,20 @@ class UdpListener:
                 cb(pong, ip)
             except Exception:  # noqa: BLE001
                 logger.exception("pong listener failed")
+
+    def _dispatch_lease_change(self, ip: str, change: LeaseChange) -> None:
+        for cb in list(self._lease_change_callbacks):
+            try:
+                cb(ip, change)
+            except Exception:  # noqa: BLE001
+                logger.exception("lease change listener failed")
+
+    def _dispatch_error(self, ip: str, error: dict) -> None:
+        for cb in list(self._error_callbacks):
+            try:
+                cb(ip, error)
+            except Exception:  # noqa: BLE001
+                logger.exception("error listener failed")
 
     def _dispatch_rtt(self, ip: str, rtt_ms: float) -> None:
         for cb in list(self._rtt_callbacks):

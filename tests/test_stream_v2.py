@@ -1,4 +1,4 @@
-"""Stream session v2 with the per-device legacy fallback (DEC-075).
+"""Stream Gen 2 with the per-device Stream Gen 1 fallback (DEC-075).
 
 No sockets: packets are captured from send_raw, PONGs are fed to the lease table.
 """
@@ -26,14 +26,20 @@ class _FakeWebSocket:
         self.messages.append(message)
 
 
-def _tail(incarnation: int, ticket: int = 7, flags: int = 0x01, high_water: int = 0) -> dict:
+def _tail(incarnation: int, ticket: int = 7, flags: int = 0x01, high_water: int = 0,
+          boot: int = BOOT) -> dict:
     raw = (protocol.STREAM_TAIL_MARKER
-           + struct.pack("<BBHQQII", 1, flags, 0, incarnation, BOOT, ticket, high_water))
+           + struct.pack("<BBHQQII", 1, flags, 0, incarnation, boot, ticket, high_water))
     return protocol.parse_stream_tail(raw)
 
 
-def _reply(leases: StreamLeaseTable, ip: str, seq: int, ts: int, tail: dict):
-    leases.note_ping(seq, ts)
+def _reply(leases: StreamLeaseTable, ip: str, seq: int, ts: int, tail: dict = None,
+           echo_xor: int = 0, **tail_args):
+    """Send an extended PING to ``ip`` and feed its matched reply. Without
+    ``tail`` the reply carries a Stream Gen 2 tail echoing the incarnation."""
+    incarnation = leases.note_ping(ip, seq, ts)
+    if tail is None:
+        tail = _tail(incarnation ^ echo_xor, **tail_args)
     return leases.on_pong(ip, {"seq": seq, "timestamp": ts, "stream_tail": tail})
 
 
@@ -67,14 +73,18 @@ def test_ping_is_16_bytes_with_incarnation_and_8_without():
 
 
 def test_stream_tail_classification():
+    # 1.x rules (stream-session.md Receiver classification): only "no byte
+    # after volume_wiper" is Stream Gen 1; a truncated or foreign tail is ignored.
     assert protocol.parse_stream_tail(b"")["status"] == "absent"
-    assert protocol.parse_stream_tail(b"\x07")["status"] == "absent"
-    assert protocol.parse_stream_tail(b"HB")["status"] == "malformed"
-    assert protocol.parse_stream_tail(protocol.STREAM_TAIL_MARKER + b"\x00" * 10)["status"] == "malformed"
-    bad_flags = protocol.STREAM_TAIL_MARKER + struct.pack("<BBHQQII", 1, 0x04, 0, 1, BOOT, 7, 0)
-    assert protocol.parse_stream_tail(bad_flags)["status"] == "malformed"
+    assert protocol.parse_stream_tail(b"\x07")["status"] == "ignored"
+    assert protocol.parse_stream_tail(b"HB")["status"] == "ignored"
+    assert protocol.parse_stream_tail(protocol.STREAM_TAIL_MARKER + b"\x00" * 10)["status"] == "ignored"
+    reissued = protocol.STREAM_TAIL_MARKER + struct.pack("<BBHQQII", 1, 0x05, 0, 1, BOOT, 9, 7)
+    out = protocol.parse_stream_tail(reissued)
+    assert out["status"] == "valid" and out["lease_reissued"] and out["lease_valid"]
     valid = _tail(0x55)
     assert valid["status"] == "valid" and valid["lease_valid"] and not valid["superseded"]
+    assert not valid["lease_reissued"]
 
 
 def test_pong_with_lease_tail_keeps_volume_fields():
@@ -90,44 +100,45 @@ def test_pong_with_lease_tail_keeps_volume_fields():
 
 def test_matched_reply_classifies_and_unmatched_never_does():
     leases = StreamLeaseTable()
-    inc = leases.incarnation
+    inc = leases.note_ping(V2_IP, 50, 50)
     # Unsolicited (timestamp 0) and unknown-seq replies change nothing.
     assert leases.on_pong(V2_IP, {"seq": 0, "timestamp": 0, "stream_tail": _tail(inc)}) is None
     assert leases.on_pong(V2_IP, {"seq": 77, "timestamp": 5, "stream_tail": _tail(inc)}) is None
     assert leases.kind(V2_IP) == stream_session.UNKNOWN
-    assert _reply(leases, V2_IP, 1, 100, _tail(inc)) == stream_session.V2
-    assert _reply(leases, LEGACY_IP, 2, 101, {"status": "absent"}) == stream_session.LEGACY
-    # Malformed tail is ignored, not treated as legacy.
-    assert _reply(leases, "192.168.0.9", 3, 102, {"status": "malformed"}) is None
+    assert _reply(leases, V2_IP, 1, 100).kind == stream_session.GEN2
+    assert _reply(leases, LEGACY_IP, 2, 101, {"status": "absent"}).kind == stream_session.GEN1
+    # An ignored tail changes nothing, and is not Stream Gen 1 either.
+    assert _reply(leases, "192.168.0.9", 3, 102, {"status": "ignored"}) is None
     assert leases.kind("192.168.0.9") == stream_session.UNKNOWN
 
 
 def test_late_or_foreign_incarnation_reply_cannot_roll_back():
     leases = StreamLeaseTable()
-    _reply(leases, V2_IP, 1, 200, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 200)
     # An older (late) tailless reply for the same device must not flip it to legacy.
-    leases.note_ping(2, 150)
+    leases.note_ping(V2_IP, 2, 150)
     assert leases.on_pong(V2_IP, {"seq": 2, "timestamp": 150, "stream_tail": {"status": "absent"}}) is None
-    assert leases.kind(V2_IP) == stream_session.V2
+    assert leases.kind(V2_IP) == stream_session.GEN2
     # A tail echoing another incarnation is ignored.
-    assert _reply(leases, V2_IP, 3, 300, _tail(leases.incarnation ^ 1, ticket=9)) is None
+    assert _reply(leases, V2_IP, 3, 300, echo_xor=1, ticket=9) is None
     assert leases.begin_session(V2_IP)[1].ticket == 7
 
 
 def test_generations_increase_and_superseded_or_invalid_leases_defer():
     leases = StreamLeaseTable()
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 100)
     first = leases.begin_session(V2_IP)[1]
     second = leases.begin_session(V2_IP)[1]
     assert (first.generation, second.generation) == (1, 2)
-    _reply(leases, V2_IP, 2, 200, _tail(leases.incarnation, flags=0x03, high_water=9))
+    _reply(leases, V2_IP, 2, 200, flags=0x03, high_water=9)
     assert leases.is_superseded(V2_IP) and leases.begin_session(V2_IP) is None
     _reply(leases, LEGACY_IP, 3, 300, {"status": "absent"})
-    leases.renew_incarnation()
+    leases.renew_incarnation(V2_IP)
+    leases.renew_incarnation(LEGACY_IP)
     assert leases.kind(V2_IP) == stream_session.UNKNOWN
-    assert leases.kind(LEGACY_IP) == stream_session.LEGACY  # no lease to renew
-    _reply(leases, "192.168.0.10", 4, 400, _tail(leases.incarnation, flags=0x00, ticket=0))
-    assert leases.kind("192.168.0.10") == stream_session.V2
+    assert leases.kind(LEGACY_IP) == stream_session.GEN1  # no lease to renew
+    _reply(leases, "192.168.0.10", 4, 400, flags=0x00, ticket=0)
+    assert leases.kind("192.168.0.10") == stream_session.GEN2
     assert leases.begin_session("192.168.0.10") is None  # v2 without a lease defers, never legacy
 
 
@@ -148,7 +159,7 @@ def _packets(server, ip):
 @pytest.mark.asyncio
 async def test_v2_and_legacy_targets_stream_in_their_own_formats(server):
     leases = server.udp.stream_leases
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 100)
     _reply(leases, LEGACY_IP, 2, 101, {"status": "absent"})
     ws = _FakeWebSocket()
     both = {"targets": [V2_IP, LEGACY_IP], "stream_id": "s", "format": "pcm16"}
@@ -159,7 +170,11 @@ async def test_v2_and_legacy_targets_stream_in_their_own_formats(server):
     await server._handle_stream_end(ws, both)
 
     v2 = _packets(server, V2_IP)
-    assert [p["version"] for p in v2] == [2, 2, 2, 2]
+    # BEGIN, then BEGIN repeated before each of the first DATA blocks, END.
+    assert [p["command"] for p in v2] == [
+        protocol.CMD_STREAM_BEGIN, protocol.CMD_STREAM_BEGIN, protocol.CMD_STREAM_DATA,
+        protocol.CMD_STREAM_BEGIN, protocol.CMD_STREAM_DATA, protocol.CMD_STREAM_END]
+    assert all(p["version"] == 2 for p in v2)
     offsets = [struct.unpack("<I", p["payload"][16:20])[0] for p in v2 if p["command"] == protocol.CMD_STREAM_DATA]
     assert offsets == [0, 4], "v2 offsets count carried bytes and never go backward"
     assert struct.unpack("<QII", v2[-1]["payload"]) == (BOOT, 7, 1)
@@ -175,7 +190,7 @@ def _timed_server(monkeypatch):
         server.udp, "send_raw",
         lambda pkt, ip: server.sent.append((time.monotonic(), ip, _decode(pkt))) or True)
     leases = server.udp.stream_leases
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 100)
     _reply(leases, LEGACY_IP, 2, 101, {"status": "absent"})
     return server
 
@@ -210,7 +225,9 @@ async def test_restart_after_end_v2_immediately_legacy_after_guard_without_stall
     generation_b = struct.unpack("<I", v2[0][1]["payload"][12:16])[0]
     v2_b = [p for _, p in v2 if struct.unpack("<I", p["payload"][12:16])[0] == generation_b]
     assert [p["command"] for p in v2_b] == (
-        [protocol.CMD_STREAM_BEGIN] + [protocol.CMD_STREAM_DATA] * 10
+        [protocol.CMD_STREAM_BEGIN]
+        + [protocol.CMD_STREAM_BEGIN, protocol.CMD_STREAM_DATA] * 3
+        + [protocol.CMD_STREAM_DATA] * 7
         + [protocol.CMD_STREAM_END] * (1 + STREAM_END_REPEATS))
     assert all(struct.unpack("<I", p["payload"][12:16])[0] < generation_b
                for _, p in v2 if p not in v2_b)
@@ -245,7 +262,7 @@ async def test_unknown_target_is_discovered_before_begin(server, monkeypatch):
     leases = server.udp.stream_leases
 
     def answer_ping(ip, **_):
-        _reply(leases, ip, 5, 500, _tail(leases.incarnation))
+        _reply(leases, ip, 5, 500)
         return 5
 
     monkeypatch.setattr(server.udp, "send_ping", answer_ping)
@@ -264,18 +281,19 @@ async def test_unanswered_target_defers_without_packets(server, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_superseded_lease_is_reacquired_on_explicit_start(server, monkeypatch):
+async def test_superseded_lease_is_reacquired_on_takeover(server, monkeypatch):
     leases = server.udp.stream_leases
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation, flags=0x03, high_water=9))
-    old = leases.incarnation
+    _reply(leases, V2_IP, 1, 100, flags=0x03, high_water=9)
+    old = leases.incarnation(V2_IP)
 
     def answer_ping(ip, **_):
-        _reply(leases, ip, 6, 600, _tail(leases.incarnation, ticket=10, high_water=9))
+        _reply(leases, ip, 6, 600, ticket=10, high_water=9)
         return 6
 
     monkeypatch.setattr(server.udp, "send_ping", answer_ping)
-    await server._handle_stream_begin(_FakeWebSocket(), {"targets": [V2_IP], "stream_id": "x"})
-    assert leases.incarnation != old
+    await server._handle_stream_begin(
+        _FakeWebSocket(), {"targets": [V2_IP], "stream_id": "x", "takeover": True})
+    assert leases.incarnation(V2_IP) != old
     begin = _packets(server, V2_IP)[0]
     assert struct.unpack("<QII", begin["payload"][:16]) == (BOOT, 10, 1)
 
@@ -285,7 +303,7 @@ async def test_superseded_lease_is_reacquired_on_explicit_start(server, monkeypa
 @pytest.mark.asyncio
 async def test_v2_end_is_repeated_and_legacy_end_is_not(server):
     leases = server.udp.stream_leases
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 100)
     _reply(leases, LEGACY_IP, 2, 101, {"status": "absent"})
     ws = _FakeWebSocket()
     both = {"targets": [V2_IP, LEGACY_IP], "stream_id": "s"}
@@ -301,7 +319,7 @@ async def test_v2_end_is_repeated_and_legacy_end_is_not(server):
 @pytest.mark.asyncio
 async def test_displaced_owner_is_told_and_its_data_gets_no_session_once(server):
     leases = server.udp.stream_leases
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 100)
     old_ws, new_ws = _FakeWebSocket(), _FakeWebSocket()
     server._clients.update({old_ws, new_ws})
     await server._handle_stream_begin(old_ws, {"targets": [V2_IP], "stream_id": "old"})
@@ -319,7 +337,7 @@ async def test_displaced_owner_is_told_and_its_data_gets_no_session_once(server)
 @pytest.mark.asyncio
 async def test_end_without_targets_reaches_every_device_the_stream_owns(server):
     leases = server.udp.stream_leases
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 100)
     ws = _FakeWebSocket()
     await server._handle_stream_begin(ws, {"targets": [V2_IP], "stream_id": "s"})
     # No targets and an address-filter "target": not an IP, must not matter.
@@ -331,7 +349,7 @@ async def test_end_without_targets_reaches_every_device_the_stream_owns(server):
 @pytest.mark.asyncio
 async def test_device_that_loses_its_lease_is_reported_deferred_not_started(server, monkeypatch):
     leases = server.udp.stream_leases
-    _reply(leases, V2_IP, 1, 100, _tail(leases.incarnation))
+    _reply(leases, V2_IP, 1, 100)
     monkeypatch.setattr(leases, "begin_session", lambda ip: None)
     ws = _FakeWebSocket()
     await server._handle_stream_begin(ws, {"targets": [V2_IP], "stream_id": "s"})
