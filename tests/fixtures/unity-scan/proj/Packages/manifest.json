@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "com.hapbeat.sdk": "file:../../sdk"
+  }
+}

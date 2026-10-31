@@ -1,0 +1,225 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100
+GameObject:
+  m_ObjectHideFlags: 0
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 101}
+  m_Layer: 0
+  m_Name: Left Hand
+  m_IsActive: 1
+--- !u!4 &101
+Transform:
+  m_ObjectHideFlags: 0
+  m_GameObject: {fileID: 100}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_Children: []
+  m_Father: {fileID: 0}
+--- !u!1 &110
+GameObject:
+  m_ObjectHideFlags: 0
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 111}
+  - component: {fileID: 112}
+  - component: {fileID: 113}
+  m_Layer: 0
+  m_Name: Grab
+  m_IsActive: 1
+--- !u!4 &111
+Transform:
+  m_ObjectHideFlags: 0
+  m_GameObject: {fileID: 110}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_Children: []
+  m_Father: {fileID: 101}
+--- !u!114 &112
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 110}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000002, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _eventMap: {fileID: 11400000, guid: b0000000000000000000000000000001, type: 2}
+  _entryId: 1000000000000000000000000000000a
+  _triggerEnabled: 1
+  _cooldown: 0
+  _gainMultiplier: 1
+  _verboseLog: 0
+--- !u!114 &113
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 110}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000003, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _eventMap: {fileID: 11400000, guid: b0000000000000000000000000000001, type: 2}
+  _entryId: 1000000000000000000000000000000b
+  _onStartEntryId: 
+  _onStopEntryId: 
+  _triggerEnabled: 1
+  _cooldown: 0
+  _gainMultiplier: 1
+  _verboseLog: 0
+--- !u!1 &120
+GameObject:
+  m_ObjectHideFlags: 0
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 121}
+  - component: {fileID: 122}
+  - component: {fileID: 123}
+  m_Layer: 0
+  m_Name: 'Right Hand'
+  m_IsActive: 1
+--- !u!4 &121
+Transform:
+  m_ObjectHideFlags: 0
+  m_GameObject: {fileID: 120}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_Children: []
+  m_Father: {fileID: 0}
+--- !u!114 &122
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 120}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000002, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _eventMap: {fileID: 11400000, guid: b0000000000000000000000000000002, type: 2}
+  _entryId: 2000000000000000000000000000000a
+  _triggerEnabled: 1
+  _cooldown: 0
+  _gainMultiplier: 1
+  _verboseLog: 0
+--- !u!114 &123
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 120}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000003, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _eventMap: {fileID: 11400000, guid: b0000000000000000000000000000002, type: 2}
+  _entryId: 2000000000000000000000000000000b
+  _onStartEntryId: 
+  _onStopEntryId: 
+  _triggerEnabled: 1
+  _cooldown: 0
+  _gainMultiplier: 1
+  _verboseLog: 0
+--- !u!1 &130
+GameObject:
+  m_ObjectHideFlags: 0
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 131}
+  - component: {fileID: 132}
+  - component: {fileID: 133}
+  - component: {fileID: 134}
+  m_Layer: 0
+  m_Name: Target
+  m_IsActive: 1
+--- !u!4 &131
+Transform:
+  m_ObjectHideFlags: 0
+  m_GameObject: {fileID: 130}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_Children: []
+  m_Father: {fileID: 0}
+--- !u!114 &132
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 130}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000002, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _eventMap: {fileID: 11400000, guid: b0000000000000000000000000000001, type: 2}
+  _entryId: 1000000000000000000000000000000e
+  _triggerEnabled: 1
+  _cooldown: 0
+  _gainMultiplier: 1
+  _verboseLog: 0
+--- !u!114 &133
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 130}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000002, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _eventMap: {fileID: 11400000, guid: b0000000000000000000000000000002, type: 2}
+  _entryId: 2000000000000000000000000000000e
+  _triggerEnabled: 1
+  _cooldown: 0
+  _gainMultiplier: 0.4
+  _verboseLog: 0
+--- !u!114 &134
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 130}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000002, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _eventMap: {fileID: 11400000, guid: b0000000000000000000000000000001, type: 2}
+  _entryId: 1000000000000000000000000000000c
+  _triggerEnabled: 1
+  _cooldown: 0
+  _gainMultiplier: 1
+  _verboseLog: 0
+--- !u!1001 &200
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    serializedVersion: 3
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 1000, guid: d0000000000000000000000000000001, type: 3}
+      propertyPath: m_Name
+      value: Tap Button
+      objectReference: {fileID: 0}
+    - target: {fileID: 3000, guid: d0000000000000000000000000000001, type: 3}
+      propertyPath: _eventMap
+      value:
+      objectReference: {fileID: 11400000, guid: b0000000000000000000000000000002, type: 2}
+    - target: {fileID: 3000, guid: d0000000000000000000000000000001, type: 3}
+      propertyPath: _entryId
+      value: 2000000000000000000000000000000f
+      objectReference: {fileID: 0}
+    m_RemovedComponents: []
+  m_SourcePrefab: {fileID: 100100000, guid: d0000000000000000000000000000001, type: 3}

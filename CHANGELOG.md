@@ -13,6 +13,23 @@
   同じフォルダの `studio-scene-ui.json` などは残す。ffmpeg（libx264）が必要。
 - `cues validate`: cue 表を schema と `specs/cue-table.md` §6 の規則で検証する
   （標準ライブラリのみ）。WAV の有無は viewer-lib の `paths` が分かる時だけ確かめる。
+- AI エージェントがゲームの触覚イベントから cue 表の初版を作り、全 cue を起こす録画を
+  確かめるための命令（DEC-101、hapbeat-contracts `specs/cue-table.md` §10・
+  `specs/scene-recording.md` §5〜§7）:
+  - `cues scan --unity`: Unity の Event Map と、それを鳴らすシーン・prefab・Animator の
+    trigger を読み、イベントの一覧（`inventory.json`）と配線の一覧（`wiring.md`）を書く。
+  - `cues init`: 一覧（または `--add` の名前、`--from-session` の記録）から cue 表の初版を作るか、
+    既存の表に足りない cue だけを足す（`--into`）。WAV を写し、`hapbeat-scene.json` の
+    `bindings` を書く。決められない項目（宛先が全員・部位でない、WAV が無い）は未定のまま報告する。
+  - `scene session`: 記録のログ（JSON Lines、エンジンのログの `HAPBEAT_SCENE ` 行も可）と
+    プロジェクトの設定 `hapbeat-scene.json` から `session.json` を作り、cue 表と突き合わせる
+    （表に無い cue、take の `expect` / `allow`、ループの列、`--require-all`）。`--build` で
+    続けて `scene build`、`--lib-only` で `viewer-lib.json` だけを書き直す。
+  - `scene check`: 既存の `session.json` を cue 表と突き合わせる。
+  - `scene guide` / `scene template`: AI エージェント向けの手順書と、ログを書くテンプレート
+    （Unity C#・Unreal C++・JS）。
+  - どの命令も `--json` で結果を 1 つの JSON にして出す。
+- `scene build`: `session.json` の `takes`（台本の区切り）を検証する。
 
 - ストリームを別のストリームに奪われたクライアントへ `stream_displaced`
   （`{"stream_id", "targets": [ip…], "by": <新しい stream_id>, "same_client": bool}`）を送る。

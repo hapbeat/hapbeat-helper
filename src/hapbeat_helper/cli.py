@@ -11,7 +11,12 @@ Subcommands:
 - ``mcp [--port 7703]``                   MCP server (stdio) for AI agents, relayed via the daemon
 - ``materials <ingest|derive|list|show|set-license|credits|where>``  material ledger (sound sources + licenses)
 - ``scene build --session <session.json>``  recording -> Saved/HapticViewer/ for Studio's Scene tab
+- ``scene session [--config hapbeat-scene.json]``  recording log -> session.json (optionally --build)
+- ``scene check --session <session.json>``  a recording against the cue table
+- ``scene guide [--engine E]`` / ``scene template <engine> --out DIR``  AI-agent guide / log writers
 - ``cues validate <cue-table.json>``      check a cue table (schema + cue-table spec section 6)
+- ``cues scan --unity <project>``         Unity Event Maps + triggers -> event inventory
+- ``cues init --inventory <file> --out <table>``  first-draft cue table (cue-table spec section 10)
 - ``install-service``                     register as OS auto-start service (Task Scheduler on Windows / launchd on macOS)
 - ``uninstall-service``                   remove the OS service registration
 - ``service-status``                      show OS service registration state
@@ -639,6 +644,180 @@ def _cmd_scene_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scene_report(
+    args: argparse.Namespace, code: int, errors: list[str], warnings: list[str],
+    check=None, events: int = 0, table=None, extra: dict | None = None, done: str = "",
+) -> int:
+    """Print a scene session / check result and return ``code``.
+
+    Text: ``error:`` / ``warning:`` lines on stderr and one summary line on stdout (none for exit 2).
+    ``--json``: one object ``{ok, errors, warnings, coverage, takes, ...extra}`` on stdout and nothing else.
+    """
+    from hapbeat_helper import scene_check
+
+    coverage = check.coverage if check is not None else {}
+    takes = check.takes if check is not None else []
+    if args.json:
+        out = {"ok": code == 0, "errors": errors, "warnings": warnings, "coverage": coverage, "takes": takes}
+        out.update(extra or {})
+        print(json.dumps(out, ensure_ascii=False))
+        return code
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    for error in errors:
+        print(f"error: {error}", file=sys.stderr)
+    if code == 2:
+        return code
+    if code == 0:
+        if table is None:
+            print(f"OK: {events} events, no cue table yet{done}")
+        else:
+            fired, total = scene_check.cue_counts(coverage, table)
+            print(f"OK: {events} events, {fired}/{total} cues fired{done}")
+    else:
+        print(f"FAILED: {len(errors)} error(s)")
+    return code
+
+
+def _load_cue_table(path: Path, lib: dict, root: Path) -> tuple[object, list[str]]:
+    """``(table, problems)``, the WAVs checked in the lib's clip / sound folders under ``root``;
+    raises OSError / ValueError when the file cannot be read."""
+    from hapbeat_helper import cue_table
+
+    table = cue_table.load_json(path)
+    paths = lib["paths"]
+    problems = cue_table.validate_cue_table(table, root / paths["clips"], root / paths["sounds"])
+    return table, [f"cue table {path}: {p}" for p in problems]
+
+
+def _cmd_scene_session(args: argparse.Namespace) -> int:
+    """Exit codes: 0 written (and built) / 1 problems in the recording or the build / 2 bad argument or unreadable input."""
+    from hapbeat_helper import scene_build, scene_check, scene_log, scene_project, scene_session
+
+    def fail(message: str) -> int:
+        return _scene_report(args, 2, [message], [])
+
+    if not args.build and (args.ffmpeg or args.keep_frames):
+        return fail("--ffmpeg and --keep-frames need --build")
+    config = Path(args.config).expanduser() if args.config else Path.cwd() / scene_project.CONFIG_NAME
+    try:
+        cfg = scene_project.load_project(config)
+    except scene_project.SceneProjectError as exc:
+        return fail(str(exc))
+    root = config.parent
+    if args.lib_only:
+        viewer = root / scene_build.VIEWER_DIR
+        viewer.mkdir(parents=True, exist_ok=True)
+        scene_build.write_json(viewer / "viewer-lib.json", cfg["lib"])
+        if args.json:
+            print(json.dumps({"ok": True, "errors": [], "warnings": [], "viewer_lib": str(viewer / "viewer-lib.json")}))
+        else:
+            print(f"wrote {viewer / 'viewer-lib.json'}")
+        return 0
+    log_path = Path(args.log).expanduser() if args.log else root / cfg.get("log", scene_project.DEFAULT_LOG)
+    out = Path(args.out).expanduser() if args.out else root / "Saved" / "HapticRecord" / "session.json"
+    table_path = Path(args.cues).expanduser() if args.cues else root / cfg["lib"]["paths"]["cues"]
+    try:
+        # No cue table yet (before Studio makes one): checked without it (specs/scene-recording.md section 7).
+        table, table_problems = (
+            (None, []) if not args.cues and not table_path.exists()
+            else _load_cue_table(table_path, cfg["lib"], root)
+        )
+    except (OSError, ValueError) as exc:
+        return fail(f"cannot read the cue table {table_path}: {exc}")
+    try:
+        log = scene_log.read_log(log_path)
+    except OSError as exc:
+        return fail(f"cannot read the log {log_path}: {exc}")
+    if table_problems:
+        return _scene_report(args, 1, table_problems, list(log.warnings))
+
+    made = scene_session.make_session(cfg, log, root)
+    errors, warnings = list(made.errors), list(made.warnings)
+    check = None
+    if made.session is not None:
+        check = scene_check.check_session(made.session, table, require_all=args.require_all)
+        errors += check.errors
+        warnings += check.warnings
+    if errors:
+        return _scene_report(args, 1, errors, warnings, check)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    scene_build.write_json(out, made.session)
+    extra: dict = {"session": str(out)}
+    done = f"; wrote {out}"
+    if args.build:
+        try:
+            built = scene_build.build(out, root, ffmpeg=args.ffmpeg, keep_frames=args.keep_frames)
+        except scene_build.SceneBuildError as exc:
+            return _scene_report(args, 1, [str(exc)], warnings, check, extra=extra)
+        warnings += built.warnings
+        extra["built"] = str(built.out_dir)
+        done += f"; built {built.out_dir} ({built.frames} frames)"
+    return _scene_report(
+        args, 0, [], warnings, check, events=len(made.session["events"]), table=table, extra=extra, done=done,
+    )
+
+
+def _cmd_scene_check(args: argparse.Namespace) -> int:
+    """Exit codes: 0 ok / 1 problems / 2 bad argument or unreadable input."""
+    from hapbeat_helper import cue_table, scene_build, scene_check
+
+    def fail(message: str) -> int:
+        return _scene_report(args, 2, [message], [])
+
+    session_path = Path(args.session).expanduser()
+    root = Path(args.project_root).expanduser() if args.project_root else Path.cwd()
+    if not root.is_dir():
+        return fail(f"not a directory: {root}")
+    try:
+        session = cue_table.load_json(session_path)
+    except (OSError, ValueError) as exc:
+        return fail(f"cannot read {args.session}: {exc}")
+    problems = scene_build.validate_session(session)
+    if problems:
+        return _scene_report(args, 1, problems, [])
+    table_path = Path(args.cues).expanduser() if args.cues else root / session["lib"]["paths"]["cues"]
+    try:
+        # No cue table yet (before Studio makes one): checked without it (specs/scene-recording.md section 7).
+        table, table_problems = (
+            (None, []) if not args.cues and not table_path.exists()
+            else _load_cue_table(table_path, session["lib"], root)
+        )
+    except (OSError, ValueError) as exc:
+        return fail(f"cannot read the cue table {table_path}: {exc}")
+    if table_problems:
+        return _scene_report(args, 1, table_problems, [])
+    check = scene_check.check_session(session, table, require_all=args.require_all)
+    code = 1 if check.errors else 0
+    return _scene_report(
+        args, code, check.errors, check.warnings, check, events=len(session["events"]), table=table,
+    )
+
+
+def _cmd_scene_guide(args: argparse.Namespace) -> int:
+    from hapbeat_helper import scene_guide
+
+    sys.stdout.write(scene_guide.guide(args.engine))
+    return 0
+
+
+def _cmd_scene_template(args: argparse.Namespace) -> int:
+    """Exit codes: 0 written (existing files are kept unless --force) / 2 cannot write."""
+    from hapbeat_helper import scene_guide
+
+    try:
+        written, skipped = scene_guide.write_templates(args.engine, Path(args.out).expanduser(), force=args.force)
+    except OSError as exc:
+        print(f"error: cannot write to {args.out}: {exc}", file=sys.stderr)
+        return 2
+    for path in written:
+        print(f"wrote {path}")
+    for path in skipped:
+        print(f"kept {path} (exists; --force to overwrite)")
+    return 0
+
+
 def _cmd_cues_validate(args: argparse.Namespace) -> int:
     """Exit codes: 0 valid / 1 problems found / 2 unreadable input."""
     from hapbeat_helper import cue_table
@@ -674,6 +853,224 @@ def _cmd_cues_validate(args: argparse.Namespace) -> int:
         return 1
     cues = table.get("cues", {}) if isinstance(table, dict) else {}
     print(f"OK ({len(cues)} cues)")
+    return 0
+
+
+def _cmd_cues_scan(args: argparse.Namespace) -> int:
+    """Exit codes: 0 written / 2 bad argument, unreadable input or a binary asset."""
+    from hapbeat_helper import cue_inventory, unity_scan
+
+    project = Path(args.unity).expanduser()
+    out_dir = Path(args.out).expanduser() if args.out else project / "Saved" / "HapticScan"
+    inv_path, wiring_path = out_dir / cue_inventory.INVENTORY_NAME, out_dir / "wiring.md"
+
+    def fail(message: str) -> int:
+        if args.json:
+            print(json.dumps({
+                "ok": False, "inventory": None, "wiring": None, "events": 0, "maps": 0, "warnings": [],
+                "error": message,
+            }, ensure_ascii=False))
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 2
+
+    if not project.is_dir():
+        return fail(f"not a directory: {project}")
+    try:
+        result = unity_scan.scan(project, Path(args.sdk_root).expanduser() if args.sdk_root else None)
+        cue_inventory.save_inventory(inv_path, result.inventory)
+        wiring_path.write_text(result.wiring, encoding="utf-8", newline="\n")
+    except (unity_scan.UnityScanError, cue_inventory.InventoryError, OSError) as exc:
+        return fail(str(exc))
+    inv = result.inventory
+    used = sum(1 for m in inv["maps"] if m["referenced"])
+    if args.json:
+        print(json.dumps({
+            "ok": True, "inventory": str(inv_path), "wiring": str(wiring_path), "events": len(inv["events"]),
+            "maps": len(inv["maps"]), "warnings": result.warnings,
+        }, ensure_ascii=False))
+        return 0
+    for warning in result.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    print(
+        f"wrote {inv_path} ({len(inv['events'])} events from {used} of {len(inv['maps'])} Event Maps) "
+        f"and {wiring_path}"
+    )
+    return 0
+
+
+def _cmd_cues_init(args: argparse.Namespace) -> int:
+    """Exit codes: 0 written (or nothing to add) / 1 rule problems (nothing written) / 2 bad argument or unreadable input."""
+    import copy
+
+    from hapbeat_helper import cue_init, cue_inventory, cue_table, scene_build, scene_project
+
+    report: dict = {
+        "ok": False, "table": None, "config": None, "added": {"cues": [], "variants": [], "clips": []},
+        "bindings": [], "undecided": [], "renamed": [], "warnings": [], "errors": [],
+    }
+
+    def emit(code: int) -> int:
+        report["ok"] = code == 0
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        else:
+            for warning in report["warnings"]:
+                print(f"warning: {warning}", file=sys.stderr)
+            for error in report["errors"]:
+                print(f"error: {error}", file=sys.stderr)
+        return code
+
+    def fail(message: str) -> int:
+        report["errors"].append(message)
+        return emit(2)
+
+    def rel(path: Path) -> str:
+        return Path(os.path.relpath(path, root)).as_posix()
+
+    root = (Path(args.project_root).expanduser() if args.project_root else Path.cwd()).resolve()
+    if not root.is_dir():
+        return fail(f"not a directory: {root}")
+    config = Path(args.config).expanduser().resolve() if args.config else root / scene_project.CONFIG_NAME
+    cfg = None
+    if config.is_file():
+        try:
+            cfg = scene_project.load_project(config)
+        except scene_project.SceneProjectError as exc:
+            return fail(str(exc))
+    table_path = Path(args.out or args.into).expanduser().resolve()
+    report["table"] = str(table_path)
+    base = None
+    if args.out and table_path.exists():
+        return fail(f"{table_path} exists (use --into to add to it)")
+    if args.into:
+        try:
+            base = cue_table.load_json(table_path)
+        except (OSError, ValueError) as exc:
+            return fail(f"cannot read {table_path}: {exc}")
+        if not isinstance(base, dict):
+            return fail(f"{table_path} is not a cue table (a JSON object)")
+    if args.kit and not cue_table.KIT_NAME.match(args.kit):
+        return fail(f"--kit must match {cue_table.KIT_NAME.pattern}")
+    if args.project and not scene_build.PROJECT_NAME.match(args.project):
+        return fail(f"--project must match {scene_build.PROJECT_NAME.pattern}")
+
+    inventory = session = None
+    named = None
+    if args.inventory:
+        try:
+            inventory = cue_inventory.load_inventory(Path(args.inventory).expanduser())
+        except cue_inventory.InventoryError as exc:
+            return fail(str(exc))
+        named = inventory.get("project")
+    elif args.from_session:
+        try:
+            session = cue_table.load_json(Path(args.from_session).expanduser())
+        except (OSError, ValueError) as exc:
+            return fail(f"cannot read {args.from_session}: {exc}")
+        problems = scene_build.validate_session(session)
+        if problems:
+            return fail(f"invalid session {args.from_session}: " + "; ".join(problems))
+        named = session["project"]
+    elif args.loop and not args.add:
+        return fail("--loop goes with --add")
+    project = named or args.project or (cfg["project"] if cfg else None)
+    kit = args.kit or (f"{project}-kit" if project else None)
+    if base is None and kit is None:
+        return fail("no project name for the new table's kit: pass --project or --kit")
+
+    if inventory is not None:
+        if cfg is not None:
+            clips_dir = root / cfg["lib"]["paths"]["clips"]
+            sounds_dir = root / cfg["lib"]["paths"]["sounds"]
+        else:
+            if not project:
+                return fail(f"no project name for {config.name}: pass --project")
+            clips_dir = root / args.clips if args.clips else table_path.parent / "Clips"
+            sounds_dir = root / args.sounds if args.sounds else table_path.parent / "Sounds"
+        source_root = Path(args.source_root).expanduser().resolve() if args.source_root else root
+        try:
+            plan = cue_init.plan_inventory(
+                inventory, base, kit=kit or "", source_root=source_root, clips_dir=clips_dir.resolve(),
+                bindings=cfg.get("bindings", []) if cfg else [],
+            )
+        except cue_init.CueInitError as exc:
+            return fail(str(exc))
+    else:
+        names: list[list[str]] = []
+        for raw in (args.add, args.loop):
+            items = [n.strip() for n in (raw or "").split(",") if n.strip()]
+            bad = [n for n in items if not cue_table.CUE_NAME.match(n)]
+            if bad:
+                return fail(f"cue names must match {cue_table.CUE_NAME.pattern}: {', '.join(bad)}")
+            names.append(items)
+        if session is not None:
+            plan = cue_init.plan_session(base, session, kit or "")
+        else:
+            plan = cue_init.plan_add(base, kit or "", names[0], names[1])
+
+    report["added"], report["undecided"], report["renamed"] = plan.added, plan.undecided, plan.renamed
+    report["warnings"] = list(plan.warnings)
+    report["errors"] = list(plan.errors)
+    unfired: list[str] = []
+    rests = [f"{r['cue']}: the rest of the target ({', '.join(r['rest'])}) is not in the table" for r in plan.target_rest]
+    report["warnings"] += rests
+    if inventory is not None:
+        report["warnings"] += [f"inventory: {w}" for w in inventory.get("warnings", []) if "levelMap" in w]
+        for m in inventory.get("maps", []):
+            if not m["referenced"]:
+                report["warnings"].append(f"Event Map {m['path']} is not referenced by any scene / prefab / controller")
+        for ev in inventory["events"]:
+            if not ev.get("where"):
+                unfired.append(f"{ev['source']} ({ev['name']})")
+        report["warnings"] += [f"{u}: nothing fires it in the scenes / prefabs (where is empty)" for u in unfired]
+
+    new_cfg = None
+    if inventory is not None and not plan.errors:
+        if cfg is not None:
+            new_cfg = copy.deepcopy(cfg)
+        else:
+            new_cfg = scene_project.new_project(
+                project, args.title or project, rel(table_path), rel(clips_dir), rel(sounds_dir),
+            )
+        scene_project.set_bindings(new_cfg, plan.bindings)
+        report["errors"] += [f"{config.name}: {p}" for p in scene_project.validate_project(new_cfg)]
+        report["bindings"] = plan.bindings
+        report["config"] = str(config)
+    if report["errors"]:
+        return emit(1)
+
+    if not args.dry_run:
+        try:
+            cue_init.write_plan(plan, table_path)
+            if new_cfg is not None and new_cfg != cfg:
+                scene_project.save_project(config, new_cfg)
+        except (cue_init.CueInitError, scene_project.SceneProjectError, OSError) as exc:
+            return fail(str(exc))
+    if args.json:
+        return emit(0)
+    emit(0)
+    verb = "would write" if args.dry_run else "wrote"
+    added = plan.added
+    counts = f"+{len(added['cues'])} cues, +{len(added['variants'])} variants, +{len(added['clips'])} clips"
+    print(f"{verb} {table_path} ({counts})" if plan.table_changed else f"no change to {table_path}")
+    if new_cfg is not None:
+        if new_cfg != cfg:
+            print(f"{verb} {config} ({len(plan.bindings)} bindings)")
+        else:
+            print(f"no change to {config}")
+    to_decide = [f"{u['cue']}: haptics undecided ({u['reason']})" for u in plan.undecided]
+    to_decide += [f"{r['from']} -> {r['to']} (renamed: {', '.join(r['sources'])})" for r in plan.renamed]
+    to_decide += [w for w in plan.warnings if " limited to " in w or "levelMap not written" in w]
+    to_decide += rests
+    if inventory is not None:
+        to_decide += [f"inventory: {w}" for w in inventory.get("warnings", []) if "levelMap" in w]
+        to_decide += [f"Event Map {m['path']} is not referenced" for m in inventory.get("maps", []) if not m["referenced"]]
+        to_decide += [f"{u}: where is empty (fired from code?)" for u in unfired]
+    if to_decide:
+        print("to decide:")
+        for line in to_decide:
+            print(f"  {line}")
     return 0
 
 
@@ -937,6 +1334,101 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_sbuild.set_defaults(func=_cmd_scene_build)
 
+    p_ssession = sub_scene.add_parser(
+        "session",
+        help="recording log + hapbeat-scene.json -> session.json (checked against the cue table)",
+        description=(
+            "Read the recording's log (hapbeat-contracts specs/scene-recording.md "
+            "section 5) with the project's hapbeat-scene.json (section 6), check it "
+            "against the cue table (section 7) and write session.json (section 2). "
+            "Nothing is written when there is an error. The project root is the "
+            "folder of the config; its paths are relative to it."
+        ),
+    )
+    p_ssession.add_argument(
+        "--config", metavar="PATH", help="the project's hapbeat-scene.json (default: ./hapbeat-scene.json)",
+    )
+    p_ssession.add_argument(
+        "--log", metavar="FILE",
+        help="the log: its own file or an engine log with HAPBEAT_SCENE lines (default: the config's log)",
+    )
+    p_ssession.add_argument(
+        "--out", metavar="FILE", help="session.json to write (default: <root>/Saved/HapticRecord/session.json)",
+    )
+    p_ssession.add_argument(
+        "--cues", metavar="TABLE", help="the cue table (default: <root>/<lib.paths.cues>)",
+    )
+    p_ssession.add_argument(
+        "--require-all", action="store_true", help="every cue and variant of the table must fire",
+    )
+    p_ssession.add_argument(
+        "--build", action="store_true", help="then run scene build on the written session",
+    )
+    p_ssession.add_argument(
+        "--ffmpeg", metavar="PATH", help="with --build: ffmpeg executable with libx264 (default: ffmpeg on PATH)",
+    )
+    p_ssession.add_argument(
+        "--keep-frames", action="store_true", help="with --build: keep the PNG frames folder",
+    )
+    p_ssession.add_argument(
+        "--lib-only", action="store_true",
+        help="only rewrite <root>/Saved/HapticViewer/viewer-lib.json from the config's lib (no log needed)",
+    )
+    p_ssession.add_argument("--json", action="store_true", help="print one JSON object instead of text")
+    p_ssession.set_defaults(func=_cmd_scene_session)
+
+    p_scheck = sub_scene.add_parser(
+        "check",
+        help="check a session.json against the cue table",
+        description=(
+            "Check a recording's session.json against the cue table "
+            "(hapbeat-contracts specs/scene-recording.md section 7): unknown cues "
+            "and variants, level columns, the takes, and with --require-all that "
+            "every cue and variant fired."
+        ),
+    )
+    p_scheck.add_argument("--session", required=True, metavar="FILE", help="the recording's session.json")
+    p_scheck.add_argument(
+        "--cues", metavar="TABLE", help="the cue table (default: <project-root>/<lib.paths.cues>)",
+    )
+    p_scheck.add_argument(
+        "--project-root", metavar="DIR", help="game project root (default: the current directory)",
+    )
+    p_scheck.add_argument(
+        "--require-all", action="store_true", help="every cue and variant of the table must fire",
+    )
+    p_scheck.add_argument("--json", action="store_true", help="print one JSON object instead of text")
+    p_scheck.set_defaults(func=_cmd_scene_check)
+
+    from hapbeat_helper.scene_guide import ENGINES, TEMPLATE_ENGINES
+
+    p_sguide = sub_scene.add_parser(
+        "guide",
+        help="print the AI-agent guide: a first-draft cue table and a checked recording",
+        description=(
+            "Print the step-by-step guide for an AI agent: find the game's haptic events, "
+            "draft the cue table (cues scan / cues init), write a recording script that "
+            "fires every cue, record it and pass scene session --require-all --build."
+        ),
+    )
+    p_sguide.add_argument("--engine", choices=ENGINES, help="only this engine's notes (default: all)")
+    p_sguide.set_defaults(func=_cmd_scene_guide)
+
+    p_stemplate = sub_scene.add_parser(
+        "template",
+        help="copy the recording log writer for an engine into a folder",
+        description=(
+            "Copy the files that write the recording log (hapbeat-contracts "
+            "specs/scene-recording.md section 5) into DIR: unity = HapbeatSceneLog.cs and "
+            "HapbeatSceneSdkCapture.cs, unreal = HapbeatSceneLog.h, js = hapbeat-scene-log.mjs. "
+            "Existing files are kept unless --force."
+        ),
+    )
+    p_stemplate.add_argument("engine", choices=TEMPLATE_ENGINES)
+    p_stemplate.add_argument("--out", required=True, metavar="DIR", help="folder to copy into (created if needed)")
+    p_stemplate.add_argument("--force", action="store_true", help="overwrite existing files")
+    p_stemplate.set_defaults(func=_cmd_scene_template)
+
     p_cues = sub.add_parser("cues", help="cue table tools (try: cues validate)")
     sub_cues = p_cues.add_subparsers(dest="cues_cmd")
     p_cvalidate = sub_cues.add_parser(
@@ -955,6 +1447,63 @@ def _build_parser() -> argparse.ArgumentParser:
         "--viewer-lib", metavar="PATH", help="viewer-lib.json whose paths.clips / paths.sounds hold the WAVs",
     )
     p_cvalidate.set_defaults(func=_cmd_cues_validate)
+
+    p_cscan = sub_cues.add_parser(
+        "scan",
+        help="read a Unity project's Event Maps and triggers into an event inventory",
+        description=(
+            "Read the Event Maps, scenes, prefabs and Animator controllers of a Unity project "
+            "(Force Text) and write inventory.json (hapbeat-contracts specs/cue-table.md section 10) "
+            "and wiring.md (what fires each entry). Only the Event Maps something references become "
+            "events. The SDK's script GUIDs are read from its installed *.cs.meta: Packages/manifest.json "
+            "com.hapbeat.sdk, Packages/com.hapbeat.sdk, Library/PackageCache, then --sdk-root."
+        ),
+    )
+    p_cscan.add_argument("--unity", required=True, metavar="PROJECT_DIR", help="the Unity project folder")
+    p_cscan.add_argument("--out", metavar="DIR", help="output folder (default: <project>/Saved/HapticScan)")
+    p_cscan.add_argument("--sdk-root", metavar="DIR", help="the Hapbeat Unity SDK package folder, when not found")
+    p_cscan.add_argument("--json", action="store_true", help="print one JSON object instead of text")
+    p_cscan.set_defaults(func=_cmd_cues_scan)
+
+    p_cinit = sub_cues.add_parser(
+        "init",
+        help="first cue table (+ recording bindings) from an inventory, names, or a recording",
+        description=(
+            "Make a first cue table by hapbeat-contracts specs/cue-table.md section 10: from an inventory "
+            "(cues, haptic routes and clips with the WAVs copied into the clip folder, plus the bindings "
+            "of hapbeat-scene.json), from cue names (--add, --loop: undecided cues), or from a recording "
+            "(--from-session: the cues it fires). Sound effects stay undecided. --into adds only what the "
+            "table does not have. Nothing is written when a rule fails (exit 1) or with --dry-run."
+        ),
+    )
+    src = p_cinit.add_mutually_exclusive_group(required=True)
+    src.add_argument("--inventory", metavar="FILE", help="an inventory.json (cues scan, or hand-written)")
+    src.add_argument("--add", metavar="A,B", help="cue names to add as undecided cues")
+    src.add_argument("--from-session", metavar="SESSION", help="a recording's session.json")
+    p_cinit.add_argument("--loop", metavar="C", help="with --add: loop cue names (loop: true)")
+    dst = p_cinit.add_mutually_exclusive_group(required=True)
+    dst.add_argument("--out", metavar="TABLE", help="a new cue table (must not exist)")
+    dst.add_argument("--into", metavar="TABLE", help="an existing cue table to add to")
+    p_cinit.add_argument("--project-root", metavar="DIR", help="game project root (default: the current directory)")
+    p_cinit.add_argument("--config", metavar="PATH", help="hapbeat-scene.json (default: <project-root>/hapbeat-scene.json)")
+    p_cinit.add_argument(
+        "--source-root", metavar="DIR",
+        help="the folder the inventory's wav paths are relative to (default: the project root)",
+    )
+    p_cinit.add_argument("--project", metavar="NAME", help="project name when the input has none")
+    p_cinit.add_argument("--title", metavar="T", help="title of a new hapbeat-scene.json (default: the project name)")
+    p_cinit.add_argument(
+        "--clips", metavar="DIR",
+        help="clip folder under the project root when there is no hapbeat-scene.json (default: <table folder>/Clips)",
+    )
+    p_cinit.add_argument(
+        "--sounds", metavar="DIR",
+        help="sound folder under the project root when there is no hapbeat-scene.json (default: <table folder>/Sounds)",
+    )
+    p_cinit.add_argument("--kit", metavar="NAME", help="kit of a new table (default: <project>-kit)")
+    p_cinit.add_argument("--dry-run", action="store_true", help="write nothing (no table, WAV or config)")
+    p_cinit.add_argument("--json", action="store_true", help="print one JSON object instead of text")
+    p_cinit.set_defaults(func=_cmd_cues_init)
 
     p_install = sub.add_parser(
         "install-service",

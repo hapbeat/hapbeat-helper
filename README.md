@@ -397,6 +397,42 @@ hapbeat-helper cues validate Content/Hapbeat/cues.json [--project-root <dir>] [-
 - `cues validate` checks the WAVs only when it knows the clip / sound folders:
   from `--viewer-lib`, or `<project-root>/Saved/HapticViewer/viewer-lib.json`.
 
+### A first-draft cue table and a checked recording (for AI agents)
+
+`hapbeat-helper scene guide [--engine unity|unreal|js|other]` prints the whole
+procedure for an AI agent: find the game's haptic events, draft the cue table,
+write a recording script that fires every cue, record it and check it.
+
+```bash
+# Unity: Event Maps and the triggers that fire them -> Saved/HapticScan/inventory.json + wiring.md
+hapbeat-helper cues scan --unity <project> [--out <dir>] [--sdk-root <dir>]
+
+# the first draft from the inventory (contracts cue-table.md section 10), or empty cues by name;
+# also writes the bindings of <project-root>/hapbeat-scene.json
+hapbeat-helper cues init --inventory <inventory.json> (--out <new table> | --into <table>) [--project-root <dir>] [--dry-run]
+hapbeat-helper cues init --add punch,block --loop rub --out <new table>
+
+# the recording log (scene-recording.md section 5) + hapbeat-scene.json (section 6)
+#   -> session.json, checked against the cue table (section 7); --build also runs scene build
+hapbeat-helper scene session [--config hapbeat-scene.json] [--log <file>] [--require-all] [--build]
+hapbeat-helper scene session --lib-only        # only rewrite Saved/HapticViewer/viewer-lib.json
+hapbeat-helper scene check --session <session.json> [--cues <table>] [--require-all]
+
+# log writers to copy into the game (Unity C#, Unreal C++, JS)
+hapbeat-helper scene template unity|unreal|js --out <dir>
+```
+
+- Every command takes `--json` (one JSON object on stdout). Exit codes: 0 ok,
+  1 problems in the input (listed), 2 bad arguments or unreadable input.
+- `cues init` never changes a decided value of an existing table (`--into`) and
+  never overwrites a WAV. Items it cannot decide (a broadcast or non-position
+  target, no WAV) stay undecided and are listed for a human.
+- `scene session` writes nothing when the recording has an error: a cue the
+  table lacks, a take that fired something outside its `expect` / `allow` or
+  missed an `expect` cue, a loop cue without its level column, an unmapped SDK
+  `source`, a `fail` record, no `end`, or with `--require-all` a cue or variant
+  that never fired.
+
 ## Verify
 
 Quick smoke test using `websocat`:

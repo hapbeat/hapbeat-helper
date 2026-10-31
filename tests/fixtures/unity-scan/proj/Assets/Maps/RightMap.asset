@@ -1,0 +1,109 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0000000000000000000000000000001, type: 3}
+  m_Name: RightMap
+  m_EditorClassIdentifier: 
+  entries:
+  - _id: 2000000000000000000000000000000a
+    mode: 1
+    displayName: GrabLight
+    category: 
+    eventName: 
+    streamClip: {fileID: 8300000, guid: c0000000000000000000000000000001, type: 3}
+    loop: 0
+    bindings: []
+    gain: 1
+    target: player_1/pos_r_wrist
+    delayOffsetSeconds: 0
+    notes: 
+    manifestOverride: {fileID: 0}
+    _cachedManifestIntensity: 0.08
+  - _id: 2000000000000000000000000000000b
+    mode: 1
+    displayName: Rub
+    category: 
+    eventName: 
+    streamClip: {fileID: 8300000, guid: c0000000000000000000000000000002, type: 3}
+    loop: 1
+    bindings: 
+    - _id: e0000000000000000000000000000001
+      ownerObjectName:
+      sourceTransformPath: Knob
+      sourceProperty: 8
+      inputMin: 0
+      inputMax: 0.5
+      curveType: 4
+      customCurve:
+        serializedVersion: 2
+        m_Curve:
+        - serializedVersion: 3
+          time: 0
+          value: 0
+          inSlope: 1
+          outSlope: 1
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 1
+          value: 1
+          inSlope: 1
+          outSlope: 1
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        m_PreInfinity: 2
+        m_PostInfinity: 2
+        m_RotationOrder: 4
+      outputParameter: 0
+      outputMin: 0
+      outputMax: 2
+      debugLog: 0
+      debugLogInterval: 0.1
+      debugLogChangeThreshold: 0.02
+    gain: 0.5
+    target: player_1/pos_r_wrist
+    delayOffsetSeconds: 0
+    notes: 
+    manifestOverride: {fileID: 0}
+    _cachedManifestIntensity: -1
+  - _id: 2000000000000000000000000000000e
+    mode: 1
+    displayName: Hit
+    category: 
+    eventName: 
+    streamClip: {fileID: 8300000, guid: c0000000000000000000000000000003, type: 3}
+    loop: 0
+    bindings: []
+    gain: 1
+    target: player_1/pos_neck
+    delayOffsetSeconds: 0
+    notes: 
+    manifestOverride: {fileID: 0}
+    _cachedManifestIntensity: 1
+  - _id: 2000000000000000000000000000000f
+    mode: 1
+    displayName: Tap
+    category: 
+    eventName: 
+    streamClip: {fileID: 8300000, guid: c0000000000000000000000000000004, type: 3}
+    loop: 0
+    bindings: []
+    gain: 2.5
+    target: player_1/pos_r_wrist
+    delayOffsetSeconds: 0
+    notes: 
+    manifestOverride: {fileID: 0}
+    _cachedManifestIntensity: -1
+  revertPlayModeChanges: 0

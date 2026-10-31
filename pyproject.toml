@@ -56,6 +56,10 @@ hapbeat-helper = "hapbeat_helper.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# scene guide / scene template (AI-agent guide and recording log templates)
+[tool.setuptools.package-data]
+"hapbeat_helper.scene_guide" = ["*.md", "engines/*.md", "templates/*/*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

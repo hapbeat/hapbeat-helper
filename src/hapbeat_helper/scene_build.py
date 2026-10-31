@@ -171,6 +171,35 @@ def validate_levels(levels: Any, label: str = "levels") -> list[str]:
     return err
 
 
+def validate_takes(takes: Any, label: str = "takes") -> list[str]:
+    """Script parts (section 7.1): ``{start, end > start, label, expect?, allow?}``, sorted, not overlapping."""
+    if not isinstance(takes, list):
+        return [f"{label} must be a list"]
+    err: list[str] = []
+    prev_end = None
+    for i, take in enumerate(takes):
+        item = f"{label}[{i}]"
+        if not _is_record(take):
+            err.append(f"{item} must be an object")
+            prev_end = None
+            continue
+        start, end = take.get("start"), take.get("end")
+        ok_start = _is_int(start) and start >= 0
+        if not ok_start:
+            err.append(f"{item}.start must be an integer >= 0")
+        if not _is_int(end) or not ok_start or end <= start:
+            err.append(f"{item}.end must be an integer > start")
+        if not isinstance(take.get("label"), str):
+            err.append(f"{item}.label must be a string")
+        for key in ("expect", "allow"):
+            if key in take and not _string_list(take[key], CUE_REF):
+                err.append(f"{item}.{key} must be a list of <cue> or <cue>:<variant>")
+        if ok_start and prev_end is not None and start < prev_end:
+            err.append(f"{item} starts at {start}, before the previous take ends ({prev_end})")
+        prev_end = end if _is_int(end) else None
+    return err
+
+
 def validate_session(session: Any) -> list[str]:
     """Problems of a session.json (scene-session schema), one line each."""
     if not _is_record(session):
@@ -211,6 +240,8 @@ def validate_session(session: Any) -> list[str]:
                 err.append(f"{label}.note must be a string")
     if "levels" in session:
         err += validate_levels(session["levels"])
+    if "takes" in session:
+        err += validate_takes(session["takes"])
     if "lib" not in session:
         err.append("lib is required")
     else:
