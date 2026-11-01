@@ -22,6 +22,7 @@ import contextlib
 import io
 import json
 import logging
+import math
 import re
 import select
 import shutil
@@ -2305,6 +2306,19 @@ class HelperServer:
                 },
             }))
             return
+        # The device multiplies the session PCM by this gain and rejects a BEGIN
+        # outside 0..1. Clients send 1.0 (or omit it) and apply the strength to
+        # the PCM (contracts helper-streaming.md "Stream gain").
+        try:
+            gain = float(payload.get("gain", 1.0))
+        except (TypeError, ValueError):
+            gain = math.nan
+        if not (math.isfinite(gain) and 0.0 <= gain <= 1.0):
+            ack_payload = {"status": "error", "message": "gain must be a number from 0 to 1 (send 1.0)"}
+            if "stream_id" in payload:
+                ack_payload["stream_id"] = key[1]
+            await ws.send(json.dumps({"type": "stream_ack", "payload": ack_payload}))
+            return
         targets = _resolve_targets(payload, self.registry)
         if not targets:
             ack_payload = {"status": "no_target"}
@@ -2340,7 +2354,7 @@ class HelperServer:
             "channels": int(payload.get("channels", 1)),
             "fmt": 1 if payload.get("format", "adpcm") == "adpcm" else 0,
             "total_samples": int(payload.get("total_samples", 0)),
-            "gain": float(payload.get("gain", 1.0)),
+            "gain": gain,
             "target": str(payload.get("target", "")),
         }
         leases = self.udp.stream_leases

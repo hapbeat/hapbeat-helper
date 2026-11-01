@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from hapbeat_helper import protocol
@@ -110,3 +112,38 @@ async def test_serial_client_without_stream_id_keeps_working(monkeypatch):
         (protocol.CMD_STREAM_DATA, 1),
         (protocol.CMD_STREAM_END, 2),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gain", [1.5, -0.1, "nan", "inf", "loud", None])
+async def test_stream_begin_rejects_gain_outside_0_to_1(monkeypatch, gain):
+    """The device rejects a BEGIN gain outside 0..1; Helper answers error and sends nothing."""
+    server = HelperServer()
+    ws = _FakeWebSocket()
+    sent: list[bytes] = []
+    monkeypatch.setattr(server.udp, "send_raw", lambda packet, _ip: sent.append(packet) or True)
+    _classify_legacy(server, "192.168.0.7")
+    await server._handle_stream_begin(
+        ws, {"targets": ["192.168.0.7"], "stream_id": "s", "gain": gain})
+
+    assert sent == []
+    reply = json.loads(ws.messages[-1])
+    assert reply["type"] == "stream_ack"
+    assert reply["payload"]["status"] == "error"
+    assert reply["payload"]["stream_id"] == "s"
+    assert "192.168.0.7" not in server._active_streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gain", [0.0, 0.5, 1.0])
+async def test_stream_begin_passes_gain_within_0_to_1(monkeypatch, gain):
+    server = HelperServer()
+    ws = _FakeWebSocket()
+    sent: list[bytes] = []
+    monkeypatch.setattr(server.udp, "send_raw", lambda packet, _ip: sent.append(packet) or True)
+    _classify_legacy(server, "192.168.0.7")
+    await server._handle_stream_begin(
+        ws, {"targets": ["192.168.0.7"], "stream_id": "s", "gain": gain})
+
+    assert len(sent) == 1
+    assert json.loads(ws.messages[-1])["payload"]["status"] == "ok"

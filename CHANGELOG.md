@@ -43,6 +43,9 @@
 
 - 素材の強さの名前を `intensity` から `clip_gain` に変えた（DEC-103）: cue 表・一覧（`inventory.json`）の
   キー、`cues validate` のメッセージ、`cues scan --unity` が読む Unity の `_cachedManifestClipGain`。
+- `stream_begin` の `gain` が 0〜1 の外か数でない時は、`stream_ack` の `status: "error"` で拒み、
+  本体へ何も送らない（本体はその BEGIN を拒む）。クライアントは `gain` を省くか 1.0 を送り、
+  強さは PCM に掛ける（hapbeat-contracts `specs/helper-streaming.md`）。
 
 ### Fixed
 
