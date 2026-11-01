@@ -656,11 +656,11 @@ class _Scanner:
                     wav = self.wav_of(entry, label)
                     if wav:
                         ev["wav"] = wav
-                intensity = _float(entry.get("_cachedManifestIntensity"), -1.0)
-                if 0 <= intensity <= 1:
-                    ev["intensity"] = _num(intensity)
-                elif intensity >= 0:
-                    self.warn(f"{label}: _cachedManifestIntensity {intensity} is not 0..1 (left out)")
+                clip_gain = _float(entry.get("_cachedManifestClipGain"), -1.0)
+                if 0 <= clip_gain <= 1:
+                    ev["clip_gain"] = _num(clip_gain)
+                elif clip_gain >= 0:
+                    self.warn(f"{label}: _cachedManifestClipGain {clip_gain} is not 0..1 (left out)")
                 lm = self.level_map(entry, loop, label)
                 if lm is not None:
                     ev["levelMap"] = lm
@@ -776,7 +776,7 @@ def wiring_markdown(inv: dict) -> str:
         lines.append(f"- source: `{ev['source']}`")
         lines.append(
             f"- target: `{ev['target'] or '(everyone)'}`, loop: {str(ev['loop']).lower()}, gain: {ev['gain']}"
-            + (f", intensity: {ev['intensity']}" if "intensity" in ev else "")
+            + (f", clip_gain: {ev['clip_gain']}" if "clip_gain" in ev else "")
         )
         lines.append(f"- wav: `{ev['wav']}`" if ev.get("wav") else "- wav: (none)")
         if ev.get("levelMap"):

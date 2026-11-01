@@ -1,7 +1,7 @@
 """The event inventory (``hapbeat-contracts`` ``specs/cue-table.md`` section 10).
 
 One item per SDK event (an Event Map entry in Unity / Unreal), with what a first cue table needs:
-its id (``source``), name, loop, target, gain, haptic WAV, intensity and where it is fired.
+its id (``source``), name, loop, target, gain, haptic WAV, clip_gain and where it is fired.
 ``hapbeat-helper cues scan --unity`` writes it, ``hapbeat-helper cues init`` reads it; agents and
 people may also write it by hand (Unreal, games with their own cue layer).
 
@@ -103,8 +103,8 @@ def validate_inventory(inv: Any) -> list[str]:
             err.append(f"{label}.gain must be a number >= 0")
         if "wav" in e and not (isinstance(e["wav"], str) and e["wav"]):
             err.append(f"{label}.wav must be a non-empty path")
-        if "intensity" in e and not in_range(e["intensity"], 0, 1):
-            err.append(f"{label}.intensity must be 0..1")
+        if "clip_gain" in e and not in_range(e["clip_gain"], 0, 1):
+            err.append(f"{label}.clip_gain must be 0..1")
         if "levelMap" in e:
             if e.get("loop") is not True:
                 err.append(f"{label}.levelMap is for loop items")

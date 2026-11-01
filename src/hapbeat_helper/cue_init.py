@@ -108,7 +108,7 @@ class _Group:
 
 def _signature(ev: dict, rest: str, digest: str | None) -> str:
     return json.dumps(
-        [rest, ev["loop"], ev["gain"], digest, ev.get("intensity", 1), ev.get("levelMap") if ev["loop"] else None],
+        [rest, ev["loop"], ev["gain"], digest, ev.get("clip_gain", 1), ev.get("levelMap") if ev["loop"] else None],
         sort_keys=True,
     )
 
@@ -152,7 +152,7 @@ def _groups(items: list[_Item], table_cues: set[str], plan: Plan) -> list[_Group
         if len(sets) > 1 and any(i.named for i in members):
             sources = ", ".join(i.event["source"] for i in members)
             plan.errors.append(
-                f"{cue}: the items named {cue} cannot be merged (target, gain, WAV, intensity or levelMap "
+                f"{cue}: the items named {cue} cannot be merged (target, gain, WAV, clip_gain or levelMap "
                 f"differ): {sources}"
             )
         elif len(sets) > 1:
@@ -286,7 +286,7 @@ def plan_inventory(
         src = source_root / ev["wav"]
         clip, copy_needed = clips.name_for(g.cue.replace(":", "_"), src, g.items[0].digest)
         clips.planned.add(clip)
-        table["clips"][clip] = {"intensity": ev.get("intensity", 1), "loop": loop, "description": f"from {ev['wav']}"}
+        table["clips"][clip] = {"clip_gain": ev.get("clip_gain", 1), "loop": loop, "description": f"from {ev['wav']}"}
         plan.added["clips"].append(clip)
         if copy_needed:
             plan.copies.append((src, clips_dir / f"{clip}.wav"))

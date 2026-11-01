@@ -66,11 +66,11 @@ def test_rule1_kit(table):
 
 def test_rule2_clips(table, tmp_path):
     t = copy.deepcopy(table)
-    t["clips"]["Bad Name"] = {"intensity": 1, "loop": False}
+    t["clips"]["Bad Name"] = {"clip_gain": 1, "loop": False}
     _one(t, "clip name Bad Name")
     t = copy.deepcopy(table)
-    t["clips"]["roar"]["intensity"] = 1.5
-    _one(t, "clip roar: intensity must be 0..1")
+    t["clips"]["roar"]["clip_gain"] = 1.5
+    _one(t, "clip roar: clip_gain must be 0..1")
     t = copy.deepcopy(table)
     del t["clips"]["roar"]["loop"]
     _one(t, "clip roar: loop must be true/false")
@@ -84,11 +84,11 @@ def test_rule2_clips(table, tmp_path):
 
 def test_rule3_sounds(table, tmp_path):
     t = copy.deepcopy(table)
-    t["sounds"]["9bad"] = {"intensity": 1}
+    t["sounds"]["9bad"] = {"clip_gain": 1}
     _one(t, "sound name 9bad")
     t = copy.deepcopy(table)
-    t["sounds"]["Rub"]["intensity"] = -0.1
-    _one(t, "sound Rub: intensity must be 0..1")
+    t["sounds"]["Rub"]["clip_gain"] = -0.1
+    _one(t, "sound Rub: clip_gain must be 0..1")
     t = copy.deepcopy(table)
     t["sounds"]["Rub"]["syncMs"] = 700000
     _one(t, "sound Rub: syncMs")

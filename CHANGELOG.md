@@ -39,6 +39,11 @@
   （`stream_orphans`）を加えた。イベントループが 2 秒以上止まったら、その時点のループの
   スタックをログに出す（最短 1 分間隔）。
 
+### Changed
+
+- 素材の強さの名前を `intensity` から `clip_gain` に変えた（DEC-103）: cue 表・一覧（`inventory.json`）の
+  キー、`cues validate` のメッセージ、`cues scan --unity` が読む Unity の `_cachedManifestClipGain`。
+
 ### Fixed
 
 - Windows の自動起動タスクが優先度「通常未満」で動き、PC が重い時にイベントループが

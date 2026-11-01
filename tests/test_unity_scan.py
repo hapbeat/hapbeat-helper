@@ -63,18 +63,18 @@ def test_scan_entry_fields(project):
     grab = events[LEFT_GRAB]
     assert grab == {
         "source": LEFT_GRAB, "map": "b0000000000000000000000000000001", "name": "GrabLight", "loop": False, "target": "player_1/pos_l_wrist", "gain": 1,
-        "wav": "Assets/Clips/grab.wav", "intensity": 0.08,
+        "wav": "Assets/Clips/grab.wav", "clip_gain": 0.08,
         "where": ["Assets/Scenes/Main.unity: Left Hand/Grab (HapbeatUnityEventTrigger._entryId)"],
     }
     rub = events["unity:b0000000000000000000000000000001/1000000000000000000000000000000b"]
-    assert rub["loop"] is True and "intensity" not in rub  # -1 = not resolved
+    assert rub["loop"] is True and "clip_gain" not in rub  # -1 = not resolved
     assert rub["levelMap"] == {"points": [[1, 2]], "curve": "linear"}  # StreamGain binding, output 0..2
 
 
 def test_scan_command_entry_has_no_wav(project):
     ping = by_source(unity_scan.scan(project).inventory)["unity:b0000000000000000000000000000001/1000000000000000000000000000000c"]
     assert ping["name"] == "ping"  # eventName for a Command entry
-    assert "wav" not in ping and ping["target"] == "" and ping["intensity"] == 0.6
+    assert "wav" not in ping and ping["target"] == "" and ping["clip_gain"] == 0.6
     assert "ui.ping" in ping["note"]
 
 

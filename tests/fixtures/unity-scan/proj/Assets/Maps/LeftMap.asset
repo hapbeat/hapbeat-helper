@@ -27,7 +27,7 @@ MonoBehaviour:
     notes: 'Kit-free StreamClip: streamed from the PC. A long note that
       continues on the next line.'
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: 0.08
+    _cachedManifestClipGain: 0.08
   - _id: 1000000000000000000000000000000b
     mode: 1
     displayName: Rub
@@ -78,7 +78,7 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: -1
+    _cachedManifestClipGain: -1
   - _id: 1000000000000000000000000000000c
     mode: 0
     displayName: Ping Display
@@ -92,7 +92,7 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: 0.6
+    _cachedManifestClipGain: 0.6
   - _id: 
     mode: 1
     displayName: NoId
@@ -106,7 +106,7 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: -1
+    _cachedManifestClipGain: -1
   - _id: 1000000000000000000000000000000e
     mode: 1
     displayName: Hit
@@ -120,5 +120,5 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: 1
+    _cachedManifestClipGain: 1
   revertPlayModeChanges: 0

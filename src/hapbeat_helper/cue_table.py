@@ -192,8 +192,8 @@ class _Checker:
         if not _is_record(clip):
             self.add(f"clip {name} must be an object")
             return
-        if not in_range(clip.get("intensity"), 0, 1):
-            self.add(f"clip {name}: intensity must be 0..1")
+        if not in_range(clip.get("clip_gain"), 0, 1):
+            self.add(f"clip {name}: clip_gain must be 0..1")
         if not isinstance(clip.get("loop"), bool):
             self.add(f"clip {name}: loop must be true/false")
         if "description" in clip and not isinstance(clip["description"], str):
@@ -210,8 +210,8 @@ class _Checker:
         if not _is_record(entry):
             self.add(f"sound {name} must be an object")
         else:
-            if not in_range(entry.get("intensity"), 0, 1):
-                self.add(f"sound {name}: intensity must be 0..1")
+            if not in_range(entry.get("clip_gain"), 0, 1):
+                self.add(f"sound {name}: clip_gain must be 0..1")
             if "syncMs" in entry and not in_range(entry["syncMs"], 0, SYNC_MAX_MS):
                 self.add(f"sound {name}: syncMs must be 0..{SYNC_MAX_MS}")
         if self.sound_wav_missing(name):

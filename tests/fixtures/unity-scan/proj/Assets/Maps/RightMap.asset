@@ -26,7 +26,7 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: 0.08
+    _cachedManifestClipGain: 0.08
   - _id: 2000000000000000000000000000000b
     mode: 1
     displayName: Rub
@@ -77,7 +77,7 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: -1
+    _cachedManifestClipGain: -1
   - _id: 2000000000000000000000000000000e
     mode: 1
     displayName: Hit
@@ -91,7 +91,7 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: 1
+    _cachedManifestClipGain: 1
   - _id: 2000000000000000000000000000000f
     mode: 1
     displayName: Tap
@@ -105,5 +105,5 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: -1
+    _cachedManifestClipGain: -1
   revertPlayModeChanges: 0

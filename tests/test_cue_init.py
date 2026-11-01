@@ -76,9 +76,9 @@ def test_inventory_to_table(capsys, scanned):
     clips = game / "Haptics" / "Clips"
     assert validate_cue_table(table, clips) == []
     assert table["kit"] == "proj-kit" and table["sounds"] == {}
-    # The left / right pair -> one route at the acting hand; levelMap and intensity carried over.
+    # The left / right pair -> one route at the acting hand; levelMap and clip_gain carried over.
     assert table["cues"]["grab_light"]["haptics"] == [{"clip": "grab_light", "at": "hand", "gain": 1}]
-    assert table["clips"]["grab_light"] == {"intensity": 0.08, "loop": False, "description": "from Assets/Clips/grab.wav"}
+    assert table["clips"]["grab_light"] == {"clip_gain": 0.08, "loop": False, "description": "from Assets/Clips/grab.wav"}
     assert table["cues"]["rub"]["loop"] is True
     assert table["cues"]["rub"]["haptics"][0]["levelMap"] == {"points": [[1, 2]], "curve": "linear"}
     assert table["cues"]["grab_light"]["review"] == {"haptics": "tentative"}
@@ -135,7 +135,7 @@ def test_into_keeps_existing_values(capsys, tmp_path):
     write_wav(root / "src" / "a.wav")
     table_path = root / "cues.json"
     existing = {
-        "schema_version": 1, "kit": "mine-kit", "clips": {"grab_light": {"intensity": 0.5, "loop": False}},
+        "schema_version": 1, "kit": "mine-kit", "clips": {"grab_light": {"clip_gain": 0.5, "loop": False}},
         "sounds": {}, "cues": {"grab_light": {"description": "decided", "sfx": None, "haptics": [{"clip": "grab_light", "at": "both", "gain": 0.3}]}},
     }
     table_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")

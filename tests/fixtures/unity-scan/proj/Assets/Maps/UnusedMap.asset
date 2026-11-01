@@ -26,5 +26,5 @@ MonoBehaviour:
     delayOffsetSeconds: 0
     notes: 
     manifestOverride: {fileID: 0}
-    _cachedManifestIntensity: -1
+    _cachedManifestClipGain: -1
   revertPlayModeChanges: 0
