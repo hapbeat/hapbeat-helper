@@ -34,8 +34,9 @@ import threading
 import time
 import traceback
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from websockets.exceptions import ConnectionClosed
 
@@ -108,6 +109,32 @@ LOOP_STUCK_DUMP_EVERY_S = 60.0
 # late END (it would stop the next stream), so it gets the single END only.
 STREAM_END_REPEATS = 2
 STREAM_END_REPEAT_INTERVAL_S = 0.1
+
+# Stream Gen 2 sender rules (contracts stream-session.md, Sender requirements).
+# A lost BEGIN silences the whole session, so it is resent before each of the
+# first STREAM_BEGIN_REPEATS DATA blocks and then this often (an equal BEGIN is
+# idempotent). Stream Gen 1 firmware resets its buffer on BEGIN: never resent.
+STREAM_BEGIN_REPEATS = 3
+STREAM_BEGIN_REPEAT_INTERVAL_S = 0.5
+# A gap of our own this long (PC suspended, loop stalled) may have outlasted
+# the device's 5 s inactivity timeout: end and begin a new generation.
+STREAM_OWN_GAP_S = 3.0
+# Keep refreshing a device's lease by extended PING for one lease TTL after
+# its last session ended (Discovery lease), then let it expire so another
+# application can get the device back (the re-issue rule).
+STREAM_LEASE_HOLD_S = 15.0
+
+# stream_lost reasons (contracts helper-streaming.md).
+STREAM_LOST_DEVICE_REBOOTED = "device_rebooted"
+STREAM_LOST_LEASE_CHANGED = "lease_changed"
+STREAM_LOST_SUPERSEDED = "superseded"
+STREAM_LOST_STOPPED = "stopped"
+STREAM_LOST_TARGET_MISMATCH = "target_mismatch"
+STREAM_LOST_UNREACHABLE = "unreachable"
+
+# helper_hello features (contracts helper-ws.md): behaviors a request type
+# alone does not show.
+HELPER_FEATURES = ["stream_gen2", "stream_lost", "stream_takeover", "device_caps"]
 
 
 def _device_to_dict(ip: str, dev: HapbeatDevice) -> dict:
@@ -188,8 +215,32 @@ def _address_routed_ips(target: str, registry: DeviceRegistry) -> list[str]:
     return ips
 
 
+@dataclass
+class _StreamWire:
+    """One device's session inside an active client transaction."""
+    mode: str  # stream_session.GEN2 / GEN1
+    identity: Optional[stream_session.StreamIdentity]
+    begin: dict  # protocol.build_stream_begin(_v2) keyword arguments
+    next_offset: int = 0  # Stream Gen 2 byte offset (bytes this session carried)
+    data_sent: int = 0
+    began_at: float = 0.0  # the first BEGIN (repeats do not restart the device's timer)
+    last_begin_at: float = 0.0
+    last_data_at: float = 0.0
+    recovering: bool = False
+
+
+def _envelope(identity: stream_session.StreamIdentity) -> bytes:
+    return protocol.stream_envelope(identity.boot_id, identity.ticket, identity.generation)
+
+
+def _helper_generation(version: str) -> int:
+    """Helper's major from its version string (``1.0.0d3`` -> 1)."""
+    match = re.match(r"\d+", version)
+    return int(match.group()) if match else 0
+
+
 class _DelayedLegacyStart:
-    """A legacy (pre-v2) stream session whose BEGIN waits out the guard."""
+    """A Stream Gen 1 session whose BEGIN waits out the END->BEGIN guard."""
 
     def __init__(self, begin_pkt: bytes, delay: float) -> None:
         self.begin_pkt = begin_pkt
@@ -252,9 +303,19 @@ class HelperServer:
         self._stream_sequences: dict[tuple[int, str], int] = {}
         # Streams already told they have no session (see _note_stream_orphan).
         self._orphan_notified: set[tuple[int, str]] = set()
-        # ip -> wire format fixed at STREAM_BEGIN for the session that owns
-        # the ip: [mode, StreamIdentity|None, next v2 byte offset].
-        self._stream_wire: dict[str, list] = {}
+        # ip -> the device-side session of the transaction that owns the ip.
+        self._stream_wire: dict[str, _StreamWire] = {}
+        # ip -> identity of the Stream Gen 2 session last ended there (a
+        # device ERROR about it is still ours, message-format.md §0xFF).
+        self._ended_identity: dict[str, stream_session.StreamIdentity] = {}
+        # ip -> until when the scan keeps refreshing its lease after a session.
+        self._lease_hold_until: dict[str, float] = {}
+        # (ip, code) of non-stream device ERRORs already logged.
+        self._warned_errors: set[tuple[str, int]] = set()
+        self._device_errors_since_health = 0
+        self._stream_lost_since_health = 0
+        # Stream timing clock (tests replace it).
+        self._clock = time.monotonic
         # ip -> legacy session whose BEGIN waits out the END->BEGIN guard.
         self._legacy_delayed: dict[str, _DelayedLegacyStart] = {}
         self._scan_task: Optional[asyncio.Task] = None
@@ -308,6 +369,9 @@ class HelperServer:
         # log_tail threads alive after the last Studio tab closes.
         self._agent_clients: set[Any] = set()
 
+        # WebSocket request type -> handler (see _build_handlers).
+        self._handlers = self._build_handlers()
+
     def _get_tcp_lock(self, ip: str) -> asyncio.Lock:
         lock = self._tcp_locks.get(ip)
         if lock is None:
@@ -350,6 +414,8 @@ class HelperServer:
 
         # Wire subsystems into the registry / WS broadcast pipeline
         self.udp.add_pong_listener(self._on_pong)
+        self.udp.add_lease_change_listener(self._on_lease_change)
+        self.udp.add_error_listener(self._on_device_error)
         self.mdns.add_found_listener(self._on_mdns_found)
         self.mdns.add_removed_listener(self._on_mdns_removed)
         self.registry.add_change_listener(self._on_registry_change)
@@ -407,28 +473,36 @@ class HelperServer:
                 # Off the loop: the broadcast refreshes the route list through
                 # ifaddr.get_adapters(), 10-100 ms here and longer while Windows
                 # reconfigures an adapter, and the loop also carries stream DATA.
-                await asyncio.to_thread(self._send_scan_pings)
+                await asyncio.to_thread(self._send_scan_pings, self._lease_ips())
                 await asyncio.sleep(2.0)
                 # Detect liveness transitions and push if anything flipped.
                 current = {
                     ip: d.is_online for ip, d in self.registry.get_all_devices().items()
                 }
                 if current != last_online_state:
+                    went_offline = [ip for ip, online in current.items()
+                                    if not online and last_online_state.get(ip)]
                     last_online_state = current
+                    if went_offline:
+                        await self._on_devices_offline(went_offline)
                     self._post_to_loop(self._broadcast(self._device_list_msg()))
         except asyncio.CancelledError:
             pass
 
-    def _send_scan_pings(self) -> None:
+    def _send_scan_pings(self, lease_ips: set[str] = frozenset()) -> None:
+        """One scan tick: an 8-byte broadcast PING for discovery, and a unicast
+        PING to every known device. Devices in ``lease_ips`` get the extended
+        PING that refreshes the helper's stream lease (every 2 s, within the
+        lease TTL / 3); the rest the 8-byte one, which never takes a lease."""
         self.udp.send_broadcast_ping()
         # Also unicast-PING every known device. Wi-Fi APs deliver broadcasts
         # on the DTIM beacon at the lowest rate and many power-saving stations
         # drop them — that intermittent loss is what made cards flap offline
         # for a moment (user report 2026-06-13). Unicast frames are
         # buffered/retried by the AP, so a sleepy ESP32 still gets them.
-        for ip in self.registry.get_all_ips():
+        for ip in sorted(set(self.registry.get_all_ips()) | set(lease_ips)):
             try:
-                self.udp.send_ping(ip)
+                self.udp.send_ping(ip, lease=ip in lease_ips)
             except OSError:
                 pass  # interface change mid-scan — next tick recovers
 
@@ -508,10 +582,13 @@ class HelperServer:
         tails = sum(1 for t in threads if t.name.startswith("log-tail-sup-"))
         pongs, self._pongs_since_health = self._pongs_since_health, 0
         orphans, self._stream_orphans_since_health = self._stream_orphans_since_health, 0
+        errors, self._device_errors_since_health = self._device_errors_since_health, 0
+        lost, self._stream_lost_since_health = self._stream_lost_since_health, 0
         return (
             f"up={up // 3600}h{up % 3600 // 60:02d}m "
             f"clients={len(self._clients)} (agent={len(self._agent_clients)}) "
             f"streams={len(self._active_streams)} stream_orphans={orphans} "
+            f"device_errors={errors} stream_lost={lost} "
             f"devices={online}/{len(devices)} online pongs={pongs} modes={modes} "
             f"log_tails={len(self._log_threads)} (threads={tails}) "
             f"threads={len(threads)} tasks={len(asyncio.all_tasks())} "
@@ -607,10 +684,7 @@ class HelperServer:
             # Send helper hello (= version) FIRST so Studio can render it
             # before any device events arrive. Studio displays this in
             # the header next to the "Helper 接続中" indicator.
-            await ws.send(json.dumps({
-                "type": "helper_hello",
-                "payload": {"version": _helper_version},
-            }))
+            await ws.send(json.dumps(self._helper_hello_msg(_helper_version)))
             await ws.send(json.dumps(self._device_list_msg()))
             async for raw in ws:
                 try:
@@ -663,6 +737,20 @@ class HelperServer:
                 self._stop_all_log_tails()
             logger.info("Studio disconnected: %s", remote)
 
+    def _helper_hello_msg(self, version: str) -> dict:
+        """The first message on every connection (contracts helper-ws.md):
+        clients enable features from ``types`` / ``features``, never from
+        ``version``."""
+        return {
+            "type": "helper_hello",
+            "payload": {
+                "version": version,
+                "generation": _helper_generation(version),
+                "types": sorted(self._handlers),
+                "features": list(HELPER_FEATURES),
+            },
+        }
+
     def _stop_all_log_tails(self) -> None:
         for ip in list(self._log_threads.keys()):
             stop = self._log_stop_flags.pop(ip, None)
@@ -673,38 +761,70 @@ class HelperServer:
     async def _dispatch(self, ws, msg: dict) -> None:
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {})
+        handler = self._handlers.get(msg_type)
+        if handler is None:
+            await ws.send(json.dumps({
+                "type": "error",
+                "payload": {"message": f"unknown type: {msg_type}"},
+            }))
+            return
+        await handler(ws, payload)
 
-        if msg_type == "ping":
+    def _build_handlers(self) -> dict[str, Callable[[Any, dict], Awaitable[None]]]:
+        """Every WebSocket request type and its handler.
+
+        helper_hello announces this table's keys as ``types`` (contracts
+        helper-ws.md), so a request type is defined here and nowhere else.
+        """
+        handlers: dict[str, Callable[[Any, dict], Awaitable[None]]] = {}
+
+        def on(msg_type: str):
+            def register(fn):
+                handlers[msg_type] = fn
+                return fn
+            return register
+
+        @on("ping")
+        async def _(ws, payload: dict) -> None:
             await ws.send(json.dumps({"type": "pong", "payload": {}}))
 
-        elif msg_type == "list_devices":
+        @on("list_devices")
+        async def _(ws, payload: dict) -> None:
             await ws.send(json.dumps(self._device_list_msg()))
 
         # Agent relay — routed here only, never through the device handlers
         # and never broadcast.
-        elif msg_type == "agent_endpoint_register":
+        @on("agent_endpoint_register")
+        async def _(ws, payload: dict) -> None:
             await self._handle_agent_endpoint_register(ws, payload)
 
-        elif msg_type == "agent_endpoint_unregister":
+        @on("agent_endpoint_unregister")
+        async def _(ws, payload: dict) -> None:
             self._handle_agent_endpoint_unregister(ws)
 
-        elif msg_type == "agent_request":
+        @on("agent_request")
+        async def _(ws, payload: dict) -> None:
             await self._handle_agent_request(ws, payload)
 
-        elif msg_type == "agent_response":
+        @on("agent_response")
+        async def _(ws, payload: dict) -> None:
             await self._handle_agent_response(ws, payload)
 
         # Material ledger — local files only, never reaches a device.
-        elif msg_type == "material_lookup":
+        @on("material_lookup")
+        async def _(ws, payload: dict) -> None:
             await self._handle_material_lookup(ws, payload)
 
-        elif msg_type == "material_register_derived":
+        @on("material_register_derived")
+        async def _(ws, payload: dict) -> None:
             await self._handle_material_register_derived(ws, payload)
 
-        elif msg_type == "material_credits":
+        @on("material_credits")
+        async def _(ws, payload: dict) -> None:
             await self._handle_material_credits(ws, payload)
 
-        elif msg_type == "rescan":
+        @on("rescan")
+        async def _(ws, payload: dict) -> None:
             # Trigger an immediate UDP broadcast PING + push the latest
             # device_list so the requester sees a fresh snapshot without
             # waiting for the next 2s scan tick.
@@ -716,7 +836,8 @@ class HelperServer:
             await asyncio.sleep(0.25)
             await self._broadcast(self._device_list_msg())
 
-        elif msg_type == "reset_discovery":
+        @on("reset_discovery")
+        async def _(ws, payload: dict) -> None:
             # In-process recovery: rebuild the UDP socket + recv thread and the
             # mDNS browser without restarting the daemon. This is the Studio-
             # triggered equivalent of `hapbeat-helper stop && start` for a
@@ -724,19 +845,23 @@ class HelperServer:
             # SIO_UDP_CONNRESET, but kept as a manual escape hatch).
             await self._handle_reset_discovery(ws)
 
-        elif msg_type == "preview_event":
+        @on("preview_event")
+        async def _(ws, payload: dict) -> None:
             await self._handle_preview_event(ws, payload)
 
-        elif msg_type == "stop_event":
+        @on("stop_event")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stop_event(ws, payload)
 
-        elif msg_type == "write_ui_config":
+        @on("write_ui_config")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "write_ui_config",
                               "config": payload.get("config")},
             )
 
-        elif msg_type == "set_wifi":
+        @on("set_wifi")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_wifi",
@@ -744,27 +869,31 @@ class HelperServer:
                  "pass": payload.get("password", payload.get("pass", ""))},
             )
 
-        elif msg_type == "set_name":
+        @on("set_name")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_name", "name": payload.get("name", "")},
             )
 
-        elif msg_type == "set_address":
+        @on("set_address")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_address",
                  "address": payload.get("address", "")},
             )
 
-        elif msg_type == "set_oled_brightness":
+        @on("set_oled_brightness")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_oled_brightness",
                  "level": int(payload.get("level", 2))},
             )
 
-        elif msg_type == "get_oled_brightness":
+        @on("get_oled_brightness")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_oled_brightness", "oled_brightness_result",
                 lambda r: {"level": r.get("level", 2)},
@@ -777,7 +906,8 @@ class HelperServer:
         # so only include a field in the outgoing cmd dict if the caller
         # actually sent it — do NOT backfill with defaults here, that
         # would defeat the firmware's "omitted = leave unchanged" contract.
-        elif msg_type == "set_haptic_gain":
+        @on("set_haptic_gain")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_haptic_gain"}
             if "pam_db" in payload:
                 cmd["pam_db"] = int(payload["pam_db"])
@@ -787,7 +917,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_dac_boost":
+        @on("set_dac_boost")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_dac_boost"}
             if "boost_db" in payload:
                 cmd["boost_db"] = int(payload["boost_db"])
@@ -795,7 +926,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_headphone_volume":
+        @on("set_headphone_volume")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_headphone_volume"}
             if "hp_db" in payload:
                 cmd["hp_db"] = int(payload["hp_db"])
@@ -803,7 +935,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_stream_buffer":
+        @on("set_stream_buffer")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_stream_buffer"}
             if "buffer_ms" in payload:
                 cmd["buffer_ms"] = int(payload["buffer_ms"])
@@ -811,7 +944,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_input_mode":
+        @on("set_input_mode")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_input_mode"}
             if "mode" in payload:
                 cmd["mode"] = str(payload["mode"])
@@ -819,7 +953,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_eq_band":
+        @on("set_eq_band")
+        async def _(ws, payload: dict) -> None:
             # DuoWL v4 in-codec EQ (audio-dsp-config.md §2). Partial-update
             # forwarding like the other DuoWL v4 audio setters.
             cmd = {"cmd": "set_eq_band"}
@@ -835,7 +970,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_av_delay":
+        @on("set_av_delay")
+        async def _(ws, payload: dict) -> None:
             # DuoWL v4 audio-vs-haptic delay (audio-dsp-config.md §3). Signed
             # ms (-100..+100): negative delays haptic, positive delays HP.
             cmd = {"cmd": "set_av_delay"}
@@ -849,7 +985,8 @@ class HelperServer:
         # Processing-block profile + the blocks it unlocks (6-band EQ, 1st-order
         # IIR, DRC compressor, 3D, beep test-tone, line-in AGC). All partial-
         # update forwards, same style as the DEC-041 audio setters above.
-        elif msg_type == "set_dsp_profile":
+        @on("set_dsp_profile")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_dsp_profile"}
             if "codec" in payload:
                 cmd["codec"] = str(payload["codec"])
@@ -859,7 +996,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_eq_iir":
+        @on("set_eq_iir")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_eq_iir"}
             if "codec" in payload:
                 cmd["codec"] = str(payload["codec"])
@@ -869,7 +1007,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_drc":
+        @on("set_drc")
+        async def _(ws, payload: dict) -> None:
             # hold/attack/decay are RAW hardware codes (0..15), not dB/ms.
             cmd = {"cmd": "set_drc"}
             if "codec" in payload:
@@ -884,7 +1023,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_beep":
+        @on("set_beep")
+        async def _(ws, payload: dict) -> None:
             # One-shot test tone (profile "full" only). enable=false stops it.
             cmd = {"cmd": "set_beep"}
             if "codec" in payload:
@@ -896,7 +1036,8 @@ class HelperServer:
                 cmd["enable"] = bool(payload["enable"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_3d":
+        @on("set_3d")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_3d"}
             if "codec" in payload:
                 cmd["codec"] = str(payload["codec"])
@@ -906,7 +1047,8 @@ class HelperServer:
                 cmd["persist"] = bool(payload["persist"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_agc":
+        @on("set_agc")
+        async def _(ws, payload: dict) -> None:
             # Line-in (HP codec) AGC — no `codec` field by design.
             cmd = {"cmd": "set_agc"}
             if "enable" in payload:
@@ -923,7 +1065,8 @@ class HelperServer:
         # Only the `band_v4_pwm` build implements these; every other build
         # replies "unknown cmd", so the helper relays board-agnostically
         # (same policy as the DEC-041 audio setters above).
-        elif msg_type == "set_pwm_bias":
+        @on("set_pwm_bias")
+        async def _(ws, payload: dict) -> None:
             # Standing DC bias. Keep accepting legacy `duty`, but preserve the
             # explicit idle_duty field so callers cannot confuse it with the
             # profile used while audio is actually playing.
@@ -936,13 +1079,15 @@ class HelperServer:
                 cmd["ma"] = int(payload["ma"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_play_bias":
+        @on("set_pwm_play_bias")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_pwm_play_bias"}
             if "duty" in payload:
                 cmd["duty"] = float(payload["duty"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_bias_enabled":
+        @on("set_pwm_bias_enabled")
+        async def _(ws, payload: dict) -> None:
             # Device-owned persistent gate for the two saved DC profiles.
             # Keep false explicit; a truthiness fallback would turn OFF into ON.
             cmd = {"cmd": "set_pwm_bias_enabled"}
@@ -950,19 +1095,22 @@ class HelperServer:
                 cmd["enabled"] = bool(payload["enabled"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_playback_gain":
+        @on("set_pwm_playback_gain")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_pwm_playback_gain"}
             if "db" in payload:
                 cmd["db"] = int(payload["db"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_post_play_hold":
+        @on("set_pwm_post_play_hold")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_pwm_post_play_hold"}
             if "ms" in payload:
                 cmd["ms"] = int(payload["ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_pwm_post_play_return":
+        @on("set_pwm_post_play_return")
+        async def _(ws, payload: dict) -> None:
             # The device owns this timer and persists it with the two bias
             # profiles. Helper only relays the explicit duration.
             cmd = {"cmd": "set_pwm_post_play_return"}
@@ -970,7 +1118,8 @@ class HelperServer:
                 cmd["ms"] = int(payload["ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_haptic_output_mode":
+        @on("set_haptic_output_mode")
+        async def _(ws, payload: dict) -> None:
             # Runtime A/B switch inside the hybrid band_v4_pwm firmware. The
             # device owns persistence and the safety-critical PAM/GPIO handoff;
             # Helper only preserves the explicit mode string.
@@ -979,7 +1128,8 @@ class HelperServer:
                 cmd["mode"] = str(payload["mode"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_bias_test":
+        @on("pwm_bias_test")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "pwm_bias_test"}
             if "enabled" in payload:
                 cmd["enabled"] = bool(payload["enabled"])
@@ -989,7 +1139,8 @@ class HelperServer:
                 cmd["profile"] = str(payload["profile"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_rewind":
+        @on("pwm_rewind")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "pwm_rewind"}
             if "duty" in payload:
                 cmd["duty"] = float(payload["duty"])
@@ -997,10 +1148,12 @@ class HelperServer:
                 cmd["ms"] = int(payload["ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_bias_off":
+        @on("pwm_bias_off")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(ws, payload, {"cmd": "pwm_bias_off"})
 
-        elif msg_type == "pwm_tone":
+        @on("pwm_tone")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "pwm_tone"}
             if "hz" in payload:
                 cmd["hz"] = int(payload["hz"])
@@ -1012,20 +1165,23 @@ class HelperServer:
                 cmd["wave"] = str(payload["wave"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_volume":
+        @on("set_volume")
+        async def _(ws, payload: dict) -> None:
             cmd = {"cmd": "set_volume"}
             if "level" in payload:
                 cmd["level"] = int(payload["level"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "pwm_status":
+        @on("pwm_status")
+        async def _(ws, payload: dict) -> None:
             # Rich status dict (state / carrier / bias / underruns / clips) —
             # pass through verbatim, the helper has no business filtering it.
             await self._handle_passthrough_query(
                 ws, payload, {"cmd": "pwm_status"}, "pwm_status_result",
             )
 
-        elif msg_type == "pwm_probe":
+        @on("pwm_probe")
+        async def _(ws, payload: dict) -> None:
             # The device BLOCKS for up to 3 s driving the gates directly.
             # _send_tcp_passthrough reads with timeout=10 s, so the reply
             # still lands well inside the window — no special-casing needed.
@@ -1038,12 +1194,14 @@ class HelperServer:
                 ws, payload, cmd, "pwm_probe_result",
             )
 
-        elif msg_type == "reboot":
+        @on("reboot")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "reboot"},
             )
 
-        elif msg_type == "clear_wifi":
+        @on("clear_wifi")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "clear_wifi"},
             )
@@ -1054,7 +1212,8 @@ class HelperServer:
         # spammed `ERROR: unknown type: get_ap_status` toasts every time.
         # The firmware (tcp_server.cpp) already implements all five — we
         # just need to relay them.
-        elif msg_type == "get_ap_status":
+        @on("get_ap_status")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_ap_status", "ap_status_result",
                 lambda r: {
@@ -1066,29 +1225,55 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "enter_ap_mode":
+        @on("enter_ap_mode")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "enter_ap_mode"},
             )
 
-        elif msg_type == "enter_sta_mode":
+        @on("enter_sta_mode")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "enter_sta_mode"},
             )
 
-        elif msg_type == "set_ap_pass":
+        @on("set_ap_pass")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_ap_pass",
                  "pass": payload.get("password", payload.get("pass", ""))},
             )
 
-        elif msg_type == "clear_ap_pass":
+        @on("clear_ap_pass")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload, {"cmd": "clear_ap_pass"},
             )
 
-        elif msg_type == "get_info":
+        @on("reset_storage")
+        async def _(ws, payload: dict) -> None:
+            # Clears a storage area the device reported in get_info's
+            # storage_incompatible (serial-config.md §4.23). Studio asks the
+            # user first; the device refuses an area that is not listed.
+            area = payload.get("area")
+            if not isinstance(area, str):
+                await ws.send(json.dumps({
+                    "type": "write_result",
+                    "payload": {
+                        "success": False,
+                        "error": "invalid_area",
+                        "message": "reset_storage: payload.area must be a string",
+                        "cmd": "reset_storage",
+                    },
+                }))
+                return
+            await self._handle_tcp_command(
+                ws, payload, {"cmd": "reset_storage", "area": area},
+            )
+
+        @on("get_info")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_info", "get_info_result",
                 lambda r: {
@@ -1155,10 +1340,19 @@ class HelperServer:
                     # {carrier_hz, gpio_a, gpio_b, state}. Absent on every
                     # other build — Studio keys the PWM tab off its presence.
                     "haptic_pwm": r.get("haptic_pwm"),
+                    # Capabilities and storage state (serial-config.md §4.1,
+                    # message-format.md §11), copied untouched — unknown
+                    # entries included — so Studio decides from the device's
+                    # own declaration. Absent (None) on 0.x firmware.
+                    "caps": r.get("caps"),
+                    "stream_formats": r.get("stream_formats"),
+                    "stream_protocol": r.get("stream_protocol"),
+                    "storage_incompatible": r.get("storage_incompatible"),
                 },
             )
 
-        elif msg_type == "get_wifi_status":
+        @on("get_wifi_status")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "get_wifi_status", "wifi_status_result",
                 lambda r: {
@@ -1170,7 +1364,8 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "list_wifi_profiles":
+        @on("list_wifi_profiles")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "list_wifi_profiles", "wifi_profiles_result",
                 lambda r: {
@@ -1180,21 +1375,24 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "connect_wifi_profile":
+        @on("connect_wifi_profile")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "connect_wifi_profile",
                  "index": int(payload.get("index", 0))},
             )
 
-        elif msg_type == "remove_wifi_profile":
+        @on("remove_wifi_profile")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "remove_wifi_profile",
                  "index": int(payload.get("index", 0))},
             )
 
-        elif msg_type == "get_debug_dump":
+        @on("get_debug_dump")
+        async def _(ws, payload: dict) -> None:
             # The debug dump response is a fat dict — pass it through
             # verbatim so the UI can render every field without the
             # helper having to know the schema.
@@ -1203,12 +1401,14 @@ class HelperServer:
                 "debug_dump_result",
             )
 
-        elif msg_type == "kit_list":
+        @on("kit_list")
+        async def _(ws, payload: dict) -> None:
             await self._handle_passthrough_query(
                 ws, payload, {"cmd": "kit_list"}, "kit_list_result",
             )
 
-        elif msg_type == "kit_delete":
+        @on("kit_delete")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "kit_delete",
@@ -1220,7 +1420,8 @@ class HelperServer:
         # 7701 config handler. The firmware ignores commands that don't
         # apply to its role (returns an error the UI surfaces). Studio's
         # serial transport drives the identical JSON over Web Serial.
-        elif msg_type == "set_broker_host":
+        @on("set_broker_host")
+        async def _(ws, payload: dict) -> None:
             cmd: dict = {"cmd": "set_broker_host",
                          "host": payload.get("host", "auto")}
             # Optional client-side MQTT knobs (mqtt-transport.md §7) —
@@ -1234,28 +1435,32 @@ class HelperServer:
                 cmd["qos"] = payload["qos"]
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_espnow_channel":
+        @on("set_espnow_channel")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_espnow_channel",
                  "channel": int(payload.get("channel", 1))},
             )
 
-        elif msg_type == "set_gain":
+        @on("set_gain")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_gain",
                  "gain": float(payload.get("gain", 0.8))},
             )
 
-        elif msg_type == "set_input_level":
+        @on("set_input_level")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_input_level",
                  "level": int(payload.get("level", 50))},
             )
 
-        elif msg_type == "set_broker_config":
+        @on("set_broker_config")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_broker_config",
@@ -1263,14 +1468,16 @@ class HelperServer:
                  "port": int(payload.get("port", 1883))},
             )
 
-        elif msg_type == "set_sensor_mapping":
+        @on("set_sensor_mapping")
+        async def _(ws, payload: dict) -> None:
             await self._handle_tcp_command(
                 ws, payload,
                 {"cmd": "set_sensor_mapping",
                  "mappings": payload.get("mappings", [])},
             )
 
-        elif msg_type == "set_alert_mode":
+        @on("set_alert_mode")
+        async def _(ws, payload: dict) -> None:
             # MQTT receiver alert behaviour. `loop` (bool) and `ack_hold_ms`
             # (deliberate-hold ms, §6.1) are INDEPENDENTLY optional
             # (serial-config.md §4.15) — forward ONLY what Studio sent. Defaulting
@@ -1283,7 +1490,8 @@ class HelperServer:
                 cmd["ack_hold_ms"] = int(payload["ack_hold_ms"])
             await self._handle_tcp_command(ws, payload, cmd)
 
-        elif msg_type == "set_recv_topics":
+        @on("set_recv_topics")
+        async def _(ws, payload: dict) -> None:
             # MQTT receiver subscribe topic roots (item 8). Relay the list;
             # the firmware persists it (effective on reconnect/reboot).
             await self._handle_tcp_command(
@@ -1292,13 +1500,15 @@ class HelperServer:
                  "topics": payload.get("topics", [])},
             )
 
-        elif msg_type == "get_sensor_mapping":
+        @on("get_sensor_mapping")
+        async def _(ws, payload: dict) -> None:
             await self._handle_passthrough_query(
                 ws, payload, {"cmd": "get_sensor_mapping"},
                 "sensor_mapping_result",
             )
 
-        elif msg_type == "get_sensor_reading":
+        @on("get_sensor_reading")
+        async def _(ws, payload: dict) -> None:
             # Live sensor value for Studio's threshold-tuning view
             # (polled ~1 Hz while the mapping tab is open).
             await self._handle_passthrough_query(
@@ -1306,20 +1516,25 @@ class HelperServer:
                 "sensor_reading_result",
             )
 
-        elif msg_type == "play_event":
+        @on("play_event")
+        async def _(ws, payload: dict) -> None:
             # Alias of preview_event, kept for parity with manager test page.
             await self._handle_preview_event(ws, payload)
 
-        elif msg_type == "ping_device":
+        @on("ping_device")
+        async def _(ws, payload: dict) -> None:
             await self._handle_ping_device(ws, payload)
 
-        elif msg_type == "subscribe_logs":
+        @on("subscribe_logs")
+        async def _(ws, payload: dict) -> None:
             await self._handle_subscribe_logs(ws, payload)
 
-        elif msg_type == "unsubscribe_logs":
+        @on("unsubscribe_logs")
+        async def _(ws, payload: dict) -> None:
             await self._handle_unsubscribe_logs(ws, payload)
 
-        elif msg_type == "ota_data":
+        @on("ota_data")
+        async def _(ws, payload: dict) -> None:
             # Spawn as a background task instead of awaiting inline, so the OTA
             # stream does NOT block this connection's receive loop. The user can
             # then switch devices and start another device's OTA without waiting
@@ -1328,7 +1543,8 @@ class HelperServer:
             # serialize traffic to one IP; different IPs run concurrently.
             asyncio.create_task(self._ota_data_bg(ws, payload))
 
-        elif msg_type == "scan_wifi":
+        @on("scan_wifi")
+        async def _(ws, payload: dict) -> None:
             # PC-side Wi-Fi scan. Studio's onboarding assumes
             # PC + Hapbeat are on the same LAN, so the PC's own
             # neighborhood is the same set the Hapbeat will see —
@@ -1337,7 +1553,8 @@ class HelperServer:
             # it works while the Hapbeat is offline being onboarded).
             await self._handle_local_wifi_scan(ws, payload)
 
-        elif msg_type == "query_space":
+        @on("query_space")
+        async def _(ws, payload: dict) -> None:
             await self._handle_query(
                 ws, payload, "space_query", "space_result",
                 lambda r: {
@@ -1347,26 +1564,27 @@ class HelperServer:
                 },
             )
 
-        elif msg_type == "query_volume":
+        @on("query_volume")
+        async def _(ws, payload: dict) -> None:
             await self._handle_volume_query(ws, payload)
 
-        elif msg_type == "deploy_kit_data":
+        @on("deploy_kit_data")
+        async def _(ws, payload: dict) -> None:
             await self._handle_deploy_kit_data(ws, payload)
 
-        elif msg_type == "stream_begin":
+        @on("stream_begin")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stream_begin(ws, payload)
 
-        elif msg_type == "stream_data":
+        @on("stream_data")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stream_data(ws, payload)
 
-        elif msg_type == "stream_end":
+        @on("stream_end")
+        async def _(ws, payload: dict) -> None:
             await self._handle_stream_end(ws, payload)
 
-        else:
-            await ws.send(json.dumps({
-                "type": "error",
-                "payload": {"message": f"unknown type: {msg_type}"},
-            }))
+        return handlers
 
     # ── Message handlers ─────────────────────────────────────
 
@@ -2140,6 +2358,11 @@ class HelperServer:
         if key not in self._active_streams.values():
             self._stream_sequences.pop(key, None)
 
+    def _next_stream_seq(self, key: tuple[int, str]) -> int:
+        seq = self._stream_sequences.get(key, 0) + 1
+        self._stream_sequences[key] = seq
+        return seq
+
     def _matching_stream_targets(
         self,
         key: tuple[int, str],
@@ -2176,28 +2399,38 @@ class HelperServer:
                     self._active_streams.pop(ip, None)
             self._stream_sequences.pop(key, None)
 
-    # Stream session v2 with a per-device legacy fallback (DEC-075):
-    # stream-v2 firmware gets (boot id, lease ticket, generation) packets with
-    # no cooldown; pre-v2 firmware keeps the v1 format and a 300 ms END->BEGIN
-    # guard. The format is fixed per ip when its session begins.
+    # Stream Gen 2 with a per-device Stream Gen 1 fallback (DEC-075):
+    # Stream Gen 2 firmware gets (boot id, lease ticket, generation) packets
+    # with no cooldown; Stream Gen 1 firmware keeps the v1 format and a 300 ms
+    # END->BEGIN guard. The format is fixed per ip when its session begins.
+    # Helper is the Stream Gen 2 sender for its clients (contracts
+    # helper-streaming.md "Device-side changes"): it never keeps sending under
+    # an identity the device retired, recovers the device-side errors it can,
+    # and tells the client with stream_lost when it cannot.
 
     STREAM_DISCOVERY_WAIT_S = 0.4
 
-    async def _prepare_stream_targets(self, targets: list[str]) -> tuple[list[str], list[str]]:
+    async def _prepare_stream_targets(
+        self, targets: list[str], takeover: bool = False,
+    ) -> tuple[list[str], list[str]]:
         """Resolve each target's wire format, discovering unknown ones.
 
-        A target that is unknown, has no usable lease or is superseded gets a
-        unicast PING and up to STREAM_DISCOVERY_WAIT_S for a matched reply.
-        Starting a stream is an explicit user action, so a superseded lease is
-        reacquired with a fresh incarnation (never silently in the background).
+        A target that is unknown or has no usable lease gets a unicast extended
+        PING and up to STREAM_DISCOVERY_WAIT_S for a matched reply. A
+        superseded target is reacquired (fresh incarnation for that device
+        only) when the client asked for a takeover; otherwise it stays
+        deferred, so an automatic cue never takes a device from another
+        application (helper-streaming.md "Takeover").
         """
         leases = self.udp.stream_leases
-        if any(leases.is_superseded(ip) for ip in targets):
-            leases.renew_incarnation()
+        if takeover:
+            for ip in targets:
+                if leases.is_superseded(ip):
+                    leases.renew_incarnation(ip)
         pending = [ip for ip in targets if leases.begin_format(ip) is None]
         if pending:
             for ip in pending:
-                self.udp.send_ping(ip)
+                self.udp.send_ping(ip, lease=True)
             deadline = time.monotonic() + self.STREAM_DISCOVERY_WAIT_S
             while time.monotonic() < deadline and any(
                     leases.begin_format(ip) is None for ip in pending):
@@ -2205,17 +2438,60 @@ class HelperServer:
         ready = [ip for ip in targets if leases.begin_format(ip) is not None]
         deferred = [ip for ip in targets if ip not in ready]
         if deferred:
-            logger.warning("stream deferred (no stream lease/class yet): %s", deferred)
+            logger.warning("stream deferred (no stream lease/class yet, or superseded): %s",
+                           deferred)
         return ready, deferred
 
-    def _send_stream_end(self, ip: str, seq: int) -> None:
+    def _begin_packet(self, wire: _StreamWire, seq: int) -> bytes:
+        if wire.mode == stream_session.GEN2:
+            ident = wire.identity
+            return protocol.build_stream_begin_v2(
+                seq, ident.boot_id, ident.ticket, ident.generation, **wire.begin)
+        return protocol.build_stream_begin(seq=seq, **wire.begin)
+
+    def _start_wire(
+        self, ip: str, mode: str, identity: Optional[stream_session.StreamIdentity],
+        begin: dict, seq: int,
+    ) -> None:
+        """Make ``ip``'s new session and send its BEGIN (a Stream Gen 1 BEGIN
+        may wait out the END->BEGIN guard)."""
+        # A guarded start still waiting is replaced, unsent packets and all.
+        replaced = self._legacy_delayed.pop(ip, None)
+        if replaced is not None:
+            replaced.task.cancel()
+        now = self._clock()
+        wire = _StreamWire(mode, identity, begin, began_at=now, last_begin_at=now)
+        self._stream_wire[ip] = wire
+        pkt = self._begin_packet(wire, seq)
+        if mode == stream_session.GEN1:
+            # Stream Gen 1 firmware cannot reject a late END: keep the guard,
+            # for this device only and without holding up the handler.
+            remaining = self.udp.stream_leases.legacy_guard_remaining(ip)
+            if remaining > 0:
+                delayed = _DelayedLegacyStart(pkt, remaining)
+                self._legacy_delayed[ip] = delayed
+                delayed.task = asyncio.create_task(self._run_delayed_legacy(ip, delayed))
+                return
+        self.udp.send_raw(pkt, ip)
+
+    def _retire_wire(self, ip: str) -> Optional[_StreamWire]:
+        """Forget ``ip``'s session, remembering its identity (a device ERROR
+        about it is still ours) and keeping its lease refreshed for one TTL."""
         wire = self._stream_wire.pop(ip, None)
+        if wire is not None:
+            if wire.identity is not None:
+                self._ended_identity[ip] = wire.identity
+            self._lease_hold_until[ip] = self._clock() + STREAM_LEASE_HOLD_S
+        return wire
+
+    def _send_stream_end(self, ip: str, seq: int) -> None:
+        wire = self._retire_wire(ip)
         if wire is None:
             return
-        mode, identity, _ = wire
-        if mode == stream_session.V2:
+        if wire.mode == stream_session.GEN2:
+            ident = wire.identity
             pkt = protocol.build_stream_end_v2(
-                seq, identity.boot_id, identity.ticket, identity.generation)
+                seq, ident.boot_id, ident.ticket, ident.generation)
             self._stream_send(ip, pkt)
             asyncio.get_running_loop().create_task(self._repeat_stream_end(ip, pkt))
         else:
@@ -2223,12 +2499,214 @@ class HelperServer:
             self._stream_send(ip, pkt, legacy_end=True)
 
     async def _repeat_stream_end(self, ip: str, pkt: bytes) -> None:
-        """Resend a v2 END (see STREAM_END_REPEATS). A newer session on the
-        same device is unaffected: its generation is greater, and v2 firmware
-        ignores a lower END."""
+        """Resend a Stream Gen 2 END (see STREAM_END_REPEATS). A newer session
+        on the same device is unaffected: its generation is greater, and the
+        firmware ignores a lower END."""
         for _ in range(STREAM_END_REPEATS):
             await asyncio.sleep(STREAM_END_REPEAT_INTERVAL_S)
             self.udp.send_raw(pkt, ip)
+
+    def _restart_session(self, ip: str, key: tuple[int, str], *, send_end: bool) -> bool:
+        """End ``ip``'s session and begin the next one inside the same client
+        transaction (new generation, or the device's new class), with the same
+        format and target. The data offset restarts at 0. False when the
+        device has no usable lease for a new session."""
+        wire = self._stream_wire.get(ip)
+        if wire is None:
+            return False
+        if send_end:
+            self._send_stream_end(ip, self._next_stream_seq(key))
+        else:
+            self._retire_wire(ip)
+        chosen = self.udp.stream_leases.begin_session(ip)
+        if chosen is None:
+            return False
+        mode, identity = chosen
+        self._start_wire(ip, mode, identity, wire.begin, self._next_stream_seq(key))
+        return True
+
+    def _stale_reason(self, ip: str, wire: _StreamWire) -> Optional[str]:
+        """Why the device no longer accepts ``wire``'s identity, from the last
+        matched reply: None while it still does."""
+        state = self.udp.stream_leases.state(ip)
+        if wire.mode == stream_session.GEN1:
+            # A class change is a firmware update, which reboots the device.
+            return STREAM_LOST_DEVICE_REBOOTED if state.kind == stream_session.GEN2 else None
+        if state.kind == stream_session.GEN1:
+            return STREAM_LOST_DEVICE_REBOOTED
+        if state.kind != stream_session.GEN2:
+            return None  # being renewed by a takeover; that BEGIN replaces this session
+        if state.boot_id != wire.identity.boot_id:
+            return STREAM_LOST_DEVICE_REBOOTED
+        if state.ticket != wire.identity.ticket:
+            return STREAM_LOST_LEASE_CHANGED
+        if state.superseded:
+            return STREAM_LOST_SUPERSEDED
+        return None
+
+    async def _check_stream_identity(self, ip: str) -> bool:
+        """End ``ip``'s session under its old identity and tell the client
+        when the device retired that identity. True while the session holds."""
+        wire = self._stream_wire.get(ip)
+        if wire is None or ip not in self._active_streams:
+            return False
+        if wire.recovering:
+            return True
+        reason = self._stale_reason(ip, wire)
+        if reason is None:
+            return True
+        await self._lose_streams([ip], reason, send_end=True)
+        return False
+
+    def _on_lease_change(self, ip: str, change: stream_session.LeaseChange) -> None:
+        """UDP thread: a matched reply changed ``ip``'s class / boot / ticket."""
+        self._post_to_loop(self._check_stream_identity(ip))
+
+    async def _lose_streams(self, ips: list[str], reason: str, *, send_end: bool) -> None:
+        """End the client transactions on ``ips`` and send each owner one
+        ``stream_lost``. ``send_end`` sends END under the old identity first."""
+        lost: dict[tuple[int, str], list[str]] = {}
+        for ip in ips:
+            key = self._active_streams.get(ip)
+            if key is None:
+                continue
+            if send_end:
+                self._send_stream_end(ip, self._next_stream_seq(key))
+            else:
+                self._retire_wire(ip)
+            self._active_streams.pop(ip, None)
+            lost.setdefault(key, []).append(ip)
+        for key, key_ips in lost.items():
+            self._drop_sequence_if_unused(key)
+            logger.info("stream %s lost on %s (%s)", key[1], key_ips, reason)
+            await self._notify_stream_lost(key, key_ips, reason)
+
+    async def _notify_stream_lost(
+        self, key: tuple[int, str], ips: list[str], reason: str,
+    ) -> None:
+        client_id, stream_id = key
+        ws = next((c for c in self._clients if id(c) == client_id), None)
+        if ws is None or stream_id == "<implicit>":
+            return
+        self._stream_lost_since_health += 1
+        try:
+            await ws.send(json.dumps({"type": "stream_lost", "payload": {
+                "stream_id": stream_id, "targets": ips, "reason": reason}}))
+        except ConnectionClosed:
+            pass
+
+    async def _on_devices_offline(self, ips: list[str]) -> None:
+        """Devices the registry just marked offline: their transactions are
+        lost (END would not arrive)."""
+        await self._lose_streams(
+            [ip for ip in ips if ip in self._active_streams],
+            STREAM_LOST_UNREACHABLE, send_end=False)
+
+    def _on_device_error(self, ip: str, error: dict) -> None:
+        """UDP thread: an ERROR from a device's port 7700."""
+        self._post_to_loop(self._handle_device_error(ip, error))
+
+    async def _handle_device_error(self, ip: str, error: dict) -> None:
+        """Act on a device ERROR (contracts message-format.md §0xFF).
+
+        Only an ERROR from a device this helper sends to is read, and a stream
+        error only when its detail is the envelope of the device's current
+        session or the one just ended (otherwise anyone on the LAN could stop
+        a stream by sending one)."""
+        known = (ip in self._stream_wire or ip in self._ended_identity
+                 or ip in self.registry.get_all_devices())
+        if not known:
+            return
+        self._device_errors_since_health += 1
+        code = error.get("error_code")
+        name = protocol.ERROR_NAMES.get(code, f"0x{code:04x}")
+        wire = self._stream_wire.get(ip)
+        if code in protocol.STREAM_ERROR_CODES:
+            detail = error.get("detail") or b""
+            current = (wire is not None and wire.identity is not None
+                       and ip in self._active_streams
+                       and detail == _envelope(wire.identity))
+            if not current:
+                ended = self._ended_identity.get(ip)
+                if ended is not None and detail == _envelope(ended):
+                    log = logger.warning if code == protocol.ERR_STREAM_ENDED else logger.debug
+                    log("device %s: %s for the stream session just ended", ip, name)
+                return
+            await self._handle_stream_error(ip, wire, code, name)
+        elif code == protocol.ERR_STREAM_GEN_UNSUPPORTED:
+            if (wire is not None and wire.mode == stream_session.GEN1
+                    and ip in self._active_streams):
+                logger.info("device %s: %s; classifying it again", ip, name)
+                await self._recover_stream(ip, wire, code)
+            else:
+                self.udp.send_ping(ip, lease=True)  # reclassify before the next session
+        elif (ip, code) not in self._warned_errors:
+            self._warned_errors.add((ip, code))
+            logger.warning("device %s: %s (%s)", ip, name, error.get("message", ""))
+
+    async def _handle_stream_error(
+        self, ip: str, wire: _StreamWire, code: int, name: str,
+    ) -> None:
+        if wire.recovering:
+            return
+        if code in (protocol.ERR_STREAM_LEASE_INVALID, protocol.ERR_STREAM_TIMED_OUT):
+            logger.info("device %s: %s; starting a new session", ip, name)
+            await self._recover_stream(ip, wire, code)
+        elif code == protocol.ERR_STREAM_SUPERSEDED:
+            self.udp.stream_leases.mark_superseded(ip)
+            await self._lose_streams([ip], STREAM_LOST_SUPERSEDED, send_end=True)
+        elif code == protocol.ERR_STREAM_NOT_STARTED:
+            key = self._active_streams[ip]
+            self._stream_send(ip, self._begin_packet(wire, self._next_stream_seq(key)))
+            wire.last_begin_at = self._clock()
+        elif code == protocol.ERR_STREAM_STOPPED:
+            await self._lose_streams([ip], STREAM_LOST_STOPPED, send_end=False)
+        elif code == protocol.ERR_STREAM_TARGET_MISMATCH:
+            self.udp.send_ping(ip, lease=True)  # re-resolve its address
+            await self._lose_streams([ip], STREAM_LOST_TARGET_MISMATCH, send_end=False)
+        elif code == protocol.ERR_STREAM_ENDED:
+            logger.warning("device %s: %s (DATA after END: a helper bug)", ip, name)
+
+    async def _recover_stream(self, ip: str, wire: _StreamWire, code: int) -> None:
+        """Begin the next session on ``ip`` without the client noticing.
+
+        STREAM_LEASE_INVALID and STREAM_GEN_UNSUPPORTED first renew the lease /
+        class with a unicast extended PING; STREAM_TIMED_OUT only needs a new
+        generation. Client DATA arriving meanwhile is dropped. If no session
+        can begin, the client gets ``stream_lost`` (``unreachable``)."""
+        key = self._active_streams.get(ip)
+        leases = self.udp.stream_leases
+        wire.recovering = True
+        try:
+            if code != protocol.ERR_STREAM_TIMED_OUT:
+                before = leases.replies(ip)
+                self.udp.send_ping(ip, lease=True)
+                deadline = time.monotonic() + self.STREAM_DISCOVERY_WAIT_S
+                while time.monotonic() < deadline and leases.replies(ip) == before:
+                    await asyncio.sleep(0.02)
+            if self._stream_wire.get(ip) is not wire or self._active_streams.get(ip) != key:
+                return  # displaced or ended meanwhile
+            ok = True
+            if code == protocol.ERR_STREAM_GEN_UNSUPPORTED:
+                ok = leases.kind(ip) == stream_session.GEN2
+            if ok:
+                ok = self._restart_session(
+                    ip, key, send_end=code != protocol.ERR_STREAM_TIMED_OUT)
+        finally:
+            wire.recovering = False
+        if not ok:
+            reason = (STREAM_LOST_SUPERSEDED if leases.is_superseded(ip)
+                      else STREAM_LOST_UNREACHABLE)
+            await self._lose_streams([ip], reason, send_end=False)
+
+    def _lease_ips(self) -> set[str]:
+        """Devices whose stream lease the scan keeps refreshing by extended
+        PING: those with an active transaction, and for one lease TTL after a
+        session ended (stream-session.md Discovery lease)."""
+        now = self._clock()
+        self._lease_hold_until = {
+            ip: until for ip, until in self._lease_hold_until.items() if until > now}
+        return set(self._active_streams) | set(self._lease_hold_until)
 
     async def _notify_stream_displaced(
         self, displaced: dict[tuple[int, str], list[str]], by: tuple[int, str],
@@ -2329,7 +2807,8 @@ class HelperServer:
                 "payload": ack_payload,
             }))
             return
-        targets, deferred = await self._prepare_stream_targets(targets)
+        targets, deferred = await self._prepare_stream_targets(
+            targets, takeover=payload.get("takeover") is True)
         if not targets:
             ack_payload = {"status": "no_target", "deferred": deferred}
             if "stream_id" in payload:
@@ -2367,25 +2846,7 @@ class HelperServer:
                 continue
             started.append(ip)
             mode, identity = chosen
-            # A guarded start still waiting is replaced, unsent packets and all.
-            replaced = self._legacy_delayed.pop(ip, None)
-            if replaced is not None:
-                replaced.task.cancel()
-            self._stream_wire[ip] = [mode, identity, 0]
-            if mode == stream_session.V2:
-                pkt = protocol.build_stream_begin_v2(
-                    0, identity.boot_id, identity.ticket, identity.generation, **begin)
-            else:
-                pkt = protocol.build_stream_begin(seq=0, **begin)
-                # Pre-v2 firmware cannot reject a late END: keep the guard,
-                # for this device only and without holding up the handler.
-                remaining = leases.legacy_guard_remaining(ip)
-                if remaining > 0:
-                    delayed = _DelayedLegacyStart(pkt, remaining)
-                    self._legacy_delayed[ip] = delayed
-                    delayed.task = asyncio.create_task(self._run_delayed_legacy(ip, delayed))
-                    continue
-            self.udp.send_raw(pkt, ip)
+            self._start_wire(ip, mode, identity, begin, 0)
         logger.info("stream %s begin on %s%s", key[1], started,
                     f" (deferred {deferred})" if deferred else "")
         ack_payload = {"status": "ok" if started else "no_target", "targets": started}
@@ -2423,22 +2884,58 @@ class HelperServer:
         offset = int(payload.get("offset", 0))
         data_b64 = payload.get("data", "")
         audio = base64.b64decode(data_b64) if data_b64 else b""
-        seq = self._stream_sequences.get(key, 0) + 1
-        self._stream_sequences[key] = seq
-        legacy_pkt = None
+        now = self._clock()
+
+        # Never send under an identity the device retired, and never resume a
+        # Stream Gen 2 session after a gap of our own that the device may have
+        # timed out (stream-session.md Sender requirements 3).
+        sendable: list[str] = []
         for ip in targets:
-            wire = self._stream_wire.get(ip)
-            if wire is None:
+            if not await self._check_stream_identity(ip):
                 continue
-            mode, identity, next_offset = wire
-            if mode == stream_session.V2:
-                # v2 firmware rejects backward offsets, but Studio rewinds its
-                # offset on seek. Offsets only order packets (the ring appends),
-                # so send the bytes this session has actually carried.
+            wire = self._stream_wire[ip]
+            if wire.recovering:
+                continue  # a new session is being set up; this DATA is dropped
+            if (wire.mode == stream_session.GEN2
+                    and now - max(wire.began_at, wire.last_data_at) >= STREAM_OWN_GAP_S):
+                logger.info("stream %s: no DATA to %s for %.1f s; new session",
+                            key[1], ip, now - max(wire.began_at, wire.last_data_at))
+                if not self._restart_session(ip, key, send_end=True):
+                    await self._lose_streams([ip], STREAM_LOST_LEASE_CHANGED, send_end=False)
+                    continue
+            sendable.append(ip)
+        if not sendable:
+            return
+
+        # A lost BEGIN would silence the whole session: repeat it before each
+        # of the first DATA blocks, then every STREAM_BEGIN_REPEAT_INTERVAL_S
+        # (Sender requirements 2). Stream Gen 1 firmware resets on BEGIN.
+        resend = [
+            ip for ip in sendable
+            if self._stream_wire[ip].mode == stream_session.GEN2
+            and (self._stream_wire[ip].data_sent < STREAM_BEGIN_REPEATS
+                 or now - self._stream_wire[ip].last_begin_at >= STREAM_BEGIN_REPEAT_INTERVAL_S)
+        ]
+        if resend:
+            begin_seq = self._next_stream_seq(key)
+            for ip in resend:
+                wire = self._stream_wire[ip]
+                self._stream_send(ip, self._begin_packet(wire, begin_seq))
+                wire.last_begin_at = now
+
+        seq = self._next_stream_seq(key)
+        legacy_pkt = None
+        for ip in sendable:
+            wire = self._stream_wire[ip]
+            if wire.mode == stream_session.GEN2:
+                # Stream Gen 2 firmware rejects backward offsets, but Studio
+                # rewinds its offset on seek. Offsets only order packets (the
+                # ring appends), so send the bytes this session has carried.
+                ident = wire.identity
                 pkt = protocol.build_stream_data_v2(
-                    seq, identity.boot_id, identity.ticket, identity.generation,
-                    next_offset, audio)
-                wire[2] = (next_offset + len(audio)) & 0xFFFFFFFF
+                    seq, ident.boot_id, ident.ticket, ident.generation,
+                    wire.next_offset, audio)
+                wire.next_offset = (wire.next_offset + len(audio)) & 0xFFFFFFFF
             else:
                 if legacy_pkt is None:
                     legacy_pkt = protocol.build_stream_data(
@@ -2446,6 +2943,8 @@ class HelperServer:
                     )
                 pkt = legacy_pkt
             self._stream_send(ip, pkt)
+            wire.data_sent += 1
+            wire.last_data_at = now
 
     async def _handle_stream_end(self, ws, payload: dict) -> None:
         key = self._stream_key(ws, payload)
@@ -2455,8 +2954,7 @@ class HelperServer:
         if not targets:
             await self._note_stream_orphan(ws, key, "END")
             return
-        seq = self._stream_sequences.get(key, 0) + 1
-        self._stream_sequences[key] = seq
+        seq = self._next_stream_seq(key)
         for ip in targets:
             self._send_stream_end(ip, seq)
             if self._active_streams.get(ip) == key:
@@ -3192,6 +3690,32 @@ def _find_kit_manifest(pack_dir: Path) -> Path | None:
     return None
 
 
+def _kit_refusal(manifest: dict, caps: Any) -> Optional[str]:
+    """Why a device must not get this Kit, from its get_info ``caps``
+    (contracts versioning.md §5.4 / §11, kit-format.md), or None.
+
+    0.x firmware has no ``caps`` and does not check the schema itself, so a
+    device without them is not checked here either. ``target_device``'s
+    firmware range is the device's own check, not this one."""
+    if not isinstance(caps, dict):
+        return None
+    kit_schema = caps.get("kit_schema")
+    if isinstance(kit_schema, dict):
+        match = re.match(r"\s*(\d+)", str(manifest.get("schema_version", "")))
+        if match is None:
+            return "kit schema_version is missing or unreadable"
+        major = int(match.group(1))
+        low, high = kit_schema.get("min"), kit_schema.get("max")
+        if (isinstance(low, int) and major < low) or (isinstance(high, int) and major > high):
+            return (f"kit schema {major} is not supported by this device "
+                    f"(accepts {low}-{high})")
+    clip_formats = caps.get("kit_clip_formats")
+    if isinstance(clip_formats, list) and "pcm16" not in clip_formats:
+        # install-clips/ are WAV PCM16, the only Kit audio format today.
+        return "this device does not accept PCM16 install clips (kit_clip_formats)"
+    return None
+
+
 def _deploy_kit_to_device(
     ip: str, pack_dir: Path, kit_id_default: str,
     on_progress=None,
@@ -3272,6 +3796,12 @@ def _deploy_kit_to_device(
         if not conn.connect():
             return False, "connect failed"
         try:
+            # connect() already read the device's get_info (the handshake).
+            refusal = _kit_refusal(manifest, (conn.info or {}).get("caps"))
+            if refusal:
+                logger.warning("Kit deploy %s: %s", ip, refusal)
+                return False, refusal
+
             conn.send_json({
                 "cmd": "kit_install", "kit_id": kit_id,
                 "file_count": len(files), "total_size": total_size,

@@ -376,6 +376,53 @@ present. Invalid payloads get the same reply type with an `error` string.
 A derived file resolves to the originals reached through its parents
 (cycles and chains deeper than 32 are cut).
 
+## Studio / browser WebSocket (`ws://localhost:7703`)
+
+Messages are `{"type": ..., "payload": {...}}`. The full rules are hapbeat-contracts
+[`specs/helper-ws.md`](https://github.com/hapbeat/hapbeat-contracts/blob/master/specs/helper-ws.md)
+(handshake) and
+[`specs/helper-streaming.md`](https://github.com/hapbeat/hapbeat-contracts/blob/master/specs/helper-streaming.md)
+(audio streaming).
+
+### helper_hello
+
+The first message on every connection:
+`{ version, generation, types: string[], features: string[] }`. `types` lists
+every request type the helper handles; `features` is `stream_gen2`,
+`stream_lost`, `stream_takeover` and `device_caps`. Enable a feature from these,
+not from `version`. An unknown request type is answered with
+`{"type": "error", "payload": {"message": "unknown type: <type>"}}`.
+
+### Audio streaming
+
+| type | payload | notes |
+|---|---|---|
+| `stream_begin` | `{ stream_id, targets: [ip…], format, sample_rate, channels, gain, target?, takeover? }` | answered by one `stream_ack`. `takeover: true` only for a playback the user started (pressing play): it takes back a device another application superseded. Without it such a device is reported in `deferred` |
+| `stream_data` | `{ stream_id, data: <base64>, offset? }` | |
+| `stream_end` | `{ stream_id }` | |
+
+Replies:
+
+| type | payload | meaning |
+|---|---|---|
+| `stream_ack` | `{ stream_id, status, targets, deferred? }` | `ok` / `no_target` / `error`; `no_session` once when data or end arrive for a stream that holds no device |
+| `stream_displaced` | `{ stream_id, targets, by, same_client }` | a newer `stream_begin` took these devices |
+| `stream_lost` | `{ stream_id, targets, reason }` | the device side ended the stream on these devices: `device_rebooted`, `lease_changed`, `superseded`, `stopped` (STOP_ALL), `target_mismatch`, `unreachable` |
+
+The helper streams to firmware 0.5.0+ in Stream Gen 2 and to older firmware in
+Stream Gen 1. It repeats BEGIN, starts a new session after a lease error, a
+device timeout or a gap of 3 s in the client's data, and sends `stream_lost`
+only when it cannot recover.
+
+### Device capabilities and storage
+
+`get_info_result` passes the device's `caps`, `stream_formats`,
+`stream_protocol` and `storage_incompatible` through unchanged (absent on 0.x
+firmware). `reset_storage` `{ ip, area }` clears an area the device listed in
+`storage_incompatible` (Studio asks the user first) and is answered with
+`write_result`. Before writing a Kit, the helper checks its `schema_version`
+against the device's `caps.kit_schema` and `caps.kit_clip_formats`.
+
 ## Scene recordings and cue tables
 
 For Hapbeat Studio's Scene tab (beta). The formats are hapbeat-contracts

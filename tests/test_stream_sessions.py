@@ -17,7 +17,7 @@ class _FakeWebSocket:
 def _classify_legacy(server: HelperServer, ip: str) -> None:
     """A matched reply without an HBS2 tail: pre-v2 firmware (v1 streams)."""
     leases = server.udp.stream_leases
-    leases.note_ping(900, 1_000)
+    leases.note_ping(ip, 900, 1_000)
     leases.on_pong(ip, {"seq": 900, "timestamp": 1_000, "stream_tail": {"status": "absent"}})
 
 

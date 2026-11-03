@@ -74,6 +74,8 @@ class TcpRawConnection:
         self.ip = ip
         self.port = port
         self.sock: Optional[socket.socket] = None
+        # The device's get_info reply from the connect() handshake.
+        self.info: Optional[dict] = None
 
     def connect(self, retries: int = 1, recover: bool = True) -> bool:
         # `recover`: run the stuck-slot recovery path (RECOVERY_SLEEP + 1 retry)
@@ -109,6 +111,7 @@ class TcpRawConnection:
                 self.send_json({"cmd": "get_info"})
                 resp = self.read_response(timeout=READ_TIMEOUT)
                 if resp and resp.get("status") == "ok":
+                    self.info = resp
                     logger.debug(
                         "TCP handshake ok (%s: %s)",
                         self.ip, resp.get("name", "?"),
@@ -151,6 +154,7 @@ class TcpRawConnection:
                 self.send_json({"cmd": "get_info"})
                 resp = self.read_response(timeout=READ_TIMEOUT)
                 if resp and resp.get("status") == "ok":
+                    self.info = resp
                     logger.debug(
                         "TCP handshake ok after recovery (%s: %s)",
                         self.ip, resp.get("name", "?"),
