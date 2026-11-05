@@ -2416,24 +2416,35 @@ class HelperServer:
         """Resolve each target's wire format, discovering unknown ones.
 
         A target that is unknown or has no usable lease gets a unicast extended
-        PING and up to STREAM_DISCOVERY_WAIT_S for a matched reply. A
-        superseded target is reacquired (fresh incarnation for that device
-        only) when the client asked for a takeover; otherwise it stays
-        deferred, so an automatic cue never takes a device from another
-        application (helper-streaming.md "Takeover").
+        PING and up to STREAM_DISCOVERY_WAIT_S for a matched reply. So does a
+        Stream Gen 2 target whose lease this helper stopped refreshing: the
+        table still shows the last reply, but the device let that lease expire,
+        so a BEGIN under its ticket would get STREAM_LEASE_INVALID and a short
+        clip would end before the recovery. A superseded target is reacquired
+        (fresh incarnation for that device only) when the client asked for a
+        takeover; otherwise it stays deferred, so an automatic cue never takes
+        a device from another application (helper-streaming.md "Takeover").
         """
         leases = self.udp.stream_leases
         if takeover:
             for ip in targets:
                 if leases.is_superseded(ip):
                     leases.renew_incarnation(ip)
-        pending = [ip for ip in targets if leases.begin_format(ip) is None]
+        held = self._lease_ips()
+        lapsed = {ip: leases.replies(ip) for ip in targets
+                  if ip not in held and leases.kind(ip) == stream_session.GEN2}
+
+        def waiting(ip: str) -> bool:
+            if ip in lapsed:
+                return leases.replies(ip) == lapsed[ip]
+            return leases.begin_format(ip) is None
+
+        pending = [ip for ip in targets if waiting(ip)]
         if pending:
             for ip in pending:
                 self.udp.send_ping(ip, lease=True)
             deadline = time.monotonic() + self.STREAM_DISCOVERY_WAIT_S
-            while time.monotonic() < deadline and any(
-                    leases.begin_format(ip) is None for ip in pending):
+            while time.monotonic() < deadline and any(waiting(ip) for ip in pending):
                 await asyncio.sleep(0.02)
         ready = [ip for ip in targets if leases.begin_format(ip) is not None]
         deferred = [ip for ip in targets if ip not in ready]

@@ -270,6 +270,68 @@ async def test_unknown_target_is_discovered_before_begin(server, monkeypatch):
     assert [p["version"] for p in _packets(server, V2_IP)] == [2]
 
 
+def _begin_tickets(server, ip):
+    return [struct.unpack("<QII", p["payload"][:16])[1] for p in _packets(server, ip)
+            if p["command"] == protocol.CMD_STREAM_BEGIN]
+
+
+@pytest.mark.asyncio
+async def test_lapsed_lease_is_renewed_before_begin(server, monkeypatch):
+    # A session ended long ago, so the device's lease expired: the table still says
+    # ticket 7, the device answers ticket 8. BEGIN must carry 8, or a short clip is lost.
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, ticket=7)
+    pings = []
+
+    def answer(ip, lease=False):
+        pings.append((ip, lease, len(_packets(server, ip))))
+        _reply(leases, ip, 2, 200, ticket=8)
+
+    monkeypatch.setattr(server.udp, "send_ping", answer)
+    ws = _FakeWebSocket()
+    await server._handle_stream_begin(ws, {"stream_id": "s", "targets": [V2_IP], "format": "pcm16"})
+    assert pings == [(V2_IP, True, 0)]  # asked first, before any packet
+    assert _begin_tickets(server, V2_IP) == [8]
+
+
+@pytest.mark.asyncio
+async def test_held_lease_begins_without_waiting_for_a_reply(server, monkeypatch):
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, ticket=7)
+    server._lease_hold_until[V2_IP] = server._clock() + 10
+    pings = []
+    monkeypatch.setattr(server.udp, "send_ping", lambda ip, lease=False: pings.append(ip))
+    ws = _FakeWebSocket()
+    await server._handle_stream_begin(ws, {"stream_id": "s", "targets": [V2_IP], "format": "pcm16"})
+    assert pings == []
+    assert _begin_tickets(server, V2_IP) == [7]
+
+
+@pytest.mark.asyncio
+async def test_lapsed_lease_without_a_reply_still_begins_and_recovers_later(server, monkeypatch):
+    # No reply in time: BEGIN goes out under the last known ticket, and
+    # STREAM_LEASE_INVALID handling takes it from there.
+    server.STREAM_DISCOVERY_WAIT_S = 0.05
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, ticket=7)
+    monkeypatch.setattr(server.udp, "send_ping", lambda ip, lease=False: None)
+    ws = _FakeWebSocket()
+    await server._handle_stream_begin(ws, {"stream_id": "s", "targets": [V2_IP], "format": "pcm16"})
+    assert _begin_tickets(server, V2_IP) == [7]
+
+
+@pytest.mark.asyncio
+async def test_lapsed_lease_answered_as_superseded_defers(server, monkeypatch):
+    leases = server.udp.stream_leases
+    _reply(leases, V2_IP, 1, 100, ticket=7)
+    monkeypatch.setattr(server.udp, "send_ping",
+                        lambda ip, lease=False: _reply(leases, ip, 2, 200, ticket=7, flags=0x03))
+    ws = _FakeWebSocket()
+    await server._handle_stream_begin(ws, {"stream_id": "s", "targets": [V2_IP], "format": "pcm16"})
+    assert _packets(server, V2_IP) == []
+    assert json.loads(ws.messages[-1])["payload"]["status"] == "no_target"
+
+
 @pytest.mark.asyncio
 async def test_unanswered_target_defers_without_packets(server, monkeypatch):
     monkeypatch.setattr(server, "STREAM_DISCOVERY_WAIT_S", 0.05)

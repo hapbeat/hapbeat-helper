@@ -19,6 +19,9 @@
 - client incarnation を機体ごとに持つ。他のアプリに奪われた（superseded）機体は、
   `lease_reissued` 付きの応答か、`stream_begin` の `takeover: true` があるまで保留する。
   `takeover` の無い `stream_begin` では取り返さず、`stream_ack` の `deferred` に入れる。
+- stream を終えて 15 秒を過ぎた機体への `stream_begin` は、先に拡張 PING で lease を取り直してから
+  BEGIN を送る。機体の lease は切れているので、古い ticket の BEGIN は `STREAM_LEASE_INVALID` で
+  拒否され、回復の間に短いクリップが終わって鳴らなかった。
 - Stream Gen 2 の BEGIN を、最初の 3 回の DATA の前と、以後 500 ms ごとに再送する。
   client の DATA が 3 秒以上途切れたら、新しい世代で始め直す。
 
