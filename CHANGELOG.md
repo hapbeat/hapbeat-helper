@@ -3,7 +3,7 @@
 このファイルの形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョニングは [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
-## [Unreleased]
+## [1.0.0] - 2026-11-06
 
 全製品を 1.0.0 にそろえる版（DEC-096）。通信の規則は hapbeat-contracts の 1.0.0 予定の版
 （`46f246e`。`specs/stream-session.md`・`specs/helper-streaming.md`・`specs/helper-ws.md`・
@@ -274,7 +274,8 @@
 
 [GitHub Releases](https://github.com/Hapbeat/hapbeat-helper/releases) を参照。
 
-[Unreleased]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Hapbeat/hapbeat-helper/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Hapbeat/hapbeat-helper/compare/v0.3.0...v0.3.1
