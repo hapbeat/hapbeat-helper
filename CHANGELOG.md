@@ -5,8 +5,8 @@
 
 ## [1.0.0] - 2026-11-06
 
-全製品を 1.0.0 にそろえる版（DEC-096）。通信の規則は hapbeat-contracts の 1.0.0 予定の版
-（`46f246e`。`specs/stream-session.md`・`specs/helper-streaming.md`・`specs/helper-ws.md`・
+全製品を 1.0.0 にそろえる版（DEC-096）。通信の規則は hapbeat-contracts `v1.0.0`
+（`specs/stream-session.md`・`specs/helper-streaming.md`・`specs/helper-ws.md`・
 `specs/message-format.md` §0xFF・`specs/serial-config.md` §4.1 / §4.23）に従う。
 
 ### Changed
